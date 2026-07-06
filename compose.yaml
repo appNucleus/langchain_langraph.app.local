@@ -1,0 +1,31 @@
+name: langchain-langraph-app
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: langchain_langraph.app:release
+    container_name: langchain-langraph-app
+    restart: unless-stopped
+    env_file:
+      - ${DEPLOY_ENV_FILE:-.env}
+    ports:
+      - "${HOST_BIND:-127.0.0.1}:${APP_PORT:-8001}:8000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - langchain-langraph-data:/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - curl --fail --silent http://127.0.0.1:8000/health >/dev/null || exit 1
+      interval: 10s
+      timeout: 5s
+      start_period: 20s
+      retries: 10
+    security_opt:
+      - no-new-privileges=true
+
+volumes:
+  langchain-langraph-data:

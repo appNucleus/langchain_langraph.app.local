@@ -1,0 +1,12 @@
+[project]
+name = "langchain-langraph-app"
+version = "0.1.0"
+description = "Minimal FastAPI + LangGraph app server ready for Ollama, MCP, and database integrations."
+requires-python = ">=3.12"
+readme = "README.md"
+license = { text = "MIT" }
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+pythonpath = ["."]
+testpaths = ["tests"]

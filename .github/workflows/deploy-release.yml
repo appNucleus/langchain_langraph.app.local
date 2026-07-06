@@ -1,0 +1,205 @@
+name: Deploy release to LangChain LangGraph app server
+
+on:
+  push:
+    branches:
+      - release
+
+permissions:
+  contents: read
+
+concurrency:
+  group: langchain-langraph-app-production-release
+  cancel-in-progress: false
+
+env:
+  CONTAINER_NAME: langchain-langraph-app
+  RELEASE_IMAGE: langchain_langraph.app:release
+  ROLLBACK_IMAGE: langchain_langraph.app:rollback
+
+jobs:
+  deploy:
+    name: Build and deploy Docker application
+    runs-on:
+      - self-hosted
+      - Linux
+      - X64
+      - mcp-prod
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Check out release commit
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Configure deployment paths
+        run: |
+          set -euo pipefail
+          {
+            echo "BACKUP_ROOT=$HOME/backup_app.local"
+            echo "DEPLOY_ENV_FILE=$HOME/.config/langchain-langraph-app/runtime.env"
+            echo "ROLLBACK_STATE_DIR=$RUNNER_TEMP/langchain-langraph-app-rollback"
+          } >> "$GITHUB_ENV"
+
+      - name: Verify deployment prerequisites
+        run: |
+          set -euo pipefail
+          echo "Checking shell-script syntax..."
+          for script in scripts/*.sh; do
+            echo "Checking: $script"
+            bash -n "$script"
+          done
+          echo "Checking server prerequisites..."
+          bash ./scripts/verify-server.sh
+          command -v tar >/dev/null 2>&1
+          command -v sha256sum >/dev/null 2>&1
+          echo "All deployment prerequisites passed."
+
+      - name: Initialize persistent deployment environment
+        run: |
+          set -euo pipefail
+          mkdir -p "$(dirname "$DEPLOY_ENV_FILE")"
+          if [[ ! -f "$DEPLOY_ENV_FILE" ]]; then
+            install -m 600 .env.example "$DEPLOY_ENV_FILE"
+            echo "Created persistent environment file:"
+            echo "$DEPLOY_ENV_FILE"
+          else
+            chmod 600 "$DEPLOY_ENV_FILE"
+            echo "Using persistent environment file:"
+            echo "$DEPLOY_ENV_FILE"
+          fi
+
+          set_runtime_env_value() {
+            local key="$1"
+            local value="$2"
+            local file="$3"
+            if grep -qE "^${key}=" "$file"; then
+              sed -i "s|^${key}=.*|${key}=${value}|" "$file"
+            else
+              printf '\n%s=%s\n' "$key" "$value" >> "$file"
+            fi
+          }
+
+          # Enforce this server's intended Caddy-facing bind even if an older
+          # persistent runtime.env already exists.
+          set_runtime_env_value HOST_BIND 127.0.0.1 "$DEPLOY_ENV_FILE"
+          set_runtime_env_value APP_PORT 8001 "$DEPLOY_ENV_FILE"
+
+      - name: Validate candidate Compose configuration
+        run: |
+          set -euo pipefail
+          docker compose --env-file "$DEPLOY_ENV_FILE" config >/dev/null
+          echo "Docker Compose configuration is valid."
+
+      - name: Prepare rollback point
+        id: prepare_rollback
+        run: |
+          set -euo pipefail
+          bash ./scripts/prepare-rollback.sh
+
+      - name: Build candidate image
+        run: |
+          set -euo pipefail
+          docker compose --env-file "$DEPLOY_ENV_FILE" build --pull
+
+      - name: Deploy candidate
+        run: |
+          set -euo pipefail
+          docker compose --env-file "$DEPLOY_ENV_FILE" up \
+            --detach \
+            --no-build \
+            --force-recreate \
+            --remove-orphans \
+            --wait \
+            --wait-timeout 120
+
+      - name: Run candidate smoke test
+        run: |
+          set -euo pipefail
+          bash ./scripts/smoke-test.sh candidate
+
+      - name: Replace successful deployment backup
+        run: |
+          set -euo pipefail
+          bash ./scripts/create-success-backup.sh
+
+      - name: Remove previous deployment image
+        if: ${{ success() }}
+        run: |
+          set -u
+          docker image rm "$ROLLBACK_IMAGE" >/dev/null 2>&1 || true
+          if ! docker image prune --force; then
+            echo "::warning::The deployment succeeded, but Docker image cleanup failed."
+          fi
+          echo
+          echo "Images remaining for this application:"
+          docker image ls langchain_langraph.app || true
+
+      - name: Roll back failed deployment
+        id: rollback
+        if: ${{ failure() && !cancelled() && steps.prepare_rollback.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          bash ./scripts/rollback-release.sh
+
+      - name: Explain why rollback was not attempted
+        if: ${{ failure() && !cancelled() && steps.prepare_rollback.outcome != 'success' }}
+        run: |
+          echo "::notice::Rollback was not attempted because the workflow failed before a rollback point was successfully prepared."
+          echo "The previously running deployment should not have been modified."
+
+      - name: Show final deployment status
+        if: ${{ always() }}
+        run: |
+          set +e
+          deploy_env_file="${DEPLOY_ENV_FILE:-$HOME/.config/langchain-langraph-app/runtime.env}"
+          backup_root="${BACKUP_ROOT:-$HOME/backup_app.local}"
+          echo "Docker Compose status:"
+          docker compose --env-file "$deploy_env_file" ps
+          echo
+          echo "Recent Docker Compose logs:"
+          docker compose --env-file "$deploy_env_file" logs --no-color --tail=100
+          echo
+          echo "Backup directories:"
+          find "$backup_root" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort
+          echo
+          echo "Application images:"
+          docker image ls langchain_langraph.app || true
+
+      - name: Write deployment summary
+        if: ${{ always() }}
+        env:
+          FINAL_JOB_STATUS: ${{ job.status }}
+          PREPARE_ROLLBACK_OUTCOME: ${{ steps.prepare_rollback.outcome }}
+          ROLLBACK_STEP_OUTCOME: ${{ steps.rollback.outcome }}
+        run: |
+          set -euo pipefail
+          backup_root="${BACKUP_ROOT:-$HOME/backup_app.local}"
+          {
+            echo "## LangChain LangGraph app deployment"
+            echo
+            echo "- Commit: \`$GITHUB_SHA\`"
+            echo "- Workflow result: **$FINAL_JOB_STATUS**"
+            echo "- Rollback point preparation: **${PREPARE_ROLLBACK_OUTCOME:-not run}**"
+            echo "- Rollback step: **${ROLLBACK_STEP_OUTCOME:-not run}**"
+            echo "- Rollback detail: **${ROLLBACK_RESULT:-not required}**"
+            echo "- Backup root: \`$backup_root\`"
+            echo
+            if [[ "$FINAL_JOB_STATUS" == "success" ]]; then
+              echo "The candidate passed its health check and smoke test."
+              echo
+              echo "The previous backup was deleted and replaced with the new timestamped successful-deployment backup."
+              echo
+              echo "The temporary rollback image and dangling Docker images were removed."
+            else
+              echo "The workflow remains failed so GitHub displays a red failure status."
+              echo
+              echo "Automatic rollback was attempted only when a valid rollback point had been prepared."
+              echo
+              echo "Review the failed step and final Docker logs above for the original deployment error."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
