@@ -105,7 +105,7 @@ The workflow deploys when you push to the `release` branch:
 It expects a self-hosted runner with labels:
 
 ```text
-self-hosted, Linux, X64, mcp-prod
+self-hosted, Linux, X64, app-prod
 ```
 
 Change the runner label in the workflow if your runner uses a different label.
