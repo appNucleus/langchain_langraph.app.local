@@ -24,7 +24,7 @@ jobs:
       - self-hosted
       - Linux
       - X64
-      - mcp-prod
+      - app-prod
     timeout-minutes: 15
     defaults:
       run:
