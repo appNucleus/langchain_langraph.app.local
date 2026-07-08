@@ -12,7 +12,7 @@ class Settings(BaseSettings):
 
     The defaults are tuned for the user's trusted local network:
     - Ollama on http://ollama.home.arpa:11434
-    - MCP on https://mcp.home.arpa/mcp with local/internal TLS
+    - MCP through stable network DNS: https://mcp.home.arpa/mcp
     """
 
     model_config = SettingsConfigDict(
@@ -23,7 +23,7 @@ class Settings(BaseSettings):
     )
 
     app_name: str = "LangChain LangGraph App"
-    app_version: str = "0.3.0"
+    app_version: str = "0.3.2"
     environment: str = "local"
     log_level: str = "INFO"
 
@@ -52,11 +52,13 @@ class Settings(BaseSettings):
     model_fallback: str = "qwen3.5:4b"
     embedding_model: str = "qwen3-embedding:0.6b"
 
-    # MCP server.
+    # MCP server. Use DNS/Caddy/network routing, not Docker-internal host aliases.
+    # Keep the endpoint without a trailing slash; the client also normalizes it defensively.
     mcp_enabled: bool = True
     mcp_server_url: str = "https://mcp.home.arpa/mcp"
     mcp_timeout_seconds: float = 75.0
     mcp_verify_tls: bool = False
+    mcp_follow_redirects: bool = True
     mcp_protocol_version: str = "2025-03-26"
 
     # Tool/query behavior.

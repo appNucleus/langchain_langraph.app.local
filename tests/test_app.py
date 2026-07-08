@@ -15,6 +15,7 @@ def test_health(client: TestClient) -> None:
     assert payload["status"] == "ok"
     assert payload["backend"] == "ollama"
     assert payload["models"]["search"] == "qwen3.5:9b"
+    assert payload["mcp_follow_redirects"] is True
 
 
 def test_chat_uses_general_model_for_general_request(client: TestClient, fake_ollama: FakeOllamaClient) -> None:
