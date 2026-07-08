@@ -13,6 +13,7 @@ from app.llm.ollama import OllamaClient
 from app.logging_config import log_kv
 from app.mcp.client import MCPClient, MCPToolResult
 from app.schemas.chat import ChatRequest, ChatResponse
+from app.services.answer_quality import validate_answer
 from app.services.decomposition import QueryDecomposer, QueryTask
 from app.services.formatting import (
     PromptBuilder,
@@ -155,15 +156,6 @@ class ChatAgent:
 
         state.update(await self._prepare_node(state))
         state.update(await self._inventory_node(state))
-        inventory = state.get("inventory") or RuntimeInventory()
-        yield {
-            "event": "inventory",
-            "data": {
-                "models": inventory.model_names,
-                "tools": inventory.tool_names,
-                "errors": inventory.errors,
-            },
-        }
 
         state.update(await self._plan_node(state))
         tasks = state.get("tasks", [])
@@ -196,42 +188,10 @@ class ChatAgent:
         else:
             state.update({"tool_results": [], "task_tool_results": {}, "references": []})
 
-        if self.settings.llm_backend == "echo":
-            response = self._echo_response(state)
-            for chunk in _chunk_text(response):
-                yield {"event": "token", "data": {"delta": chunk}}
-                await asyncio.sleep(0)
-            state.update({"response": response, "backend": "echo", "model": None})
-        else:
-            # Streaming keeps the final response streamed. For multiple tasks, use
-            # the normal answer node to preserve decomposition/synthesis quality.
-            if len(state.get("tasks", [])) > 1:
-                state.update(await self._answer_node(state))
-                for chunk in _chunk_text(state.get("response", "")):
-                    yield {"event": "token", "data": {"delta": chunk}}
-                    await asyncio.sleep(0)
-            else:
-                model = state.get("model") or self.selector.resolve(state["plan"].model_key, inventory)
-                messages = self._messages_for_state(state)
-                response_parts: list[str] = []
-                try:
-                    async for delta in self.ollama.stream_chat(
-                        model=model,
-                        messages=messages,
-                        temperature=self.settings.ollama_temperature,
-                        num_predict=self.settings.ollama_stream_num_predict,
-                    ):
-                        if not delta:
-                            continue
-                        response_parts.append(delta)
-                        yield {"event": "token", "data": {"delta": delta}}
-                except Exception as exc:  # noqa: BLE001 - report as SSE error and fallback.
-                    yield {"event": "error", "data": {"message": str(exc)}}
-                response = clean_model_output("".join(response_parts))
-                if not response:
-                    response = "I could not get answer content from the local Ollama model."
-                response = append_references(response, state.get("references", []), limit=self.settings.answer_reference_limit)
-                state.update({"response": response, "backend": "ollama", "model": model, "models_used": [model]})
+        state.update(await self._answer_node(state))
+        for chunk in _chunk_text(state.get("response", "")):
+            yield {"event": "token", "data": {"delta": chunk}}
+            await asyncio.sleep(0)
 
         await self.memory.add_pair(thread_id, user=request.message, assistant=state.get("response", ""))
         yield {
@@ -376,56 +336,40 @@ class ChatAgent:
 
         tasks = state.get("tasks", [])
         if len(tasks) <= 1:
-            model = state.get("model") or self.selector.resolve(state["plan"].model_key, state.get("inventory"))
-            messages = self._messages_for_state(state)
-            log_kv(logger, logging.INFO, "ollama_answer_start", thread_id=state.get("thread_id"), model=model, messages=len(messages))
-            result = await self.ollama.chat(
-                model=model,
-                messages=messages,
-                temperature=self.settings.ollama_temperature,
-                num_predict=self.settings.ollama_num_predict,
+            task = tasks[0] if tasks else QueryTask(
+                id="q1",
+                query=state["message"],
+                plan=state["plan"],
+                model=state.get("model") or self.selector.resolve(state["plan"].model_key, state.get("inventory")),
+                tools=state["plan"].tools,
+                rewritten_query=state.get("rewritten_query"),
             )
+            task_answer, models_used = await self._answer_one_task(state, task, state.get("tool_results", []))
             response = append_references(
-                clean_model_output(result.content),
+                task_answer["answer"],
                 state.get("references", []),
                 limit=self.settings.answer_reference_limit,
             )
             if not response:
                 response = "I could not get answer content from the local Ollama model."
-            log_kv(logger, logging.INFO, "ollama_answer_done", thread_id=state.get("thread_id"), model=result.model, response_chars=len(response))
-            return {**state, "response": response, "backend": "ollama", "model": result.model, "models_used": [result.model]}
+            model = models_used[-1] if models_used else task.model
+            log_kv(logger, logging.INFO, "ollama_answer_done", thread_id=state.get("thread_id"), model=model, response_chars=len(response))
+            return {
+                **state,
+                "task_answers": [task_answer],
+                "response": response,
+                "backend": "ollama",
+                "model": model,
+                "models_used": models_used,
+            }
 
         task_answers: list[dict[str, Any]] = []
         models_used: list[str] = []
         task_tool_results = state.get("task_tool_results", {})
         for task in tasks:
-            task_state: ChatGraphState = {
-                **state,
-                "message": task.query,
-                "plan": task.plan,
-                "rewritten_query": task.rewritten_query,
-                "tool_results": task_tool_results.get(task.id, []),
-            }
-            messages = self._messages_for_state(task_state)
-            log_kv(logger, logging.INFO, "ollama_task_answer_start", thread_id=state.get("thread_id"), task_id=task.id, model=task.model)
-            result = await self.ollama.chat(
-                model=task.model,
-                messages=messages,
-                temperature=self.settings.ollama_temperature,
-                num_predict=self.settings.ollama_num_predict,
-            )
-            answer = clean_model_output(result.content) or "No answer content returned."
-            models_used.append(result.model)
-            task_answers.append(
-                {
-                    "id": task.id,
-                    "query": task.query,
-                    "intent": task.plan.intent,
-                    "model": result.model,
-                    "tools": task.tools,
-                    "answer": answer,
-                }
-            )
+            answer_payload, used_for_task = await self._answer_one_task(state, task, task_tool_results.get(task.id, []))
+            models_used.extend(used_for_task)
+            task_answers.append(answer_payload)
 
         synthesis_model = self.selector.resolve("synthesis", state.get("inventory"))
         synthesis_messages = self.prompt_builder.build_synthesis_messages(
@@ -435,20 +379,62 @@ class ChatAgent:
             task_answers=task_answers,
             references=state.get("references", []),
         )
+        log_kv(logger, logging.INFO, "ollama_synthesis_start", thread_id=state.get("thread_id"), model=synthesis_model, task_count=len(task_answers))
         result = await self.ollama.chat(
             model=synthesis_model,
             messages=synthesis_messages,
             temperature=self.settings.ollama_temperature,
             num_predict=self.settings.ollama_num_predict,
         )
+        response = clean_model_output(result.content)
+        validation = validate_answer(
+            response,
+            query=state["message"],
+            min_chars=self.settings.min_answer_chars,
+            required_references=bool(state.get("references")),
+            references_count=len(state.get("references", [])),
+        )
+        models_used.append(result.model)
+        if not validation.ok:
+            heavy_model = self.selector.resolve("heavy", state.get("inventory"))
+            if heavy_model != result.model:
+                retry_messages = [
+                    *synthesis_messages,
+                    {
+                        "role": "user",
+                        "content": (
+                            "The previous synthesis was not acceptable because: "
+                            f"{validation.reasons}. Rewrite a complete, useful final answer."
+                        ),
+                    },
+                ]
+                retry = await self.ollama.chat(
+                    model=heavy_model,
+                    messages=retry_messages,
+                    temperature=self.settings.ollama_temperature,
+                    num_predict=self.settings.ollama_num_predict,
+                )
+                retry_response = clean_model_output(retry.content)
+                retry_validation = validate_answer(
+                    retry_response,
+                    query=state["message"],
+                    min_chars=self.settings.min_answer_chars,
+                    required_references=bool(state.get("references")),
+                    references_count=len(state.get("references", [])),
+                )
+                models_used.append(retry.model)
+                if retry_validation.ok or len(retry_response) > len(response):
+                    response = retry_response
+                    validation = retry_validation
+                    result = retry
+
         response = append_references(
-            clean_model_output(result.content),
+            response,
             state.get("references", []),
             limit=self.settings.answer_reference_limit,
         )
         if not response:
             response = "I could not combine the answer content from the local Ollama model."
-        models_used.append(result.model)
         return {
             **state,
             "task_answers": task_answers,
@@ -456,7 +442,107 @@ class ChatAgent:
             "backend": "ollama",
             "model": result.model,
             "models_used": models_used,
+            "synthesis_validation": validation.as_dict(),
         }
+
+    async def _answer_one_task(
+        self,
+        state: ChatGraphState,
+        task: QueryTask,
+        tool_results: Sequence[MCPToolResult],
+    ) -> tuple[dict[str, Any], list[str]]:
+        models_used: list[str] = []
+        inventory = state.get("inventory")
+        references_count = len(extract_references(tool_results, limit=self.settings.max_references))
+        required_references = bool(task.tools) and task.plan.intent in {"web_research", "news", "stock", "sports_or_match_results", "url_scrape"}
+        tried: list[str] = []
+        last_answer = ""
+        last_validation = None
+
+        for attempt, model in enumerate(self._model_retry_sequence(task, inventory), 1):
+            if model in tried:
+                continue
+            tried.append(model)
+            task_state: ChatGraphState = {
+                **state,
+                "message": task.query,
+                "plan": task.plan,
+                "rewritten_query": task.rewritten_query,
+                "tool_results": list(tool_results),
+            }
+            messages = self._messages_for_state(task_state)
+            if attempt > 1 and last_validation is not None:
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "The previous answer failed quality checks: "
+                            f"{last_validation.reasons}. Give a complete answer that directly addresses the query."
+                        ),
+                    }
+                )
+            log_kv(logger, logging.INFO, "ollama_task_answer_start", thread_id=state.get("thread_id"), task_id=task.id, model=model, attempt=attempt)
+            result = await self.ollama.chat(
+                model=model,
+                messages=messages,
+                temperature=self.settings.ollama_temperature,
+                num_predict=self.settings.ollama_num_predict,
+            )
+            answer = clean_model_output(result.content)
+            validation = validate_answer(
+                answer,
+                query=task.query,
+                min_chars=self.settings.min_answer_chars,
+                required_references=required_references,
+                references_count=references_count,
+            )
+            models_used.append(result.model)
+            last_answer = answer
+            last_validation = validation
+            if validation.ok or attempt >= self.settings.max_answer_retries + 1:
+                return {
+                    "id": task.id,
+                    "query": task.query,
+                    "intent": task.plan.intent,
+                    "model": result.model,
+                    "model_key": task.plan.model_key,
+                    "tools": task.tools,
+                    "answer": answer or "No answer content returned.",
+                    "validation": validation.as_dict(),
+                    "retry_count": attempt - 1,
+                }, models_used
+
+        fallback_validation = last_validation or validate_answer(last_answer, query=task.query, min_chars=self.settings.min_answer_chars)
+        return {
+            "id": task.id,
+            "query": task.query,
+            "intent": task.plan.intent,
+            "model": tried[-1] if tried else task.model,
+            "model_key": task.plan.model_key,
+            "tools": task.tools,
+            "answer": last_answer or "No answer content returned.",
+            "validation": fallback_validation.as_dict(),
+            "retry_count": max(0, len(tried) - 1),
+        }, models_used
+
+    def _model_retry_sequence(self, task: QueryTask, inventory: RuntimeInventory | None) -> list[str]:
+        sequence = [task.model]
+        retry_keys = {
+            "simple": ["general", "reasoning", "fallback"],
+            "general": ["reasoning", "synthesis", "fallback"],
+            "search": ["reasoning", "synthesis", "fallback"],
+            "reasoning": ["fast_reasoning", "heavy", "fallback"],
+            "fast_reasoning": ["reasoning", "heavy", "fallback"],
+            "writer": ["synthesis", "heavy", "fallback"],
+            "classifier": ["general", "fallback"],
+            "vision": ["general", "fallback"],
+            "fallback": ["general", "synthesis"],
+        }.get(task.plan.model_key, ["reasoning", "synthesis", "fallback"])
+        for key in retry_keys:
+            model = self.selector.resolve(key, inventory)
+            if model not in sequence:
+                sequence.append(model)
+        return sequence[: self.settings.max_answer_retries + 1]
 
     def _messages_for_state(self, state: ChatGraphState) -> list[dict[str, str]]:
         return self.prompt_builder.build_messages(
@@ -616,7 +702,16 @@ class ChatAgent:
         results = state.get("tool_results", [])
         inventory = state.get("inventory")
         tasks = state.get("tasks", [])
-        return {
+        tool_decisions = [
+            {
+                "subquery_id": task.id,
+                "tool": tool,
+                "reason": task.plan.reason,
+            }
+            for task in tasks
+            for tool in task.tools
+        ]
+        metadata = {
             **state.get("metadata", {}),
             "intent": plan.intent if plan else None,
             "tools_requested": plan.tools if plan else [],
@@ -626,13 +721,22 @@ class ChatAgent:
                 for item in results
                 if not item.ok
             ],
+            "tool_decisions": tool_decisions,
             "rewritten_query": state.get("rewritten_query"),
             "subqueries": [task.as_metadata() for task in tasks],
             "task_answers": state.get("task_answers", []),
             "models_used": state.get("models_used", []),
-            "inventory": inventory.as_dict() if inventory else None,
             "references": state.get("references", []),
         }
+        if inventory:
+            metadata["inventory_summary"] = {
+                "model_count": len(inventory.model_names),
+                "tool_count": len(inventory.tool_names),
+                "errors": inventory.errors,
+            }
+        if state.get("synthesis_validation"):
+            metadata["synthesis_validation"] = state["synthesis_validation"]
+        return metadata
 
 
 def encode_sse(event: str, data: dict[str, Any]) -> str:

@@ -77,6 +77,12 @@ class ModelRouter:
         if _contains_any(lower, ["weather", "forecast", "temperature", "rain", "snow", "storm", "wind", "humid"]):
             return QueryPlan("weather", ["weather_lookup"], "search", True, "Weather/current forecast request.")
 
+        if _contains_any(lower, ["image", "screenshot", "photo", "picture", "chart", "diagram", "visual"]):
+            return QueryPlan("vision", [], "vision", False, "Visual/image-related request; route to the vision model when image input is available.")
+
+        if _contains_any(lower, ["embedding", "vector", "semantic search", "rag index", "similarity search"]):
+            return QueryPlan("embedding_or_rag", [], "general", False, "Embedding/RAG planning request; embedding model is cataloged for vector tasks, chat answer uses a generative model.")
+
         if _contains_any(lower, ["road condition", "traffic", "closure", "closed road", "accident on", "construction on"]):
             return QueryPlan(
                 "road_condition",
@@ -150,6 +156,33 @@ class ModelRouter:
             if _contains_any(lower, ["read", "open", "message id"]):
                 return QueryPlan("mail_read", ["mail_read"], "general", False, "Mail read intent.")
             return QueryPlan("mail_search", ["mail_search"], "general", True, "Mail search intent.")
+
+        if _contains_any(lower, ["classify", "classification", "intent", "routing", "query type"]):
+            return QueryPlan(
+                "classification",
+                [],
+                "classifier",
+                False,
+                "Classification/routing request; use the compact classifier model.",
+            )
+
+        if _contains_any(lower, ["rewrite", "polish", "draft", "write an email", "documentation", "readme", "report"]):
+            return QueryPlan(
+                "writing",
+                [],
+                "writer",
+                False,
+                "Writing/rewrite/documentation request; use the writer model.",
+            )
+
+        if _contains_any(lower, ["math", "algorithm", "logic", "prove", "calculate", "equation"]):
+            return QueryPlan(
+                "fast_reasoning",
+                [],
+                "fast_reasoning",
+                False,
+                "Math/logic/algorithm request; use the fast reasoning model first.",
+            )
 
         if _contains_any(lower, ["architect", "architecture", "design", "debug", "explain why", "reason", "tradeoff", "compare", "analyze"]):
             return QueryPlan(

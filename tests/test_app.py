@@ -18,14 +18,15 @@ def test_health(client: TestClient) -> None:
     assert payload["mcp_follow_redirects"] is True
 
 
-def test_chat_uses_general_model_for_general_request(client: TestClient, fake_ollama: FakeOllamaClient) -> None:
+def test_chat_uses_reasoning_model_for_architecture_request(client: TestClient, fake_ollama: FakeOllamaClient) -> None:
     response = client.post("/api/chat", json={"message": "Explain this architecture in a few sentences."})
     assert response.status_code == 200
     payload = response.json()
     assert payload["backend"] == "ollama"
-    assert payload["model"] == "phi4-mini-reasoning:latest"
+    assert payload["model"] == "deepseek-r1:8b"
+    assert payload["metadata"]["intent"] == "reasoning"
     assert "Answer from" in payload["response"]
-    assert fake_ollama.calls[-1]["model"] == "phi4-mini-reasoning:latest"
+    assert fake_ollama.calls[-1]["model"] == "deepseek-r1:8b"
 
 
 def test_weather_request_calls_weather_tool_and_search_model(client: TestClient, fake_mcp: FakeMCPClient) -> None:
@@ -73,8 +74,8 @@ def test_stream_endpoint_returns_sse_events(client: TestClient) -> None:
     assert "event: plan" in text
     assert "event: token" in text
     assert "event: done" in text
-    assert "stream " in text
-    assert "answer" in text
+    assert "Answer from" in text
+    assert "event: inventory" not in text
 
 
 def test_api_key_required() -> None:
@@ -167,12 +168,24 @@ def test_echo_backend_skips_real_mcp_calls(fake_mcp: FakeMCPClient) -> None:
     assert fake_mcp.calls == []
 
 
-def test_inventory_endpoint_lists_live_models_and_tools(client: TestClient) -> None:
+def test_inventory_endpoint_lists_live_models_tools_and_full_role_catalog(client: TestClient) -> None:
     response = client.get("/api/inventory")
     assert response.status_code == 200
     payload = response.json()
     assert "qwen3.5:4b" in payload["ollama"]["model_names"]
     assert payload["ollama"]["configured_roles"]["general"]["resolved"] == "qwen3.5:4b"
+    assert payload["ollama"]["configured_roles"]["simple"]["resolved"] == "qwen3.5:2b"
+    assert payload["ollama"]["configured_roles"]["search"]["resolved"] == "qwen3.5:9b"
+    assert payload["ollama"]["configured_roles"]["reasoning"]["resolved"] == "deepseek-r1:8b"
+    assert payload["ollama"]["configured_roles"]["fast_reasoning"]["resolved"] == "phi4-mini-reasoning:latest"
+    assert payload["ollama"]["configured_roles"]["synthesis"]["resolved"] == "gemma4:12b-it-qat"
+    assert payload["ollama"]["configured_roles"]["heavy"]["resolved"] == "gemma4:26b-a4b-it-qat"
+    assert payload["ollama"]["configured_roles"]["writer"]["resolved"] == "gemma4:e4b-it-qat"
+    assert payload["ollama"]["configured_roles"]["classifier"]["resolved"] == "gemma4:e2b-it-qat"
+    assert payload["ollama"]["configured_roles"]["fallback"]["resolved"] == "granite3.3:8b"
+    assert payload["ollama"]["configured_roles"]["embedding"]["resolved"] == "qwen3-embedding:0.6b"
+    catalog_models = {item["model"] for item in payload["ollama"]["model_task_catalog"]}
+    assert set(payload["ollama"]["model_names"]).issubset(catalog_models)
     assert "web_search_and_scrape" in payload["mcp"]["tool_names"]
     assert payload["errors"] == {}
 
@@ -190,3 +203,37 @@ def test_compound_request_is_split_answered_and_synthesized(client: TestClient, 
     called_tools = [call["name"] for call in fake_mcp.calls]
     assert "news_search" in called_tools
     assert "weather_lookup" in called_tools
+
+
+def test_chat_metadata_is_compact_without_full_inventory(client: TestClient) -> None:
+    response = client.post("/api/chat", json={"message": "hello"})
+    assert response.status_code == 200
+    metadata = response.json()["metadata"]
+    assert "inventory" not in metadata
+    assert "inventory_summary" in metadata
+    assert "subqueries" in metadata
+    assert "task_answers" in metadata
+
+
+def test_validation_retries_broken_subquery_answer(settings: Settings, fake_mcp: FakeMCPClient) -> None:
+    class BrokenThenGoodOllama(FakeOllamaClient):
+        async def chat(self, *, model, messages, temperature=None, num_predict=None):  # type: ignore[no-untyped-def]
+            self.calls.append({"model": model, "messages": list(messages), "temperature": temperature, "num_predict": num_predict})
+            if len(self.calls) == 1:
+                return type("Resp", (), {"content": "**", "model": model, "raw": {}})()
+            return type("Resp", (), {
+                "content": "This retry answer is complete and useful enough to pass validation after the first broken model output.",
+                "model": model,
+                "raw": {},
+            })()
+
+    local_settings = settings.model_copy(update={"enable_llm_query_planning": False})
+    ollama = BrokenThenGoodOllama()
+    agent = ChatAgent(local_settings, ollama_client=ollama, mcp_client=fake_mcp)
+    local_client = TestClient(create_app(settings=local_settings, chat_agent=agent))
+    response = local_client.post("/api/chat", json={"message": "hello"})
+    assert response.status_code == 200
+    metadata = response.json()["metadata"]
+    assert metadata["task_answers"][0]["retry_count"] == 1
+    assert metadata["task_answers"][0]["validation"]["ok"] is True
+    assert len(ollama.calls) >= 2

@@ -22,21 +22,27 @@ class FakeOllamaClient:
 
     async def list_models(self) -> list[dict[str, Any]]:
         return [
-            {"name": "qwen3.5:2b", "size": 2700000000},
-            {"name": "qwen3.5:4b", "size": 3400000000},
-            {"name": "qwen3.5:9b", "size": 6600000000},
-            {"name": "phi4-mini-reasoning:latest", "size": 3200000000},
             {"name": "gemma4:26b-a4b-it-qat", "size": 15000000000},
             {"name": "qwen3-vl:4b", "size": 3300000000},
+            {"name": "phi4-mini-reasoning:latest", "size": 3200000000},
+            {"name": "deepseek-r1:8b", "size": 5200000000},
+            {"name": "qwen3.5:9b", "size": 6600000000},
+            {"name": "qwen3.5:4b", "size": 3400000000},
+            {"name": "qwen3.5:2b", "size": 2700000000},
+            {"name": "granite3.3:8b", "size": 4900000000},
+            {"name": "gemma4:12b-it-qat", "size": 7200000000},
+            {"name": "gemma4:e4b-it-qat", "size": 6100000000},
+            {"name": "gemma4:e2b-it-qat", "size": 4300000000},
             {"name": "qwen3-embedding:0.6b", "size": 639000000},
         ]
 
     async def chat(self, *, model: str, messages: Sequence[dict[str, str]], temperature: float | None = None, num_predict: int | None = None) -> LLMResponse:
         self.calls.append({"model": model, "messages": list(messages), "temperature": temperature, "num_predict": num_predict})
+        content = f"Answer from {model}. This is a complete test answer with enough useful detail to pass validation for the requested query."
         return LLMResponse(
-            content=f"Answer from {model}",
+            content=content,
             model=model,
-            raw={"message": {"content": f"Answer from {model}", "thinking": "hidden"}},
+            raw={"message": {"content": content, "thinking": "hidden"}},
         )
 
     async def stream_chat(self, *, model: str, messages: Sequence[dict[str, str]], temperature: float | None = None, num_predict: int | None = None) -> AsyncIterator[str]:

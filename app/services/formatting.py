@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from urllib.parse import urlparse
 from collections.abc import Sequence
 from typing import Any
 
@@ -156,13 +157,21 @@ def extract_references(tool_results: Sequence[MCPToolResult], *, limit: int) -> 
     def add(title: str | None, url: str | None, source: str) -> None:
         if not url or not isinstance(url, str) or not url.startswith(("http://", "https://")):
             return
-        if url in seen:
+        normalized = _normalize_url(url)
+        if normalized in seen:
             return
-        seen.add(url)
-        refs.append({"title": (title or url).strip()[:180], "url": url.strip(), "source": source})
+        seen.add(normalized)
+        refs.append(
+            {
+                "title": (title or url).strip()[:180],
+                "url": url.strip(),
+                "source": source,
+                "quality": _reference_quality(url, title or ""),
+            }
+        )
 
     def walk(obj: Any, source: str) -> None:
-        if len(refs) >= limit:
+        if len(refs) >= max(limit * 3, limit):
             return
         if isinstance(obj, dict):
             url = obj.get("url") or obj.get("link") or obj.get("href")
@@ -176,9 +185,49 @@ def extract_references(tool_results: Sequence[MCPToolResult], *, limit: int) -> 
 
     for result in tool_results:
         walk(result.data, result.tool)
-        if len(refs) >= limit:
-            break
-    return refs[:limit]
+
+    if not refs:
+        return []
+
+    # Prefer official/project/vendor docs and high-quality sources. Keep weaker
+    # sources only when there are not enough better references.
+    refs.sort(key=lambda ref: ref.get("quality", 0), reverse=True)
+    selected = refs[:limit]
+    return [{"title": ref["title"], "url": ref["url"], "source": ref["source"]} for ref in selected]
+
+
+def _normalize_url(url: str) -> str:
+    parsed = urlparse(url.strip())
+    return f"{parsed.scheme}://{parsed.netloc.lower()}{parsed.path.rstrip('/')}"
+
+
+def _reference_quality(url: str, title: str) -> int:
+    host = urlparse(url).netloc.lower().removeprefix("www.")
+    text = f"{host} {title}".lower()
+    score = 10
+    official_hosts = [
+        "docs.",
+        "developer.",
+        "developers.",
+        "github.com",
+        "langchain.com",
+        "modelcontextprotocol.io",
+        "ollama.com",
+        "aws.amazon.com",
+        "docs.aws.amazon.com",
+        "fastapi.tiangolo.com",
+        "python.org",
+    ]
+    low_quality_hosts = ["reddit.com", "medium.com", "geeksforgeeks.org", "udemy.com", "quora.com"]
+    if any(marker in host for marker in official_hosts) or any(marker in text for marker in ["official", "documentation", "docs"]):
+        score += 50
+    if host.endswith(".gov") or host.endswith(".edu"):
+        score += 25
+    if any(marker in host for marker in low_quality_hosts):
+        score -= 35
+    if "blog" in host or "blog" in text:
+        score -= 10
+    return score
 
 
 def render_reference_instruction(references: Sequence[dict[str, str]]) -> str:
