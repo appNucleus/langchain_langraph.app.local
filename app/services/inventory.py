@@ -108,7 +108,7 @@ class ModelSelector:
         return available[0] if available else self.settings.model_fallback
 
     def configured_roles(self, inventory: RuntimeInventory | None = None) -> dict[str, dict[str, Any]]:
-        roles = ["planner", "simple", "general", "search", "reasoning", "heavy", "synthesis", "vision", "fallback"]
+        roles = ["planner", "simple", "general", "search", "reasoning", "fast_reasoning", "heavy", "synthesis", "writer", "classifier", "vision", "fallback"]
         available = set(inventory.model_names if inventory else [])
         output: dict[str, dict[str, Any]] = {}
         for role in roles:
@@ -123,6 +123,7 @@ class ModelSelector:
             "configured": self.settings.embedding_model,
             "resolved": self.settings.embedding_model if not available or self.settings.embedding_model in available else None,
             "available": not available or self.settings.embedding_model in available,
+            "chat_model": False,
         }
         return output
 
@@ -132,16 +133,20 @@ class ModelSelector:
             self.settings.model_general,
             self.settings.model_search,
             self.settings.model_reasoning,
+            self.settings.model_fast_reasoning,
             self.settings.model_simple,
         ]
         preferences = {
-            "planner": [self.settings.model_planner, self.settings.model_general, self.settings.model_search],
+            "planner": [self.settings.model_planner, self.settings.model_general, self.settings.model_classifier, self.settings.model_search],
             "simple": [self.settings.model_simple, self.settings.model_general, self.settings.model_fallback],
-            "general": [self.settings.model_general, self.settings.model_search, self.settings.model_fallback],
+            "general": [self.settings.model_general, self.settings.model_simple, self.settings.model_search, self.settings.model_fallback],
             "search": [self.settings.model_search, self.settings.model_general, self.settings.model_fallback],
-            "reasoning": [self.settings.model_reasoning, self.settings.model_heavy, self.settings.model_search],
+            "reasoning": [self.settings.model_reasoning, self.settings.model_fast_reasoning, self.settings.model_heavy, self.settings.model_search],
+            "fast_reasoning": [self.settings.model_fast_reasoning, self.settings.model_reasoning, self.settings.model_general, self.settings.model_fallback],
             "heavy": [self.settings.model_heavy, self.settings.model_synthesis, self.settings.model_reasoning, self.settings.model_search],
             "synthesis": [self.settings.model_synthesis, self.settings.model_heavy, self.settings.model_reasoning, self.settings.model_search],
+            "writer": [self.settings.model_writer, self.settings.model_general, self.settings.model_synthesis, self.settings.model_fallback],
+            "classifier": [self.settings.model_classifier, self.settings.model_general, self.settings.model_simple, self.settings.model_fallback],
             "vision": [self.settings.model_vision, self.settings.model_general, self.settings.model_fallback],
             "fallback": [self.settings.model_fallback, self.settings.model_general],
         }
@@ -164,6 +169,7 @@ def build_inventory_payload(settings: Settings, inventory: RuntimeInventory, sel
             "models": inventory.models,
             "model_names": inventory.model_names,
             "configured_roles": selector.configured_roles(inventory),
+            "model_task_catalog": settings.model_role_catalog(),
         },
         "mcp": {
             "enabled": settings.mcp_enabled,

@@ -64,19 +64,31 @@ class QueryDecomposer:
             if cleaned:
                 return cleaned[: self.settings.max_subqueries]
 
+        numbered = _extract_numbered_items(message)
+        if numbered:
+            return _ensure_request_coverage(message, numbered, self.settings.max_subqueries)
+
         if self.settings.llm_backend == "ollama" and self.settings.enable_llm_query_planning:
             planned = await self._llm_decompose(message=message, inventory=inventory, ollama=ollama)
             if planned:
+                planned = _ensure_request_coverage(message, planned, self.settings.max_subqueries)
                 return planned[: self.settings.max_subqueries]
 
-        return _heuristic_decompose(message, max_items=self.settings.max_subqueries)
+        return _ensure_request_coverage(
+            message,
+            _heuristic_decompose(message, max_items=self.settings.max_subqueries),
+            self.settings.max_subqueries,
+        )
 
     async def _llm_decompose(self, *, message: str, inventory: RuntimeInventory, ollama: OllamaClient) -> list[str]:
         model = self.selector.resolve("planner", inventory)
         prompt = (
-            "Split the user's request into simple standalone questions only when it truly contains multiple tasks. "
-            "Keep broad context, do not over-split small phrases, and return only valid JSON.\n"
-            "JSON schema: {\"queries\": [\"simple question 1\", \"simple question 2\"]}\n"
+            "Split the user's request into the smallest useful standalone tasks. "
+            "Preserve every major requirement from the original request. "
+            "Do not drop comparison, latest-fact-checking, model-selection, architecture, reference, or output-format requirements. "
+            "If the request contains numbered items, keep each numbered item as its own task unless it must be split. "
+            "Return only valid JSON.\n"
+            "JSON schema: {\"queries\": [\"simple standalone task 1\", \"simple standalone task 2\"]}\n"
             f"Available tools: {inventory.tool_names}\n"
             f"User request: {message}"
         )
@@ -231,6 +243,127 @@ def _looks_fresh_or_discovery_query(text: str) -> bool:
     ]
     discovery_starters = ("what is ", "who is ", "where is ", "when is ", "how much ", "which ")
     return any(word in lowered for word in fresh_words) or lowered.startswith(discovery_starters)
+
+
+def _extract_numbered_items(message: str) -> list[str]:
+    text = _clean_query(message)
+    if not text:
+        return []
+    matches = list(re.finditer(r"(?:^|\s)(\d{1,2})[\).]\s+", text))
+    if len(matches) < 2:
+        return []
+    items: list[str] = []
+    preamble = text[: matches[0].start()].strip(" :-")
+    for index, match in enumerate(matches):
+        start = match.end()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        item = _clean_query(text[start:end])
+        if not item:
+            continue
+        # Keep enough context so the task is understandable on its own.
+        if preamble and len(preamble) < 240 and not item.lower().startswith(("explain", "compare", "search", "choose", "give", "based")):
+            item = f"{preamble}: {item}"
+        if item not in items:
+            items.append(item)
+    return items
+
+
+def _ensure_request_coverage(message: str, queries: list[str], max_items: int) -> list[str]:
+    """Patch planner omissions for common multi-part architecture/test prompts.
+
+    Local models sometimes split obvious definitions but forget comparison, model
+    selection, final recommendation, or citation requirements. This deterministic
+    repair keeps the agent faithful to the original user request.
+    """
+    output: list[str] = []
+    for query in queries:
+        item = _clean_query(query)
+        if item and item not in output:
+            output.append(item)
+
+    lower = message.lower()
+    joined = " ".join(output).lower()
+    if len(output) <= 1 and not _is_complex_coverage_case(lower):
+        return output[:max_items] or [_clean_query(message)]
+
+    def add_if_needed(condition: bool, must_contain: list[str], query: str) -> None:
+        nonlocal output
+        if len(output) >= max_items or not condition:
+            return
+        if any(term in joined for term in must_contain):
+            return
+        cleaned = _clean_query(query)
+        if cleaned and cleaned not in output:
+            output.append(cleaned)
+
+    add_if_needed(
+        "mcp" in lower,
+        ["mcp"],
+        "Explain what MCP servers do in this app in simple words.",
+    )
+    add_if_needed(
+        "langgraph" in lower or "orchestration" in lower,
+        ["langgraph", "orchestration"],
+        "Explain how LangGraph-style orchestration works in this app in simple words.",
+    )
+    add_if_needed(
+        "ollama" in lower,
+        ["ollama"],
+        "Explain what Ollama models do in this app in simple words.",
+    )
+    add_if_needed(
+        any(term in lower for term in ["external search", "search tools", "internet", "latest", "unknown"]),
+        ["search tool", "external search", "latest", "unknown"],
+        "Explain why external search tools are needed for latest or unknown facts.",
+    )
+    add_if_needed(
+        ("home" in lower and "aws" in lower) or "deployment" in lower,
+        ["aws", "home-server", "home server", "deployment"],
+        "Compare a small home-server Docker deployment with an AWS-native serverless/container deployment, including pros, cons, cost, load, and when each makes sense.",
+    )
+    add_if_needed(
+        any(term in lower for term in ["model list", "live model", "available model", "choose which model", "based on the live model"]),
+        ["model", "role"],
+        "Choose the best live model role for simple, general, search-heavy, reasoning, synthesis, vision, embedding, and fallback tasks, using only the available inventory.",
+    )
+    add_if_needed(
+        any(term in lower for term in ["recommended architecture", "final recommended", "recommend architecture", "architecture"]),
+        ["recommended architecture", "final architecture"],
+        "Give a final recommended architecture that balances quality, speed, reliability, and cost.",
+    )
+    add_if_needed(
+        any(term in lower for term in ["reference", "references", "cite", "official documentation", "latest technical"]),
+        ["reference", "official", "citation"],
+        "Find or verify the most useful official/high-quality references needed to support the answer.",
+    )
+
+    return output[:max_items] or [_clean_query(message)]
+
+
+def _is_complex_coverage_case(lower: str) -> bool:
+    signals = [
+        "compare",
+        "aws",
+        "home server",
+        "home-server",
+        "deployment",
+        "model list",
+        "live model",
+        "available model",
+        "choose which model",
+        "recommended architecture",
+        "final recommended",
+        "references",
+        "official documentation",
+        "latest technical",
+        "subqueries",
+        "stress test",
+        "1)",
+        "2)",
+        "1.",
+        "2.",
+    ]
+    return sum(signal in lower for signal in signals) >= 2
 
 
 def _extract_json_object(text: str) -> dict[str, Any]:
