@@ -33,6 +33,12 @@ class QueryRewriter:
             ticker = extract_ticker(message) or base
             return f"{ticker} stock quote latest news earnings analyst guidance price movement last {self.settings.default_news_lookback_days} days {today}"
 
+        if plan.intent == "sports_or_match_results":
+            return (
+                f"{base} today match results final score highlights schedule official match centre "
+                f"ESPN FIFA ICC reliable sources {today}"
+            )
+
         if plan.intent == "news":
             return f"{base} latest news recent developments authoritative sources published within last {self.settings.default_news_lookback_days} days {today}"
 

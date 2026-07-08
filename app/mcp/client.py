@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from typing import Any
 
 import httpx
 
+from app.logging_config import log_kv
 from app.settings import Settings
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -44,7 +48,9 @@ class MCPClient:
             normalized = self._normalize_tool_result((data.get("result") or {}))
             return MCPToolResult(tool=name, ok=True, data=normalized)
         except Exception as exc:  # noqa: BLE001 - preserve tool failure as data for the LLM.
-            return MCPToolResult(tool=name, ok=False, data=None, error=str(exc))
+            error = _format_exception(exc)
+            log_kv(logger, logging.ERROR, "mcp_client_tool_error", tool=name, error=error)
+            return MCPToolResult(tool=name, ok=False, data=None, error=error)
 
     async def _jsonrpc(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         self._request_id += 1
@@ -59,8 +65,17 @@ class MCPClient:
             "Content-Type": "application/json",
             "MCP-Protocol-Version": self.settings.mcp_protocol_version,
         }
+        log_kv(logger, logging.DEBUG, "mcp_jsonrpc_request", method=method, url=self.settings.mcp_server_url)
         async with self._client() as client:
             response = await client.post("", headers=headers, json=payload)
+            log_kv(
+                logger,
+                logging.DEBUG,
+                "mcp_jsonrpc_response",
+                method=method,
+                status_code=response.status_code,
+                content_type=response.headers.get("content-type", ""),
+            )
             response.raise_for_status()
             return self._decode_response(response)
 
@@ -119,3 +134,10 @@ def _maybe_json(text: str) -> Any:
         except json.JSONDecodeError:
             return text
     return text
+
+
+def _format_exception(exc: BaseException) -> str:
+    text = str(exc).strip()
+    if text:
+        return f"{type(exc).__name__}: {text}"
+    return f"{type(exc).__name__}: {exc!r}"

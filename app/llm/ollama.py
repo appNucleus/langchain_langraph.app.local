@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 import httpx
 
+from app.logging_config import log_kv
 from app.settings import Settings
+
+logger = logging.getLogger(__name__)
 
 
 ChatMessage = dict[str, str]
@@ -63,8 +67,10 @@ class OllamaClient:
             temperature=temperature,
             num_predict=num_predict,
         )
+        log_kv(logger, logging.INFO, "ollama_chat_request", model=model, stream=False, messages=len(messages))
         async with self._client() as client:
             response = await client.post("/api/chat", json=payload)
+            log_kv(logger, logging.INFO, "ollama_chat_response", model=model, status_code=response.status_code)
             response.raise_for_status()
             data = response.json()
         message = data.get("message") or {}
@@ -86,8 +92,10 @@ class OllamaClient:
             temperature=temperature,
             num_predict=num_predict,
         )
+        log_kv(logger, logging.INFO, "ollama_stream_request", model=model, stream=True, messages=len(messages))
         async with self._client() as client:
             async with client.stream("POST", "/api/chat", json=payload) as response:
+                log_kv(logger, logging.INFO, "ollama_stream_response", model=model, status_code=response.status_code)
                 response.raise_for_status()
                 async for line in response.aiter_lines():
                     if not line.strip():
