@@ -65,14 +65,33 @@ class MCPClient:
             "Content-Type": "application/json",
             "MCP-Protocol-Version": self.settings.mcp_protocol_version,
         }
-        log_kv(logger, logging.DEBUG, "mcp_jsonrpc_request", method=method, url=self.settings.mcp_server_url)
+        url = self.settings.mcp_server_url.rstrip("/")
+        log_kv(
+            logger,
+            logging.DEBUG,
+            "mcp_jsonrpc_request",
+            method=method,
+            url=url,
+            follow_redirects=self.settings.mcp_follow_redirects,
+        )
         async with self._client() as client:
-            response = await client.post("", headers=headers, json=payload)
+            response = await client.post(url, headers=headers, json=payload)
+            if response.history:
+                log_kv(
+                    logger,
+                    logging.INFO,
+                    "mcp_jsonrpc_redirect_followed",
+                    method=method,
+                    redirects=" -> ".join(str(item.url) for item in response.history + [response]),
+                    final_url=str(response.url),
+                    final_status=response.status_code,
+                )
             log_kv(
                 logger,
                 logging.DEBUG,
                 "mcp_jsonrpc_response",
                 method=method,
+                url=str(response.url),
                 status_code=response.status_code,
                 content_type=response.headers.get("content-type", ""),
             )
@@ -81,9 +100,9 @@ class MCPClient:
 
     def _client(self) -> httpx.AsyncClient:
         return httpx.AsyncClient(
-            base_url=self.settings.mcp_server_url.rstrip("/"),
             timeout=httpx.Timeout(self.settings.mcp_timeout_seconds),
             verify=self.settings.mcp_verify_tls,
+            follow_redirects=self.settings.mcp_follow_redirects,
             transport=self._transport,
         )
 

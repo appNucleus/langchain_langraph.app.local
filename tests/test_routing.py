@@ -64,3 +64,16 @@ def test_router_mail_send_draft_is_guarded_intent() -> None:
     plan = router.plan("send draft email now")
     assert plan.intent == "mail_send_draft"
     assert plan.tools == ["mail_send_draft"]
+
+
+
+def test_rewriter_respects_yesterday_for_world_cup_results() -> None:
+    settings = Settings()
+    router = ModelRouter(settings)
+    message = "What is yesterdays world cup match results in detail"
+    plan = router.plan(message)
+    rewritten = QueryRewriter(settings).rewrite(message, plan).lower()
+    assert plan.intent == "sports_or_match_results"
+    assert "yesterday" in rewritten
+    assert "today match results" not in rewritten
+    assert "final score" in rewritten

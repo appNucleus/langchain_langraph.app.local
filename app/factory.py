@@ -29,6 +29,7 @@ def create_app(*, settings: Settings | None = None, chat_agent: ChatAgent | None
         mcp_enabled=app_settings.mcp_enabled,
         mcp_url=app_settings.mcp_server_url,
         mcp_verify_tls=app_settings.mcp_verify_tls,
+        mcp_follow_redirects=app_settings.mcp_follow_redirects,
     )
     agent = chat_agent or ChatAgent(app_settings)
 
@@ -86,6 +87,7 @@ def create_app(*, settings: Settings | None = None, chat_agent: ChatAgent | None
             "mcp_configured": bool(current_settings.mcp_server_url),
             "mcp_enabled": current_settings.mcp_enabled,
             "mcp_verify_tls": current_settings.mcp_verify_tls,
+            "mcp_follow_redirects": current_settings.mcp_follow_redirects,
             "mcp_timeout_seconds": current_settings.mcp_timeout_seconds,
             "models": {
                 "simple": current_settings.model_simple,
