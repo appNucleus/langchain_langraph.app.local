@@ -18,7 +18,18 @@ class FakeOllamaClient:
         self.stream_calls: list[dict[str, Any]] = []
 
     async def health(self) -> dict[str, Any]:
-        return {"root": "Ollama is running", "models": ["qwen3.5:4b"]}
+        return {"root": "Ollama is running", "models": [item["name"] for item in await self.list_models()]}
+
+    async def list_models(self) -> list[dict[str, Any]]:
+        return [
+            {"name": "qwen3.5:2b", "size": 2700000000},
+            {"name": "qwen3.5:4b", "size": 3400000000},
+            {"name": "qwen3.5:9b", "size": 6600000000},
+            {"name": "phi4-mini-reasoning:latest", "size": 3200000000},
+            {"name": "gemma4:26b-a4b-it-qat", "size": 15000000000},
+            {"name": "qwen3-vl:4b", "size": 3300000000},
+            {"name": "qwen3-embedding:0.6b", "size": 639000000},
+        ]
 
     async def chat(self, *, model: str, messages: Sequence[dict[str, str]], temperature: float | None = None, num_predict: int | None = None) -> LLMResponse:
         self.calls.append({"model": model, "messages": list(messages), "temperature": temperature, "num_predict": num_predict})
@@ -42,7 +53,23 @@ class FakeMCPClient:
         self.calls: list[dict[str, Any]] = []
 
     async def list_tools(self) -> list[dict[str, Any]]:
-        return [{"name": "weather_lookup"}]
+        return [
+            {"name": "health_check", "description": "Check MCP health."},
+            {"name": "web_search", "description": "Search the web."},
+            {"name": "web_search_and_scrape", "description": "Search and scrape pages."},
+            {"name": "scrape_url", "description": "Scrape a URL."},
+            {"name": "extract_image_urls", "description": "Extract images from a URL."},
+            {"name": "weather_lookup", "description": "Get current weather and forecast."},
+            {"name": "stock_quote", "description": "Get stock quote."},
+            {"name": "stock_news", "description": "Get stock news."},
+            {"name": "explain_stock_move", "description": "Explain stock moves."},
+            {"name": "news_search", "description": "Search recent news."},
+            {"name": "road_condition_search", "description": "Search road conditions."},
+            {"name": "mail_search", "description": "Search mail."},
+            {"name": "mail_read", "description": "Read mail."},
+            {"name": "mail_create_draft", "description": "Create mail draft."},
+            {"name": "mail_send_draft", "description": "Send confirmed draft."},
+        ]
 
     async def health_check(self) -> MCPToolResult:
         return MCPToolResult(tool="health_check", ok=True, data={"status": "ok"})
