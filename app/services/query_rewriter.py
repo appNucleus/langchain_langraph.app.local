@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from app.services.routing import QueryPlan, extract_location, extract_road, extract_ticker
@@ -23,7 +23,9 @@ class QueryRewriter:
     def rewrite(self, message: str, plan: QueryPlan, *, metadata: dict | None = None) -> str:
         metadata = metadata or {}
         base = self._clean(message)
-        today = datetime.now(ZoneInfo("America/Indiana/Indianapolis")).strftime("%Y-%m-%d")
+        now = datetime.now(ZoneInfo("America/Indiana/Indianapolis"))
+        today = now.strftime("%Y-%m-%d")
+        yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
 
         if plan.intent == "weather":
             location = extract_location(message, metadata)
@@ -34,9 +36,19 @@ class QueryRewriter:
             return f"{ticker} stock quote latest news earnings analyst guidance price movement last {self.settings.default_news_lookback_days} days {today}"
 
         if plan.intent == "sports_or_match_results":
+            lowered = message.lower()
+            if _contains_any(lowered, ["yesterday", "yesterdays", "yesterday's"]):
+                date_phrase = f"yesterday {yesterday}"
+            elif _contains_any(lowered, ["today", "todays", "today's"]):
+                date_phrase = f"today {today}"
+            elif _contains_any(lowered, ["tomorrow", "tomorrows", "tomorrow's"]):
+                tomorrow = (now + timedelta(days=1)).strftime("%Y-%m-%d")
+                date_phrase = f"tomorrow {tomorrow}"
+            else:
+                date_phrase = f"latest {today}"
             return (
-                f"{base} today match results final score highlights schedule official match centre "
-                f"ESPN FIFA ICC reliable sources {today}"
+                f"{base} {date_phrase} match results final score highlights schedule official match centre "
+                "ESPN FIFA ICC reliable sources"
             )
 
         if plan.intent == "news":
@@ -65,3 +77,7 @@ class QueryRewriter:
         if len(text) > 350:
             return text[:350].rsplit(" ", 1)[0]
         return text
+
+
+def _contains_any(text: str, needles: list[str]) -> bool:
+    return any(needle in text for needle in needles)

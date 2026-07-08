@@ -58,3 +58,57 @@ async def test_mcp_sse_response_decode() -> None:
 
     client = MCPClient(Settings(mcp_server_url="https://mcp.test/mcp"), transport=httpx.MockTransport(handler))
     assert await client.list_tools() == []
+
+
+@pytest.mark.asyncio
+async def test_mcp_client_posts_exact_configured_url_without_trailing_slash() -> None:
+    seen_urls: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen_urls.append(str(request.url))
+        payload = json.loads(request.content.decode())
+        return httpx.Response(
+            200,
+            json={"jsonrpc": "2.0", "id": payload["id"], "result": {"tools": []}},
+        )
+
+    client = MCPClient(Settings(mcp_server_url="https://mcp.test/mcp"), transport=httpx.MockTransport(handler))
+
+    assert await client.list_tools() == []
+    assert seen_urls == ["https://mcp.test/mcp"]
+
+
+@pytest.mark.asyncio
+async def test_mcp_client_follows_307_redirect_over_network_dns_endpoint() -> None:
+    seen_urls: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen_urls.append(str(request.url))
+        if str(request.url) == "https://mcp.test/mcp":
+            return httpx.Response(307, headers={"location": "http://mcp.test/mcp"})
+        payload = json.loads(request.content.decode())
+        return httpx.Response(
+            200,
+            json={"jsonrpc": "2.0", "id": payload["id"], "result": {"tools": [{"name": "health_check"}]}},
+        )
+
+    client = MCPClient(Settings(mcp_server_url="https://mcp.test/mcp"), transport=httpx.MockTransport(handler))
+
+    assert await client.list_tools() == [{"name": "health_check"}]
+    assert seen_urls == ["https://mcp.test/mcp", "http://mcp.test/mcp"]
+
+
+@pytest.mark.asyncio
+async def test_mcp_client_can_disable_redirect_following() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(307, headers={"location": "http://mcp.test/mcp"})
+
+    client = MCPClient(
+        Settings(mcp_server_url="https://mcp.test/mcp", mcp_follow_redirects=False),
+        transport=httpx.MockTransport(handler),
+    )
+
+    result = await client.call_tool("news_search", {"query": "test"})
+    assert result.ok is False
+    assert "HTTPStatusError" in (result.error or "")
+    assert "307" in (result.error or "")
