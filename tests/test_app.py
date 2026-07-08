@@ -133,3 +133,34 @@ def test_forced_tools_can_cover_supported_mcp_surface(client: TestClient, fake_m
     assert response.status_code == 200
     names = [call["name"] for call in fake_mcp.calls[-3:]]
     assert names == ["health_check", "web_search", "mail_read"]
+
+
+def test_world_cup_match_results_uses_search_and_scrape(client: TestClient, fake_mcp: FakeMCPClient) -> None:
+    response = client.post(
+        "/api/chat",
+        json={"message": "What is todays world cup match results in detail"},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["metadata"]["intent"] == "sports_or_match_results"
+    assert payload["metadata"]["tools_requested"] == ["web_search_and_scrape", "news_search"]
+    names = [call["name"] for call in fake_mcp.calls[-2:]]
+    assert names == ["web_search_and_scrape", "news_search"]
+    rewritten = payload["metadata"]["rewritten_query"].lower()
+    assert "final score" in rewritten
+    assert "official match centre" in rewritten
+
+
+def test_echo_backend_skips_real_mcp_calls(fake_mcp: FakeMCPClient) -> None:
+    settings = Settings(llm_backend="echo", mcp_enabled=True, api_key="")
+    app = create_app(settings=settings, chat_agent=ChatAgent(settings, mcp_client=fake_mcp))
+    client = TestClient(app)
+
+    response = client.post("/api/chat", json={"message": "latest OpenAI news"})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["backend"] == "echo"
+    assert payload["metadata"]["tools_requested"] == ["news_search"]
+    assert payload["metadata"]["tools_used"] == []
+    assert fake_mcp.calls == []

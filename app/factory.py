@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+import logging
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
@@ -9,12 +10,26 @@ from fastapi.responses import StreamingResponse
 
 from app import __version__
 from app.graph import ChatAgent, encode_sse
+from app.logging_config import configure_logging, log_kv
 from app.schemas.chat import ChatRequest, ChatResponse
 from app.settings import Settings, get_settings
 
 
 def create_app(*, settings: Settings | None = None, chat_agent: ChatAgent | None = None) -> FastAPI:
     app_settings = settings or get_settings()
+    configure_logging(app_settings.log_level)
+    logger = logging.getLogger(__name__)
+    log_kv(
+        logger,
+        logging.INFO,
+        "app_start",
+        environment=app_settings.environment,
+        backend=app_settings.llm_backend,
+        ollama=app_settings.ollama_base_url,
+        mcp_enabled=app_settings.mcp_enabled,
+        mcp_url=app_settings.mcp_server_url,
+        mcp_verify_tls=app_settings.mcp_verify_tls,
+    )
     agent = chat_agent or ChatAgent(app_settings)
 
     app = FastAPI(
@@ -65,10 +80,13 @@ def create_app(*, settings: Settings | None = None, chat_agent: ChatAgent | None
             "version": __version__,
             "environment": current_settings.environment,
             "backend": current_settings.llm_backend,
+            "log_level": current_settings.log_level,
+            "api_key_enabled": bool(current_settings.api_key),
             "ollama_base_url": current_settings.ollama_base_url,
             "mcp_configured": bool(current_settings.mcp_server_url),
             "mcp_enabled": current_settings.mcp_enabled,
             "mcp_verify_tls": current_settings.mcp_verify_tls,
+            "mcp_timeout_seconds": current_settings.mcp_timeout_seconds,
             "models": {
                 "simple": current_settings.model_simple,
                 "general": current_settings.model_general,
@@ -106,11 +124,29 @@ def create_app(*, settings: Settings | None = None, chat_agent: ChatAgent | None
     @app.post("/api/chat", response_model=ChatResponse, dependencies=[Depends(require_api_key)])
     async def chat(request: Request, chat_request: ChatRequest) -> ChatResponse:
         agent: ChatAgent = request.app.state.chat_agent
+        current_settings: Settings = request.app.state.settings
+        log_kv(
+            logging.getLogger(__name__),
+            logging.INFO,
+            "chat_request",
+            thread_id=chat_request.thread_id,
+            backend=current_settings.llm_backend,
+            message_chars=len(chat_request.message),
+        )
         return await agent.ainvoke(chat_request)
 
     @app.post("/api/chat/stream", dependencies=[Depends(require_api_key)])
     async def chat_stream(request: Request, chat_request: ChatRequest) -> StreamingResponse:
         agent: ChatAgent = request.app.state.chat_agent
+        current_settings: Settings = request.app.state.settings
+        log_kv(
+            logging.getLogger(__name__),
+            logging.INFO,
+            "chat_stream_request",
+            thread_id=chat_request.thread_id,
+            backend=current_settings.llm_backend,
+            message_chars=len(chat_request.message),
+        )
 
         async def events() -> AsyncIterator[str]:
             try:
