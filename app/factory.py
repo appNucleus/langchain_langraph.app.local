@@ -11,6 +11,7 @@ from fastapi.responses import StreamingResponse
 from app import __version__
 from app.graph import ChatAgent, encode_sse
 from app.logging_config import configure_logging, log_kv
+from app.services.inventory import build_inventory_payload
 from app.schemas.chat import ChatRequest, ChatResponse
 from app.settings import Settings, get_settings
 
@@ -70,6 +71,7 @@ def create_app(*, settings: Settings | None = None, chat_agent: ChatAgent | None
             "health": "/health",
             "chat": "/api/chat",
             "stream": "/api/chat/stream",
+            "inventory": "/api/inventory",
         }
 
     @app.get("/health")
@@ -90,15 +92,25 @@ def create_app(*, settings: Settings | None = None, chat_agent: ChatAgent | None
             "mcp_follow_redirects": current_settings.mcp_follow_redirects,
             "mcp_timeout_seconds": current_settings.mcp_timeout_seconds,
             "models": {
+                "planner": current_settings.model_planner,
                 "simple": current_settings.model_simple,
                 "general": current_settings.model_general,
                 "search": current_settings.model_search,
                 "reasoning": current_settings.model_reasoning,
                 "heavy": current_settings.model_heavy,
+                "synthesis": current_settings.model_synthesis,
                 "vision": current_settings.model_vision,
                 "embedding": current_settings.embedding_model,
             },
         }
+
+    @app.get("/api/inventory", dependencies=[Depends(require_api_key)])
+    async def inventory(request: Request) -> dict[str, object]:
+        """Return live Ollama models and live MCP tools available to this app."""
+        agent: ChatAgent = request.app.state.chat_agent
+        current_settings: Settings = request.app.state.settings
+        live_inventory = await agent.load_inventory()
+        return build_inventory_payload(current_settings, live_inventory, agent.selector)
 
     @app.get("/health/live")
     async def live_health(request: Request) -> dict[str, object]:

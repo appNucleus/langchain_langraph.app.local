@@ -45,12 +45,22 @@ class OllamaClient:
         async with self._client() as client:
             root = await client.get("/")
             root.raise_for_status()
-            tags = await client.get("/api/tags")
-            tags.raise_for_status()
+            models = await self.list_models(client=client)
             return {
                 "root": root.text.strip(),
-                "models": [item.get("name") for item in tags.json().get("models", [])],
+                "models": [item.get("name") or item.get("model") for item in models],
             }
+
+    async def list_models(self, *, client: httpx.AsyncClient | None = None) -> list[dict[str, Any]]:
+        """Return live local Ollama models from GET /api/tags."""
+        if client is not None:
+            response = await client.get("/api/tags")
+            response.raise_for_status()
+            return list(response.json().get("models") or [])
+        async with self._client() as owned_client:
+            response = await owned_client.get("/api/tags")
+            response.raise_for_status()
+            return list(response.json().get("models") or [])
 
     async def chat(
         self,

@@ -43,3 +43,14 @@ async def test_ollama_stream_skips_thinking_chunks() -> None:
     client = OllamaClient(Settings(ollama_base_url="http://ollama.test:11434"), transport=httpx.MockTransport(handler))
     chunks = [chunk async for chunk in client.stream_chat(model="qwen3.5:4b", messages=[{"role": "user", "content": "hi"}])]
     assert chunks == ["hello", " world"]
+
+
+@pytest.mark.asyncio
+async def test_ollama_list_models_reads_api_tags() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/tags"
+        return httpx.Response(200, json={"models": [{"name": "qwen3.5:4b"}]})
+
+    client = OllamaClient(Settings(ollama_base_url="http://ollama.test:11434"), transport=httpx.MockTransport(handler))
+    models = await client.list_models()
+    assert models == [{"name": "qwen3.5:4b"}]

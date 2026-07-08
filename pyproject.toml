@@ -1,7 +1,7 @@
 [project]
 name = "langchain-langraph-app"
-version = "0.1.0"
-description = "Minimal FastAPI + LangGraph app server ready for Ollama, MCP, and database integrations."
+version = "0.4.0"
+description = "FastAPI + LangGraph app server with live Ollama/MCP inventory, dynamic routing, and multi-query synthesis."
 requires-python = ">=3.12"
 readme = "README.md"
 license = { text = "MIT" }

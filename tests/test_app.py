@@ -165,3 +165,28 @@ def test_echo_backend_skips_real_mcp_calls(fake_mcp: FakeMCPClient) -> None:
     assert payload["metadata"]["tools_requested"] == ["news_search"]
     assert payload["metadata"]["tools_used"] == []
     assert fake_mcp.calls == []
+
+
+def test_inventory_endpoint_lists_live_models_and_tools(client: TestClient) -> None:
+    response = client.get("/api/inventory")
+    assert response.status_code == 200
+    payload = response.json()
+    assert "qwen3.5:4b" in payload["ollama"]["model_names"]
+    assert payload["ollama"]["configured_roles"]["general"]["resolved"] == "qwen3.5:4b"
+    assert "web_search_and_scrape" in payload["mcp"]["tool_names"]
+    assert payload["errors"] == {}
+
+
+def test_compound_request_is_split_answered_and_synthesized(client: TestClient, fake_mcp: FakeMCPClient) -> None:
+    response = client.post(
+        "/api/chat",
+        json={"message": "What is the latest OpenAI news? Also what is the weather in Indianapolis tomorrow?"},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert len(payload["metadata"]["subqueries"]) >= 2
+    assert payload["metadata"]["subqueries"][0]["tools"]
+    assert payload["metadata"]["task_answers"]
+    called_tools = [call["name"] for call in fake_mcp.calls]
+    assert "news_search" in called_tools
+    assert "weather_lookup" in called_tools

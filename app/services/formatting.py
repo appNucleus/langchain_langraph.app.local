@@ -60,9 +60,11 @@ class PromptBuilder:
             "- If tool evidence is present, base factual/current claims on that evidence.\n"
             "- If evidence is missing or weak, say what is missing; do not invent sources.\n"
             "- Never expose chain-of-thought, hidden reasoning, or fields named thinking.\n"
-            "- Prefer a direct answer first, then relevant details.\n"
+            "- Prefer a direct answer first, then useful context, tradeoffs, and next steps.\n"
+            "- Be broad enough to answer the real need, not only the narrow literal words.\n"
+            "- Use very simple language. A young student should understand the main answer.\n"
             "- For current information, mention the freshness/limits of the evidence when useful.\n"
-            "- Include references naturally when source URLs/titles are available.\n"
+            "- Put references in a separate References section when source URLs/titles are available.\n"
         )
         user = (
             f"Current session context:\n{history_text}\n\n"
@@ -70,7 +72,49 @@ class PromptBuilder:
             f"Optimized search query: {rewritten_query or 'not needed'}\n\n"
             f"Tool evidence:\n{evidence}\n\n"
             f"Reference guidance:\n{ref_text}\n\n"
+            "Answer format:\n"
+            "1. Start with the clear answer.\n"
+            "2. Add the important details that help the user act correctly.\n"
+            "3. Keep the wording clean and easy.\n"
+            "4. Do not include hidden reasoning.\n\n"
             f"User message:\n{user_message}"
+        )
+        value = self._prompt.invoke({"system": system, "user": user})
+        messages: list[dict[str, str]] = []
+        for msg in value.messages:
+            role = msg.type
+            if role == "human":
+                role = "user"
+            elif role == "ai":
+                role = "assistant"
+            messages.append({"role": role, "content": str(msg.content)})
+        return messages
+
+    def build_synthesis_messages(
+        self,
+        *,
+        original_message: str,
+        system_prompt: str,
+        history: Sequence[ConversationTurn],
+        task_answers: Sequence[dict[str, Any]],
+        references: Sequence[dict[str, str]],
+    ) -> list[dict[str, str]]:
+        history_text = self.memory.render(history)
+        ref_text = render_reference_instruction(references)
+        system = (
+            f"{system_prompt}\n\n"
+            "You are combining answers from several smaller questions into one final answer.\n"
+            "Use simple words, keep it broad and useful, and avoid repeating the same point.\n"
+            "Start with the final answer, then give helpful details or steps.\n"
+            "Put references in a separate References section when references are available.\n"
+            "Never expose hidden reasoning.\n"
+        )
+        user = (
+            f"Current session context:\n{history_text}\n\n"
+            f"Original user message:\n{original_message}\n\n"
+            f"Individual answers:\n{_to_compact_json(list(task_answers))}\n\n"
+            f"Reference guidance:\n{ref_text}\n\n"
+            "Create one clean final answer that covers all parts."
         )
         value = self._prompt.invoke({"system": system, "user": user})
         messages: list[dict[str, str]] = []
@@ -146,14 +190,14 @@ def render_reference_instruction(references: Sequence[dict[str, str]]) -> str:
     return "\n".join(lines)
 
 
-def append_references(answer: str, references: Sequence[dict[str, str]]) -> str:
+def append_references(answer: str, references: Sequence[dict[str, str]], *, limit: int = 3) -> str:
     answer = clean_model_output(answer)
     if not references:
         return answer
     if "references:" in answer.lower() or "sources:" in answer.lower():
         return answer
     lines = [answer.rstrip(), "", "References:"]
-    for idx, ref in enumerate(references, 1):
+    for idx, ref in enumerate(list(references)[:limit], 1):
         lines.append(f"{idx}. {ref['title']} — {ref['url']}")
     return "\n".join(lines)
 
