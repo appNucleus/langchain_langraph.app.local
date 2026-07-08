@@ -86,6 +86,15 @@ class ModelRouter:
                 "Road condition requests require fresh official/state data.",
             )
 
+        if _contains_any(lower, ["world cup", "match result", "match results", "score", "scores", "fixture", "fixtures", "standings", "who won", "final score"]):
+            return QueryPlan(
+                "sports_or_match_results",
+                ["web_search_and_scrape", "news_search"],
+                "search",
+                True,
+                "Sports/match results are current information and need search plus page evidence.",
+            )
+
         if self._looks_like_stock_request(text):
             tools = ["stock_quote"]
             if _contains_any(lower, ["why", "move", "moved", "down", "up", "drop", "gain", "reason"]):

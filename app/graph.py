@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from collections.abc import AsyncIterator
 from typing import Any, TypedDict
 from uuid import uuid4
@@ -9,6 +10,7 @@ from uuid import uuid4
 from langgraph.graph import END, START, StateGraph
 
 from app.llm.ollama import OllamaClient
+from app.logging_config import log_kv
 from app.mcp.client import MCPClient, MCPToolResult
 from app.schemas.chat import ChatRequest, ChatResponse
 from app.services.formatting import (
@@ -28,6 +30,8 @@ from app.services.routing import (
 )
 from app.services.routing import ModelRouter
 from app.settings import Settings
+
+logger = logging.getLogger(__name__)
 
 
 class ChatGraphState(TypedDict, total=False):
@@ -71,6 +75,15 @@ class ChatAgent:
         self.rewriter = QueryRewriter(settings)
         self.prompt_builder = PromptBuilder(settings, self.memory)
         self.graph = self._build_graph()
+        log_kv(
+            logger,
+            logging.INFO,
+            "agent_initialized",
+            backend=settings.llm_backend,
+            mcp_enabled=settings.mcp_enabled,
+            model_general=settings.model_general,
+            model_search=settings.model_search,
+        )
 
     def _build_graph(self):
         builder = StateGraph(ChatGraphState)
@@ -89,14 +102,24 @@ class ChatAgent:
 
     async def ainvoke(self, request: ChatRequest) -> ChatResponse:
         thread_id = request.thread_id or str(uuid4())
+        log_kv(logger, logging.INFO, "ainvoke_start", thread_id=thread_id, message_chars=len(request.message))
         initial: ChatGraphState = {
             "thread_id": thread_id,
             "message": request.message,
-            "system_prompt": request.system_prompt or self.settings.default_system_prompt,
+            "system_prompt": self._system_prompt_or_default(request.system_prompt),
             "metadata": dict(request.metadata or {}),
         }
         result = await self.graph.ainvoke(initial)
         response_text = result.get("response", "")
+        log_kv(
+            logger,
+            logging.INFO,
+            "ainvoke_done",
+            thread_id=thread_id,
+            backend=result.get("backend", self.settings.llm_backend),
+            model=result.get("model"),
+            response_chars=len(response_text),
+        )
         await self.memory.add_pair(thread_id, user=request.message, assistant=response_text)
         return ChatResponse.from_result(
             thread_id=thread_id,
@@ -108,10 +131,11 @@ class ChatAgent:
 
     async def astream_events(self, request: ChatRequest) -> AsyncIterator[dict[str, Any]]:
         thread_id = request.thread_id or str(uuid4())
+        log_kv(logger, logging.INFO, "astream_start", thread_id=thread_id, message_chars=len(request.message))
         state: ChatGraphState = {
             "thread_id": thread_id,
             "message": request.message,
-            "system_prompt": request.system_prompt or self.settings.default_system_prompt,
+            "system_prompt": self._system_prompt_or_default(request.system_prompt),
             "metadata": dict(request.metadata or {}),
         }
         yield {"event": "status", "data": {"status": "started", "thread_id": thread_id}}
@@ -194,7 +218,18 @@ class ChatAgent:
 
     async def _plan_node(self, state: ChatGraphState) -> ChatGraphState:
         plan = self.router.plan(state["message"], state.get("metadata", {}))
-        return {**state, "plan": plan, "model": self.settings.model_for_key(plan.model_key)}
+        model = self.settings.model_for_key(plan.model_key)
+        log_kv(
+            logger,
+            logging.INFO,
+            "route_plan",
+            thread_id=state.get("thread_id"),
+            intent=plan.intent,
+            tools=",".join(plan.tools),
+            model=model,
+            reason=plan.reason,
+        )
+        return {**state, "plan": plan, "model": model}
 
     async def _rewrite_node(self, state: ChatGraphState) -> ChatGraphState:
         plan = state["plan"]
@@ -205,6 +240,7 @@ class ChatAgent:
                 plan,
                 metadata=state.get("metadata", {}),
             )
+            log_kv(logger, logging.INFO, "query_rewritten", thread_id=state.get("thread_id"), query=rewritten)
         return {**state, "rewritten_query": rewritten}
 
     async def _tools_node(self, state: ChatGraphState) -> ChatGraphState:
@@ -212,24 +248,56 @@ class ChatAgent:
         if not self.settings.mcp_enabled or not plan.tools:
             return {**state, "tool_results": [], "references": []}
 
+        if self.settings.llm_backend == "echo":
+            log_kv(
+                logger,
+                logging.WARNING,
+                "mcp_skipped_echo_backend",
+                thread_id=state.get("thread_id"),
+                requested_tools=",".join(plan.tools),
+            )
+            return {**state, "tool_results": [], "references": []}
+
         requested_tools = plan.tools[: self.settings.max_tool_calls]
         prepared: list[tuple[str, dict[str, Any] | None]] = [(tool, self._tool_args(tool, state)) for tool in requested_tools]
 
         async def run_tool(tool: str, args: dict[str, Any] | None) -> MCPToolResult:
             if args is None:
+                log_kv(logger, logging.WARNING, "mcp_tool_missing_args", thread_id=state.get("thread_id"), tool=tool)
                 return MCPToolResult(tool=tool, ok=False, data=None, error="Missing required tool arguments.")
-            return await self.mcp.call_tool(tool, args)
+            log_kv(
+                logger,
+                logging.INFO,
+                "mcp_tool_start",
+                thread_id=state.get("thread_id"),
+                tool=tool,
+                arg_keys=",".join(sorted(args.keys())),
+            )
+            result = await self.mcp.call_tool(tool, args)
+            log_kv(
+                logger,
+                logging.INFO if result.ok else logging.ERROR,
+                "mcp_tool_done",
+                thread_id=state.get("thread_id"),
+                tool=tool,
+                ok=result.ok,
+                error=result.error,
+            )
+            return result
 
         results = list(await asyncio.gather(*(run_tool(tool, args) for tool, args in prepared)))
         references = extract_references(results, limit=self.settings.max_references)
+        log_kv(logger, logging.INFO, "mcp_tools_complete", thread_id=state.get("thread_id"), refs=len(references))
         return {**state, "tool_results": results, "references": references}
 
     async def _answer_node(self, state: ChatGraphState) -> ChatGraphState:
         if self.settings.llm_backend == "echo":
+            log_kv(logger, logging.WARNING, "echo_backend_response", thread_id=state.get("thread_id"))
             return {**state, "response": self._echo_response(state), "backend": "echo", "model": None}
 
         model = state.get("model") or self.settings.model_for_key(state["plan"].model_key)
         messages = self._messages_for_state(state)
+        log_kv(logger, logging.INFO, "ollama_answer_start", thread_id=state.get("thread_id"), model=model, messages=len(messages))
         result = await self.ollama.chat(
             model=model,
             messages=messages,
@@ -239,6 +307,7 @@ class ChatAgent:
         response = append_references(clean_model_output(result.content), state.get("references", []))
         if not response:
             response = "I could not get answer content from the local Ollama model."
+        log_kv(logger, logging.INFO, "ollama_answer_done", thread_id=state.get("thread_id"), model=result.model, response_chars=len(response))
         return {**state, "response": response, "backend": "ollama", "model": result.model}
 
     def _messages_for_state(self, state: ChatGraphState) -> list[dict[str, str]]:
@@ -380,6 +449,14 @@ class ChatAgent:
         if isinstance(tool_overrides, dict):
             return {**(args or {}), **tool_overrides}
         return args
+
+
+    def _system_prompt_or_default(self, system_prompt: str | None) -> str:
+        # Swagger/OpenAPI examples often send the literal placeholder "string".
+        # Treat that as no custom system prompt so the assistant keeps its real instructions.
+        if not system_prompt or system_prompt.strip().lower() == "string":
+            return self.settings.default_system_prompt
+        return system_prompt
 
     def _echo_response(self, state: ChatGraphState) -> str:
         plan = state.get("plan")
