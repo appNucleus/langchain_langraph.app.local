@@ -27,7 +27,7 @@ class ChatResponse(BaseModel):
         thread_id: str | None,
         response: str,
         backend: str,
-        model: str | None,
+        model: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> "ChatResponse":
         return cls(
