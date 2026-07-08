@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from typing import Any, TypedDict
 from uuid import uuid4
 
@@ -13,12 +13,14 @@ from app.llm.ollama import OllamaClient
 from app.logging_config import log_kv
 from app.mcp.client import MCPClient, MCPToolResult
 from app.schemas.chat import ChatRequest, ChatResponse
+from app.services.decomposition import QueryDecomposer, QueryTask
 from app.services.formatting import (
     PromptBuilder,
     append_references,
     clean_model_output,
     extract_references,
 )
+from app.services.inventory import InventoryService, ModelSelector, RuntimeInventory
 from app.services.memory import ConversationTurn, InMemoryConversationStore
 from app.services.query_rewriter import QueryRewriter
 from app.services.routing import (
@@ -40,23 +42,29 @@ class ChatGraphState(TypedDict, total=False):
     system_prompt: str
     metadata: dict[str, Any]
     history: list[ConversationTurn]
+    inventory: RuntimeInventory
     plan: QueryPlan
+    tasks: list[QueryTask]
     rewritten_query: str | None
     tool_results: list[MCPToolResult]
+    task_tool_results: dict[str, list[MCPToolResult]]
+    task_answers: list[dict[str, Any]]
     references: list[dict[str, str]]
     response: str
     backend: str
     model: str | None
+    models_used: list[str]
 
 
 class ChatAgent:
     """LangGraph-backed chat orchestrator.
 
-    Graph path for non-streaming calls:
-        START -> prepare -> plan -> rewrite -> call_tools -> answer -> END
+    Non-streaming path:
+        START -> prepare -> inventory -> plan -> rewrite -> call_tools -> answer -> END
 
-    Streaming calls use the same node methods but stream the final Ollama call
-    token-by-token as SSE events.
+    The graph now plans against live Ollama/MCP inventory, can split compound
+    requests into simple tasks, answers each task with the best available model
+    and tools, then synthesizes a clean final answer.
     """
 
     def __init__(
@@ -72,6 +80,9 @@ class ChatAgent:
         self.mcp = mcp_client or MCPClient(settings)
         self.memory = memory or InMemoryConversationStore(settings)
         self.router = ModelRouter(settings)
+        self.selector = ModelSelector(settings)
+        self.inventory_service = InventoryService(settings, self.ollama, self.mcp)
+        self.decomposer = QueryDecomposer(settings, self.router, self.selector)
         self.rewriter = QueryRewriter(settings)
         self.prompt_builder = PromptBuilder(settings, self.memory)
         self.graph = self._build_graph()
@@ -88,12 +99,14 @@ class ChatAgent:
     def _build_graph(self):
         builder = StateGraph(ChatGraphState)
         builder.add_node("prepare", self._prepare_node)
+        builder.add_node("inventory", self._inventory_node)
         builder.add_node("plan", self._plan_node)
         builder.add_node("rewrite", self._rewrite_node)
         builder.add_node("call_tools", self._tools_node)
         builder.add_node("answer", self._answer_node)
         builder.add_edge(START, "prepare")
-        builder.add_edge("prepare", "plan")
+        builder.add_edge("prepare", "inventory")
+        builder.add_edge("inventory", "plan")
         builder.add_edge("plan", "rewrite")
         builder.add_edge("rewrite", "call_tools")
         builder.add_edge("call_tools", "answer")
@@ -141,16 +154,28 @@ class ChatAgent:
         yield {"event": "status", "data": {"status": "started", "thread_id": thread_id}}
 
         state.update(await self._prepare_node(state))
+        state.update(await self._inventory_node(state))
+        inventory = state.get("inventory") or RuntimeInventory()
+        yield {
+            "event": "inventory",
+            "data": {
+                "models": inventory.model_names,
+                "tools": inventory.tool_names,
+                "errors": inventory.errors,
+            },
+        }
+
         state.update(await self._plan_node(state))
+        tasks = state.get("tasks", [])
         plan = state["plan"]
-        model = self.settings.model_for_key(plan.model_key)
         yield {
             "event": "plan",
             "data": {
                 "intent": plan.intent,
                 "tools": plan.tools,
-                "model": model,
+                "model": state.get("model"),
                 "reason": plan.reason,
+                "tasks": [task.as_metadata() for task in tasks],
             },
         }
 
@@ -158,8 +183,9 @@ class ChatAgent:
         if state.get("rewritten_query"):
             yield {"event": "query", "data": {"query": state["rewritten_query"]}}
 
-        if plan.tools and self.settings.mcp_enabled:
-            for tool in plan.tools[: self.settings.max_tool_calls]:
+        all_tools = [tool for task in state.get("tasks", []) for tool in task.tools]
+        if all_tools and self.settings.mcp_enabled:
+            for tool in all_tools[: self.settings.max_tool_calls * max(1, len(tasks))]:
                 yield {"event": "tool_start", "data": {"tool": tool}}
             state.update(await self._tools_node(state))
             for result in state.get("tool_results", []):
@@ -168,7 +194,7 @@ class ChatAgent:
                     "data": {"tool": result.tool, "ok": result.ok, "error": result.error},
                 }
         else:
-            state.update({"tool_results": [], "references": []})
+            state.update({"tool_results": [], "task_tool_results": {}, "references": []})
 
         if self.settings.llm_backend == "echo":
             response = self._echo_response(state)
@@ -177,29 +203,35 @@ class ChatAgent:
                 await asyncio.sleep(0)
             state.update({"response": response, "backend": "echo", "model": None})
         else:
-            messages = self._messages_for_state(state)
-            response_parts: list[str] = []
-            try:
-                async for delta in self.ollama.stream_chat(
-                    model=model,
-                    messages=messages,
-                    temperature=self.settings.ollama_temperature,
-                    num_predict=self.settings.ollama_stream_num_predict,
-                ):
-                    # OllamaClient already suppresses message.thinking. Do not strip
-                    # every token here, because stripping breaks spaces between chunks.
-                    clean_delta = delta
-                    if not clean_delta:
-                        continue
-                    response_parts.append(clean_delta)
-                    yield {"event": "token", "data": {"delta": clean_delta}}
-            except Exception as exc:  # noqa: BLE001 - report as SSE error and fallback.
-                yield {"event": "error", "data": {"message": str(exc)}}
-            response = clean_model_output("".join(response_parts))
-            if not response:
-                response = "I could not get answer content from the local Ollama model."
-            response = append_references(response, state.get("references", []))
-            state.update({"response": response, "backend": "ollama", "model": model})
+            # Streaming keeps the final response streamed. For multiple tasks, use
+            # the normal answer node to preserve decomposition/synthesis quality.
+            if len(state.get("tasks", [])) > 1:
+                state.update(await self._answer_node(state))
+                for chunk in _chunk_text(state.get("response", "")):
+                    yield {"event": "token", "data": {"delta": chunk}}
+                    await asyncio.sleep(0)
+            else:
+                model = state.get("model") or self.selector.resolve(state["plan"].model_key, inventory)
+                messages = self._messages_for_state(state)
+                response_parts: list[str] = []
+                try:
+                    async for delta in self.ollama.stream_chat(
+                        model=model,
+                        messages=messages,
+                        temperature=self.settings.ollama_temperature,
+                        num_predict=self.settings.ollama_stream_num_predict,
+                    ):
+                        if not delta:
+                            continue
+                        response_parts.append(delta)
+                        yield {"event": "token", "data": {"delta": delta}}
+                except Exception as exc:  # noqa: BLE001 - report as SSE error and fallback.
+                    yield {"event": "error", "data": {"message": str(exc)}}
+                response = clean_model_output("".join(response_parts))
+                if not response:
+                    response = "I could not get answer content from the local Ollama model."
+                response = append_references(response, state.get("references", []), limit=self.settings.answer_reference_limit)
+                state.update({"response": response, "backend": "ollama", "model": model, "models_used": [model]})
 
         await self.memory.add_pair(thread_id, user=request.message, assistant=state.get("response", ""))
         yield {
@@ -212,13 +244,42 @@ class ChatAgent:
             },
         }
 
+    async def load_inventory(self) -> RuntimeInventory:
+        return await self.inventory_service.load()
+
     async def _prepare_node(self, state: ChatGraphState) -> ChatGraphState:
         history = await self.memory.get(state["thread_id"])
         return {**state, "history": history}
 
+    async def _inventory_node(self, state: ChatGraphState) -> ChatGraphState:
+        inventory = await self.load_inventory()
+        log_kv(
+            logger,
+            logging.INFO,
+            "inventory_loaded",
+            thread_id=state.get("thread_id"),
+            models=len(inventory.model_names),
+            tools=len(inventory.tool_names),
+            errors=",".join(inventory.errors.keys()),
+        )
+        return {**state, "inventory": inventory}
+
     async def _plan_node(self, state: ChatGraphState) -> ChatGraphState:
-        plan = self.router.plan(state["message"], state.get("metadata", {}))
-        model = self.settings.model_for_key(plan.model_key)
+        inventory = state.get("inventory") or RuntimeInventory()
+        metadata = state.get("metadata", {})
+        queries = await self.decomposer.decompose(
+            message=state["message"],
+            metadata=metadata,
+            inventory=inventory,
+            ollama=self.ollama,
+        )
+        tasks = self.decomposer.build_tasks(queries=queries, metadata=metadata, inventory=inventory)
+        if not tasks:
+            fallback_plan = self.router.plan(state["message"], metadata)
+            model = self.selector.resolve(fallback_plan.model_key, inventory)
+            tasks = [QueryTask(id="q1", query=state["message"], plan=fallback_plan, model=model, tools=fallback_plan.tools)]
+        plan = tasks[0].plan
+        model = tasks[0].model if len(tasks) == 1 else self.selector.resolve("synthesis", inventory)
         log_kv(
             logger,
             logging.INFO,
@@ -227,49 +288,60 @@ class ChatAgent:
             intent=plan.intent,
             tools=",".join(plan.tools),
             model=model,
+            task_count=len(tasks),
             reason=plan.reason,
         )
-        return {**state, "plan": plan, "model": model}
+        return {**state, "plan": plan, "tasks": tasks, "model": model}
 
     async def _rewrite_node(self, state: ChatGraphState) -> ChatGraphState:
-        plan = state["plan"]
-        rewritten = None
-        if plan.needs_query_rewrite:
-            rewritten = self.rewriter.rewrite(
-                state["message"],
-                plan,
-                metadata=state.get("metadata", {}),
+        rewritten_first: str | None = None
+        rewritten_tasks: list[QueryTask] = []
+        for task in state.get("tasks", []):
+            rewritten = None
+            if task.plan.needs_query_rewrite:
+                rewritten = self.rewriter.rewrite(task.query, task.plan, metadata=state.get("metadata", {}))
+                log_kv(logger, logging.INFO, "query_rewritten", thread_id=state.get("thread_id"), task_id=task.id, query=rewritten)
+            rewritten_tasks.append(
+                QueryTask(
+                    id=task.id,
+                    query=task.query,
+                    plan=task.plan,
+                    model=task.model,
+                    tools=task.tools,
+                    rewritten_query=rewritten,
+                )
             )
-            log_kv(logger, logging.INFO, "query_rewritten", thread_id=state.get("thread_id"), query=rewritten)
-        return {**state, "rewritten_query": rewritten}
+            if rewritten_first is None:
+                rewritten_first = rewritten
+        return {**state, "tasks": rewritten_tasks, "rewritten_query": rewritten_first}
 
     async def _tools_node(self, state: ChatGraphState) -> ChatGraphState:
-        plan = state["plan"]
-        if not self.settings.mcp_enabled or not plan.tools:
-            return {**state, "tool_results": [], "references": []}
+        tasks = state.get("tasks", [])
+        if not self.settings.mcp_enabled or not tasks:
+            return {**state, "tool_results": [], "task_tool_results": {}, "references": []}
 
         if self.settings.llm_backend == "echo":
+            requested = [tool for task in tasks for tool in task.tools]
             log_kv(
                 logger,
                 logging.WARNING,
                 "mcp_skipped_echo_backend",
                 thread_id=state.get("thread_id"),
-                requested_tools=",".join(plan.tools),
+                requested_tools=",".join(requested),
             )
-            return {**state, "tool_results": [], "references": []}
+            return {**state, "tool_results": [], "task_tool_results": {}, "references": []}
 
-        requested_tools = plan.tools[: self.settings.max_tool_calls]
-        prepared: list[tuple[str, dict[str, Any] | None]] = [(tool, self._tool_args(tool, state)) for tool in requested_tools]
-
-        async def run_tool(tool: str, args: dict[str, Any] | None) -> MCPToolResult:
+        async def run_tool(task: QueryTask, tool: str) -> tuple[str, MCPToolResult]:
+            args = self._tool_args(tool, state, task=task)
             if args is None:
-                log_kv(logger, logging.WARNING, "mcp_tool_missing_args", thread_id=state.get("thread_id"), tool=tool)
-                return MCPToolResult(tool=tool, ok=False, data=None, error="Missing required tool arguments.")
+                log_kv(logger, logging.WARNING, "mcp_tool_missing_args", thread_id=state.get("thread_id"), task_id=task.id, tool=tool)
+                return task.id, MCPToolResult(tool=tool, ok=False, data=None, error="Missing required tool arguments.")
             log_kv(
                 logger,
                 logging.INFO,
                 "mcp_tool_start",
                 thread_id=state.get("thread_id"),
+                task_id=task.id,
                 tool=tool,
                 arg_keys=",".join(sorted(args.keys())),
             )
@@ -279,36 +351,112 @@ class ChatAgent:
                 logging.INFO if result.ok else logging.ERROR,
                 "mcp_tool_done",
                 thread_id=state.get("thread_id"),
+                task_id=task.id,
                 tool=tool,
                 ok=result.ok,
                 error=result.error,
             )
-            return result
+            return task.id, result
 
-        results = list(await asyncio.gather(*(run_tool(tool, args) for tool, args in prepared)))
+        calls = [run_tool(task, tool) for task in tasks for tool in task.tools[: self.settings.max_tool_calls]]
+        pairs = list(await asyncio.gather(*calls)) if calls else []
+        task_results: dict[str, list[MCPToolResult]] = {task.id: [] for task in tasks}
+        results: list[MCPToolResult] = []
+        for task_id, result in pairs:
+            task_results.setdefault(task_id, []).append(result)
+            results.append(result)
         references = extract_references(results, limit=self.settings.max_references)
-        log_kv(logger, logging.INFO, "mcp_tools_complete", thread_id=state.get("thread_id"), refs=len(references))
-        return {**state, "tool_results": results, "references": references}
+        log_kv(logger, logging.INFO, "mcp_tools_complete", thread_id=state.get("thread_id"), refs=len(references), results=len(results))
+        return {**state, "tool_results": results, "task_tool_results": task_results, "references": references}
 
     async def _answer_node(self, state: ChatGraphState) -> ChatGraphState:
         if self.settings.llm_backend == "echo":
             log_kv(logger, logging.WARNING, "echo_backend_response", thread_id=state.get("thread_id"))
-            return {**state, "response": self._echo_response(state), "backend": "echo", "model": None}
+            return {**state, "response": self._echo_response(state), "backend": "echo", "model": None, "models_used": []}
 
-        model = state.get("model") or self.settings.model_for_key(state["plan"].model_key)
-        messages = self._messages_for_state(state)
-        log_kv(logger, logging.INFO, "ollama_answer_start", thread_id=state.get("thread_id"), model=model, messages=len(messages))
+        tasks = state.get("tasks", [])
+        if len(tasks) <= 1:
+            model = state.get("model") or self.selector.resolve(state["plan"].model_key, state.get("inventory"))
+            messages = self._messages_for_state(state)
+            log_kv(logger, logging.INFO, "ollama_answer_start", thread_id=state.get("thread_id"), model=model, messages=len(messages))
+            result = await self.ollama.chat(
+                model=model,
+                messages=messages,
+                temperature=self.settings.ollama_temperature,
+                num_predict=self.settings.ollama_num_predict,
+            )
+            response = append_references(
+                clean_model_output(result.content),
+                state.get("references", []),
+                limit=self.settings.answer_reference_limit,
+            )
+            if not response:
+                response = "I could not get answer content from the local Ollama model."
+            log_kv(logger, logging.INFO, "ollama_answer_done", thread_id=state.get("thread_id"), model=result.model, response_chars=len(response))
+            return {**state, "response": response, "backend": "ollama", "model": result.model, "models_used": [result.model]}
+
+        task_answers: list[dict[str, Any]] = []
+        models_used: list[str] = []
+        task_tool_results = state.get("task_tool_results", {})
+        for task in tasks:
+            task_state: ChatGraphState = {
+                **state,
+                "message": task.query,
+                "plan": task.plan,
+                "rewritten_query": task.rewritten_query,
+                "tool_results": task_tool_results.get(task.id, []),
+            }
+            messages = self._messages_for_state(task_state)
+            log_kv(logger, logging.INFO, "ollama_task_answer_start", thread_id=state.get("thread_id"), task_id=task.id, model=task.model)
+            result = await self.ollama.chat(
+                model=task.model,
+                messages=messages,
+                temperature=self.settings.ollama_temperature,
+                num_predict=self.settings.ollama_num_predict,
+            )
+            answer = clean_model_output(result.content) or "No answer content returned."
+            models_used.append(result.model)
+            task_answers.append(
+                {
+                    "id": task.id,
+                    "query": task.query,
+                    "intent": task.plan.intent,
+                    "model": result.model,
+                    "tools": task.tools,
+                    "answer": answer,
+                }
+            )
+
+        synthesis_model = self.selector.resolve("synthesis", state.get("inventory"))
+        synthesis_messages = self.prompt_builder.build_synthesis_messages(
+            original_message=state["message"],
+            system_prompt=state.get("system_prompt") or self.settings.default_system_prompt,
+            history=state.get("history", []),
+            task_answers=task_answers,
+            references=state.get("references", []),
+        )
         result = await self.ollama.chat(
-            model=model,
-            messages=messages,
+            model=synthesis_model,
+            messages=synthesis_messages,
             temperature=self.settings.ollama_temperature,
             num_predict=self.settings.ollama_num_predict,
         )
-        response = append_references(clean_model_output(result.content), state.get("references", []))
+        response = append_references(
+            clean_model_output(result.content),
+            state.get("references", []),
+            limit=self.settings.answer_reference_limit,
+        )
         if not response:
-            response = "I could not get answer content from the local Ollama model."
-        log_kv(logger, logging.INFO, "ollama_answer_done", thread_id=state.get("thread_id"), model=result.model, response_chars=len(response))
-        return {**state, "response": response, "backend": "ollama", "model": result.model}
+            response = "I could not combine the answer content from the local Ollama model."
+        models_used.append(result.model)
+        return {
+            **state,
+            "task_answers": task_answers,
+            "response": response,
+            "backend": "ollama",
+            "model": result.model,
+            "models_used": models_used,
+        }
 
     def _messages_for_state(self, state: ChatGraphState) -> list[dict[str, str]]:
         return self.prompt_builder.build_messages(
@@ -321,10 +469,10 @@ class ChatAgent:
             references=state.get("references", []),
         )
 
-    def _tool_args(self, tool: str, state: ChatGraphState) -> dict[str, Any] | None:
-        message = state["message"]
+    def _tool_args(self, tool: str, state: ChatGraphState, *, task: QueryTask | None = None) -> dict[str, Any] | None:
+        message = task.query if task else state["message"]
         metadata = state.get("metadata", {})
-        rewritten = state.get("rewritten_query") or message
+        rewritten = (task.rewritten_query if task else state.get("rewritten_query")) or message
         urls = extract_urls(message)
 
         args: dict[str, Any] | None
@@ -429,8 +577,6 @@ class ChatAgent:
             body = metadata.get("body") or message
             args = {"to": str(to), "subject": str(subject), "body": str(body), "cc": metadata.get("cc")} if to else None
         elif tool == "mail_send_draft":
-            # Intentionally guarded: this only works when the caller supplies both
-            # draft_id and confirmation_token. Natural language alone is not enough.
             draft_id = metadata.get("draft_id")
             confirmation_token = metadata.get("confirmation_token")
             args = {"draft_id": str(draft_id), "confirmation_token": str(confirmation_token)} if draft_id and confirmation_token else None
@@ -450,25 +596,26 @@ class ChatAgent:
             return {**(args or {}), **tool_overrides}
         return args
 
-
     def _system_prompt_or_default(self, system_prompt: str | None) -> str:
-        # Swagger/OpenAPI examples often send the literal placeholder "string".
-        # Treat that as no custom system prompt so the assistant keeps its real instructions.
         if not system_prompt or system_prompt.strip().lower() == "string":
             return self.settings.default_system_prompt
         return system_prompt
 
     def _echo_response(self, state: ChatGraphState) -> str:
         plan = state.get("plan")
+        tasks = state.get("tasks", [])
         return (
             "Echo mode is active. FastAPI + LangGraph orchestration is running. "
             f"Intent: {plan.intent if plan else 'unknown'}. "
+            f"Tasks: {len(tasks)}. "
             f"Message received: {state['message']}"
         )
 
     def _response_metadata(self, state: ChatGraphState) -> dict[str, Any]:
         plan = state.get("plan")
         results = state.get("tool_results", [])
+        inventory = state.get("inventory")
+        tasks = state.get("tasks", [])
         return {
             **state.get("metadata", {}),
             "intent": plan.intent if plan else None,
@@ -480,6 +627,10 @@ class ChatAgent:
                 if not item.ok
             ],
             "rewritten_query": state.get("rewritten_query"),
+            "subqueries": [task.as_metadata() for task in tasks],
+            "task_answers": state.get("task_answers", []),
+            "models_used": state.get("models_used", []),
+            "inventory": inventory.as_dict() if inventory else None,
             "references": state.get("references", []),
         }
 

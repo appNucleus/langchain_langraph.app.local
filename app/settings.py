@@ -23,7 +23,7 @@ class Settings(BaseSettings):
     )
 
     app_name: str = "LangChain LangGraph App"
-    app_version: str = "0.3.2"
+    app_version: str = "0.4.0"
     environment: str = "local"
     log_level: str = "INFO"
 
@@ -43,11 +43,13 @@ class Settings(BaseSettings):
     ollama_think: bool = False
 
     # Model router defaults based on the user's installed Ollama models.
+    model_planner: str = "qwen3.5:4b"
     model_simple: str = "qwen3.5:2b"
     model_general: str = "qwen3.5:4b"
     model_search: str = "qwen3.5:9b"
     model_reasoning: str = "phi4-mini-reasoning:latest"
-    model_heavy: str = "gemma4:12b-it-qat"
+    model_heavy: str = "gemma4:26b-a4b-it-qat"
+    model_synthesis: str = "gemma4:26b-a4b-it-qat"
     model_vision: str = "qwen3-vl:4b"
     model_fallback: str = "qwen3.5:4b"
     embedding_model: str = "qwen3-embedding:0.6b"
@@ -65,8 +67,12 @@ class Settings(BaseSettings):
     default_search_results: int = 8
     default_scrape_pages: int = 4
     max_tool_calls: int = 4
-    max_tool_chars: int = 14000
+    max_tool_chars: int = 18000
     max_references: int = 8
+    answer_reference_limit: int = 3
+    max_subqueries: int = 6
+    enable_llm_query_planning: bool = True
+    search_unknown_or_fresh: bool = True
     default_news_lookback_days: int = 7
     default_forecast_days: int = 7
 
@@ -78,7 +84,8 @@ class Settings(BaseSettings):
         default=(
             "You are a precise local assistant running behind a FastAPI + LangGraph service. "
             "Use tool evidence when provided. Be direct, technically accurate, and honest about uncertainty. "
-            "Never expose hidden reasoning or thinking traces. When references are available, ground the answer in them."
+            "Never expose hidden reasoning or thinking traces. Prefer broad, useful answers over narrow one-line replies. "
+            "Use very simple wording unless the user asks for deep technical detail. When references are available, ground the answer in them."
         )
     )
 
@@ -93,11 +100,13 @@ class Settings(BaseSettings):
 
     def model_for_key(self, key: str | None) -> str:
         mapping = {
+            "planner": self.model_planner,
             "simple": self.model_simple,
             "general": self.model_general,
             "search": self.model_search,
             "reasoning": self.model_reasoning,
             "heavy": self.model_heavy,
+            "synthesis": self.model_synthesis,
             "vision": self.model_vision,
             "fallback": self.model_fallback,
         }
