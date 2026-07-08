@@ -97,10 +97,14 @@ def create_app(*, settings: Settings | None = None, chat_agent: ChatAgent | None
                 "general": current_settings.model_general,
                 "search": current_settings.model_search,
                 "reasoning": current_settings.model_reasoning,
+                "fast_reasoning": current_settings.model_fast_reasoning,
                 "heavy": current_settings.model_heavy,
                 "synthesis": current_settings.model_synthesis,
+                "writer": current_settings.model_writer,
+                "classifier": current_settings.model_classifier,
                 "vision": current_settings.model_vision,
                 "embedding": current_settings.embedding_model,
+                "fallback": current_settings.model_fallback,
             },
         }
 
