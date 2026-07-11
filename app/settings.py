@@ -8,11 +8,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    """Validated runtime configuration shared by Phases 1, 2, and 3.
-
-    Environment variable names remain compatible with the existing runtime.env.
-    Application versioning intentionally does not belong here; use app.__version__.
-    """
+    """Application settings loaded from environment variables or ``.env``."""
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -81,9 +77,7 @@ class Settings(BaseSettings):
     mcp_initialize_on_startup: bool = True
     mcp_protocol_version: str = "2025-06-18"
     mcp_client_name: str = "langchain-langraph-app"
-    mcp_inventory_cache_ttl_seconds: int = Field(default=60, ge=1, le=3600)
 
-    # Unified runtime inventory cache used by app.services.inventory
     inventory_cache_ttl_seconds: int = Field(default=60, ge=1, le=3600)
     inventory_stale_if_error_seconds: int = Field(default=300, ge=0, le=86400)
 
@@ -99,20 +93,41 @@ class Settings(BaseSettings):
     execution_max_tool_calls: int = Field(default=10, ge=0, le=100)
     execution_max_verifier_rounds: int = Field(default=3, ge=1, le=10)
 
-    # Phase 3 bounded in-memory state
-    state_ttl_seconds: int = Field(default=3600, ge=60, le=86400)
+    state_ttl_seconds: int = Field(default=3600, ge=60, le=2_592_000)
     state_max_sessions: int = Field(default=1000, ge=10, le=100000)
-    state_max_history_messages: int = Field(default=30, ge=2, le=200)
-
-    # Phase 3 safety / telemetry
+    state_max_history_messages: int = Field(default=30, ge=2, le=500)
     side_effect_policy_enabled: bool = True
     real_streaming_enabled: bool = True
     detailed_tracing_enabled: bool = True
     expose_internal_health_details: bool = False
 
-    # Phase 4 placeholders; unused unless a persistence backend is enabled.
+    # Phase 4: backends are independent so deployments can use PostgreSQL
+    # checkpoints with Redis history/cache or PostgreSQL for both.
+    state_backend: Literal["memory", "redis", "postgres"] = "memory"
+    checkpoint_backend: Literal["memory", "postgres"] = "memory"
+    artifact_backend: Literal["disabled", "minio"] = "disabled"
+
     database_url: str = ""
+    postgres_pool_min_size: int = Field(default=1, ge=1, le=20)
+    postgres_pool_max_size: int = Field(default=10, ge=1, le=100)
+    postgres_command_timeout_seconds: float = Field(default=30, gt=0, le=300)
+    postgres_auto_setup: bool = True
+
     redis_url: str = ""
+    redis_key_prefix: str = "langgraph"
+
+    minio_endpoint: str = "dbs.home.arpa:9000"
+    minio_access_key: str = ""
+    minio_secret_key: str = ""
+    minio_bucket: str = "langchain-langraph-app"
+    minio_secure: bool = False
+
+    persistence_required: bool = False
+
+    default_system_prompt: str = (
+        "You are a precise, evidence-grounded assistant. "
+        "Be honest about uncertainty and missing tools."
+    )
 
     @property
     def cors_origins(self) -> list[str]:
@@ -133,22 +148,7 @@ class Settings(BaseSettings):
 
     def model_for_key(self, key: str | None) -> str:
         role = (key or "general").strip().lower()
-        mapping = {
-            "planner": self.model_planner,
-            "simple": self.model_simple,
-            "general": self.model_general,
-            "search": self.model_search,
-            "reasoning": self.model_reasoning,
-            "fast_reasoning": self.model_fast_reasoning,
-            "heavy": self.model_heavy,
-            "synthesis": self.model_synthesis,
-            "writer": self.model_writer,
-            "classifier": self.model_classifier,
-            "vision": self.model_vision,
-            "fallback": self.model_fallback,
-            "embedding": self.embedding_model,
-        }
-        return mapping.get(role, self.model_general)
+        return self.model_role_catalog().get(role, self.model_general)
 
     def model_role_catalog(self) -> dict[str, str]:
         return {
@@ -165,7 +165,18 @@ class Settings(BaseSettings):
             "vision": self.model_vision,
             "fallback": self.model_fallback,
             "embedding": self.embedding_model,
+            "fallback": self.model_fallback,
         }
+
+    @property
+    def persistence_enabled(self) -> bool:
+        return any(
+            (
+                self.state_backend != "memory",
+                self.checkpoint_backend != "memory",
+                self.artifact_backend != "disabled",
+            )
+        )
 
 
 @lru_cache(maxsize=1)

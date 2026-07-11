@@ -21,11 +21,7 @@ from app.settings import Settings, get_settings
 logger = logging.getLogger(__name__)
 
 
-def create_app(
-    *,
-    settings: Settings | None = None,
-    chat_agent: ChatAgent | None = None,
-) -> FastAPI:
+def create_app(*, settings: Settings | None = None, chat_agent: ChatAgent | None = None) -> FastAPI:
     app_settings = settings or get_settings()
     configure_logging(app_settings.log_level)
     agent = chat_agent or ChatAgent(app_settings)
@@ -39,15 +35,15 @@ def create_app(
             version=__version__,
             environment=app_settings.environment,
             backend=app_settings.llm_backend,
-            ollama=app_settings.ollama_base_url,
-            mcp_enabled=app_settings.mcp_enabled,
-            mcp_url=app_settings.mcp_server_url,
+            state_backend=app_settings.state_backend,
+            checkpoint_backend=app_settings.checkpoint_backend,
+            artifact_backend=app_settings.artifact_backend,
         )
         try:
             start = getattr(agent, "start", None)
             if callable(start):
                 await start()
-        except Exception as exc:  # Keep liveness available; readiness reports dependency failure.
+        except Exception as exc:
             metrics.inc("app.startup_dependency_error")
             log_kv(
                 logger,
@@ -55,6 +51,8 @@ def create_app(
                 "app_dependency_start_error",
                 error=_safe_error(exc, expose=app_settings.expose_internal_health_details),
             )
+            if app_settings.persistence_required:
+                raise
         try:
             yield
         finally:
@@ -68,13 +66,12 @@ def create_app(
         version=__version__,
         description=(
             "FastAPI + LangGraph local assistant with bounded agent execution, "
-            "Ollama model routing, and MCP tools."
+            "durable checkpoints, Ollama model routing, and MCP tools."
         ),
         lifespan=lifespan,
     )
     app.state.settings = app_settings
     app.state.chat_agent = agent
-
     app.add_middleware(
         CORSMiddleware,
         allow_origins=app_settings.cors_origins,
@@ -98,10 +95,7 @@ def create_app(
     ) -> None:
         current_settings: Settings = request.app.state.settings
         if current_settings.api_key and x_api_key != current_settings.api_key:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid or missing API key.",
-            )
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or missing API key.")
 
     @app.get("/")
     async def root(request: Request) -> dict[str, str]:
@@ -119,17 +113,11 @@ def create_app(
 
     @app.get("/health")
     async def health(request: Request) -> dict[str, object]:
-        """Container liveness check; never performs network dependency calls."""
         current_settings: Settings = request.app.state.settings
-        return {
-            "status": "ok",
-            "service": current_settings.app_name,
-            "version": __version__,
-        }
+        return {"status": "ok", "service": current_settings.app_name, "version": __version__}
 
     @app.get("/health/ready")
     async def ready_health(request: Request) -> JSONResponse:
-        """Readiness check for Ollama and MCP dependencies."""
         current_agent: ChatAgent = request.app.state.chat_agent
         current_settings: Settings = request.app.state.settings
         payload: dict[str, Any] = {
@@ -143,14 +131,11 @@ def create_app(
         if current_settings.llm_backend == "ollama":
             try:
                 payload["dependencies"]["ollama"] = await current_agent.ollama.health()
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 ready = False
                 payload["dependencies"]["ollama"] = {
                     "status": "unavailable",
-                    "error": _safe_error(
-                        exc,
-                        expose=current_settings.expose_internal_health_details,
-                    ),
+                    "error": _safe_error(exc, expose=current_settings.expose_internal_health_details),
                 }
 
         if current_settings.mcp_enabled:
@@ -162,15 +147,22 @@ def create_app(
                     "error": result.error,
                 }
                 ready = ready and result.ok
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 ready = False
                 payload["dependencies"]["mcp"] = {
                     "status": "unavailable",
-                    "error": _safe_error(
-                        exc,
-                        expose=current_settings.expose_internal_health_details,
-                    ),
+                    "error": _safe_error(exc, expose=current_settings.expose_internal_health_details),
                 }
+
+        try:
+            payload["dependencies"]["persistence"] = await current_agent.persistence_health()
+        except Exception as exc:
+            if current_settings.persistence_enabled:
+                ready = False
+            payload["dependencies"]["persistence"] = {
+                "status": "unavailable",
+                "error": _safe_error(exc, expose=current_settings.expose_internal_health_details),
+            }
 
         if not ready:
             payload["status"] = "not_ready"
@@ -181,7 +173,6 @@ def create_app(
 
     @app.get("/health/live")
     async def live_health(request: Request) -> JSONResponse:
-        """Backward-compatible alias for the dependency readiness check."""
         return await ready_health(request)
 
     @app.get("/api/inventory", dependencies=[Depends(require_api_key)])
@@ -189,25 +180,13 @@ def create_app(
         current_agent: ChatAgent = request.app.state.chat_agent
         current_settings: Settings = request.app.state.settings
         live_inventory = await current_agent.load_inventory()
-        return build_inventory_payload(
-            current_settings,
-            live_inventory,
-            current_agent.selector,
-        )
+        return build_inventory_payload(current_settings, live_inventory, current_agent.selector)
 
     @app.get("/api/metrics", dependencies=[Depends(require_api_key)])
     async def application_metrics() -> dict[str, Any]:
-        return {
-            "service": app_settings.app_name,
-            "version": __version__,
-            **metrics.snapshot(),
-        }
+        return {"service": app_settings.app_name, "version": __version__, **metrics.snapshot()}
 
-    @app.post(
-        "/api/chat",
-        response_model=ChatResponse,
-        dependencies=[Depends(require_api_key)],
-    )
+    @app.post("/api/chat", response_model=ChatResponse, dependencies=[Depends(require_api_key)])
     async def chat(request: Request, chat_request: ChatRequest) -> ChatResponse:
         current_agent: ChatAgent = request.app.state.chat_agent
         metrics.inc("api.chat.requests")
@@ -232,16 +211,11 @@ def create_app(
             except asyncio.CancelledError:
                 metrics.inc("api.chat_stream.cancelled")
                 raise
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 metrics.inc("api.chat_stream.error")
                 yield encode_sse(
                     "error",
-                    {
-                        "message": _safe_error(
-                            exc,
-                            expose=app_settings.expose_internal_health_details,
-                        )
-                    },
+                    {"message": _safe_error(exc, expose=app_settings.expose_internal_health_details)},
                 )
 
         return StreamingResponse(
