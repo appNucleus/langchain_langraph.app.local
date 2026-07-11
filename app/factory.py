@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 import logging
 from typing import Annotated
 
@@ -34,10 +35,23 @@ def create_app(*, settings: Settings | None = None, chat_agent: ChatAgent | None
     )
     agent = chat_agent or ChatAgent(app_settings)
 
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        start = getattr(agent, "start", None)
+        if callable(start):
+            await start()
+        try:
+            yield
+        finally:
+            close = getattr(agent, "aclose", None)
+            if callable(close):
+                await close()
+
     app = FastAPI(
         title=app_settings.app_name,
         version=__version__,
         description="FastAPI + LangGraph local assistant with Ollama model routing and MCP tools.",
+        lifespan=lifespan,
     )
     app.state.settings = app_settings
     app.state.chat_agent = agent
