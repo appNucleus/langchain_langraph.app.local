@@ -19,11 +19,11 @@ services:
     healthcheck:
       test:
         - CMD-SHELL
-        - curl --fail --silent http://127.0.0.1:8000/health >/dev/null || exit 1
+        - curl --fail --silent http://127.0.0.1:8000/health/ready >/dev/null || exit 1
       interval: 10s
       timeout: 5s
-      start_period: 20s
-      retries: 10
+      start_period: 30s
+      retries: 12
     security_opt:
       - no-new-privileges=true
 
