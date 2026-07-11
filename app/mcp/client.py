@@ -1,13 +1,19 @@
 from __future__ import annotations
 
-import json
+import asyncio
 import logging
 from dataclasses import dataclass
 from typing import Any
 
 import httpx
 
+from app import __version__
 from app.logging_config import log_kv
+from app.mcp.errors import MCPError, MCPHTTPStatusError, MCPProtocolError
+from app.mcp.protocol import notification_envelope, request_envelope, validate_response
+from app.mcp.result_parser import parse_tool_result
+from app.mcp.session import MCPSessionManager
+from app.mcp.transport import MCPHTTPTransport
 from app.settings import Settings
 
 logger = logging.getLogger(__name__)
@@ -21,142 +27,129 @@ class MCPToolResult:
     error: str | None = None
 
 
-class MCPClientError(RuntimeError):
-    pass
+class MCPClientError(MCPError):
+    """Backward-compatible public MCP client exception."""
 
 
 class MCPClient:
-    """Async JSON-RPC client for the local MCP HTTP endpoint."""
+    """Session-aware async JSON-RPC client for a streamable HTTP MCP endpoint."""
 
-    def __init__(self, settings: Settings, *, transport: httpx.AsyncBaseTransport | None = None) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        transport: httpx.AsyncBaseTransport | None = None,
+        http_transport: MCPHTTPTransport | None = None,
+    ) -> None:
         self.settings = settings
-        self._transport = transport
+        self._transport = http_transport or MCPHTTPTransport(settings, transport=transport)
         self._request_id = 0
+        self._id_lock = asyncio.Lock()
+        self._session = MCPSessionManager(
+            settings.mcp_protocol_version,
+            settings.mcp_client_name,
+            settings.mcp_client_version or __version__,
+        )
+
+    @property
+    def session_id(self) -> str | None:
+        return self._session.state.session_id
+
+    async def start(self) -> None:
+        await self._transport.start()
+        if self.settings.mcp_enabled and self.settings.mcp_session_enabled and self.settings.mcp_initialize_on_startup:
+            await self.initialize()
+
+    async def aclose(self) -> None:
+        await self._transport.close()
+        self._session.reset()
+
+    async def initialize(self) -> None:
+        if not self.settings.mcp_session_enabled:
+            return
+        await self._session.ensure_initialized(self._send_for_session)
 
     async def list_tools(self) -> list[dict[str, Any]]:
-        data = await self._jsonrpc("tools/list", {})
-        return list((data.get("result") or {}).get("tools") or [])
+        data = await self._rpc("tools/list", {})
+        tools = (data or {}).get("tools") if isinstance(data, dict) else None
+        if tools is None:
+            return []
+        if not isinstance(tools, list):
+            raise MCPProtocolError("MCP tools/list result.tools must be a list.")
+        return [item for item in tools if isinstance(item, dict)]
 
     async def health_check(self) -> MCPToolResult:
         return await self.call_tool("health_check", {})
 
     async def call_tool(self, name: str, arguments: dict[str, Any] | None = None) -> MCPToolResult:
         try:
-            data = await self._jsonrpc("tools/call", {"name": name, "arguments": arguments or {}})
-            if "error" in data and data["error"]:
-                return MCPToolResult(tool=name, ok=False, data=data, error=str(data["error"]))
-            normalized = self._normalize_tool_result((data.get("result") or {}))
-            return MCPToolResult(tool=name, ok=True, data=normalized)
-        except Exception as exc:  # noqa: BLE001 - preserve tool failure as data for the LLM.
+            result = await self._rpc("tools/call", {"name": name, "arguments": arguments or {}})
+            parsed = parse_tool_result(result)
+            return MCPToolResult(tool=name, ok=parsed.ok, data=parsed.data, error=parsed.error)
+        except Exception as exc:  # noqa: BLE001 - preserve dependency failure as tool data.
             error = _format_exception(exc)
             log_kv(logger, logging.ERROR, "mcp_client_tool_error", tool=name, error=error)
             return MCPToolResult(tool=name, ok=False, data=None, error=error)
 
-    async def _jsonrpc(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
-        self._request_id += 1
-        payload = {
-            "jsonrpc": "2.0",
-            "id": self._request_id,
-            "method": method,
-            "params": params,
-        }
+    async def _rpc(self, method: str, params: dict[str, Any]) -> Any:
+        if self.settings.mcp_session_enabled and method != "initialize":
+            await self.initialize()
+        try:
+            result, _headers = await self._send_for_session(method, params, False)
+            return result
+        except MCPHTTPStatusError as exc:
+            if self.settings.mcp_session_enabled and self.session_id and exc.status_code in {404, 410}:
+                log_kv(logger, logging.WARNING, "mcp_session_expired", status_code=exc.status_code)
+                self._session.reset()
+                await self.initialize()
+                result, _headers = await self._send_for_session(method, params, False)
+                return result
+            raise
+
+    async def _send_for_session(
+        self,
+        method: str,
+        params: dict[str, Any],
+        notification: bool,
+    ) -> tuple[Any, dict[str, str]]:
+        request_id: int | None = None
+        if notification:
+            payload = notification_envelope(method, params)
+        else:
+            request_id = await self._next_id()
+            payload = request_envelope(request_id, method, params)
+
+        headers = self._headers()
+        log_kv(logger, logging.DEBUG, "mcp_jsonrpc_request", method=method, session=bool(self.session_id))
+        body, response_headers = await self._transport.post(payload, headers=headers, allow_empty=notification)
+        normalized_headers = {key.lower(): value for key, value in response_headers.items()}
+
+        if notification:
+            return None, normalized_headers
+        if body is None:
+            raise MCPProtocolError(f"MCP method {method} returned an empty response.")
+        response = validate_response(body, expected_id=request_id)
+        if response.error is not None:
+            raise MCPClientError(f"MCP JSON-RPC error for {method}: {response.error}")
+        return response.result, normalized_headers
+
+    def _headers(self) -> dict[str, str]:
+        protocol_version = self._session.state.protocol_version or self.settings.mcp_protocol_version
         headers = {
             "Accept": "application/json, text/event-stream",
             "Content-Type": "application/json",
-            "MCP-Protocol-Version": self.settings.mcp_protocol_version,
+            "MCP-Protocol-Version": protocol_version,
         }
-        url = self.settings.mcp_server_url.rstrip("/")
-        log_kv(
-            logger,
-            logging.DEBUG,
-            "mcp_jsonrpc_request",
-            method=method,
-            url=url,
-            follow_redirects=self.settings.mcp_follow_redirects,
-        )
-        async with self._client() as client:
-            response = await client.post(url, headers=headers, json=payload)
-            if response.history:
-                log_kv(
-                    logger,
-                    logging.INFO,
-                    "mcp_jsonrpc_redirect_followed",
-                    method=method,
-                    redirects=" -> ".join(str(item.url) for item in response.history + [response]),
-                    final_url=str(response.url),
-                    final_status=response.status_code,
-                )
-            log_kv(
-                logger,
-                logging.DEBUG,
-                "mcp_jsonrpc_response",
-                method=method,
-                url=str(response.url),
-                status_code=response.status_code,
-                content_type=response.headers.get("content-type", ""),
-            )
-            response.raise_for_status()
-            return self._decode_response(response)
+        if self.session_id:
+            headers["Mcp-Session-Id"] = self.session_id
+        return headers
 
-    def _client(self) -> httpx.AsyncClient:
-        return httpx.AsyncClient(
-            timeout=httpx.Timeout(self.settings.mcp_timeout_seconds),
-            verify=self.settings.mcp_verify_tls,
-            follow_redirects=self.settings.mcp_follow_redirects,
-            transport=self._transport,
-        )
-
-    @staticmethod
-    def _decode_response(response: httpx.Response) -> dict[str, Any]:
-        text = response.text.strip()
-        content_type = response.headers.get("content-type", "")
-        if "text/event-stream" in content_type or text.startswith("event:") or "\ndata:" in text:
-            data_lines: list[str] = []
-            for line in text.splitlines():
-                if line.startswith("data:"):
-                    data_lines.append(line.removeprefix("data:").strip())
-            if not data_lines:
-                raise MCPClientError("MCP SSE response contained no data lines.")
-            text = data_lines[-1]
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError as exc:
-            raise MCPClientError(f"MCP response was not valid JSON: {text[:300]}") from exc
-
-    @staticmethod
-    def _normalize_tool_result(result: dict[str, Any]) -> Any:
-        """Normalize common MCP content formats into JSON-like Python data."""
-        content = result.get("content")
-        if isinstance(content, list):
-            normalized_items: list[Any] = []
-            for item in content:
-                if isinstance(item, dict) and item.get("type") == "text":
-                    text = str(item.get("text") or "")
-                    normalized_items.append(_maybe_json(text))
-                else:
-                    normalized_items.append(item)
-            if len(normalized_items) == 1:
-                return normalized_items[0]
-            return normalized_items
-        if "structuredContent" in result:
-            return result["structuredContent"]
-        return result
-
-
-def _maybe_json(text: str) -> Any:
-    stripped = text.strip()
-    if not stripped:
-        return ""
-    if stripped[0] in "[{\"":
-        try:
-            return json.loads(stripped)
-        except json.JSONDecodeError:
-            return text
-    return text
+    async def _next_id(self) -> int:
+        async with self._id_lock:
+            self._request_id += 1
+            return self._request_id
 
 
 def _format_exception(exc: BaseException) -> str:
     text = str(exc).strip()
-    if text:
-        return f"{type(exc).__name__}: {text}"
-    return f"{type(exc).__name__}: {exc!r}"
+    return f"{type(exc).__name__}: {text}" if text else f"{type(exc).__name__}: {exc!r}"
