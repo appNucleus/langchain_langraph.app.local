@@ -1,12 +1,35 @@
 from __future__ import annotations
-from pydantic import BaseModel
+from dataclasses import dataclass
+from time import monotonic
 
-class ExecutionBudget(BaseModel):
-    max_iterations: int = 4
-    max_research_rounds: int = 2
-    max_replans: int = 1
+class BudgetExceeded(RuntimeError):
+    pass
 
-class ExecutionCounters(BaseModel):
-    iterations: int = 0
-    research_rounds: int = 0
-    replans: int = 0
+@dataclass
+class ExecutionBudget:
+    max_duration_seconds: float
+    max_model_calls: int
+    max_tool_calls: int
+    max_verifier_rounds: int
+    started_at: float = 0.0
+    model_calls: int = 0
+    tool_calls: int = 0
+    verifier_rounds: int = 0
+
+    def __post_init__(self) -> None:
+        if not self.started_at:
+            self.started_at = monotonic()
+
+    @property
+    def elapsed_seconds(self) -> float:
+        return monotonic() - self.started_at
+
+    def check(self) -> None:
+        if self.elapsed_seconds > self.max_duration_seconds:
+            raise BudgetExceeded('maximum execution duration exceeded')
+        if self.model_calls > self.max_model_calls:
+            raise BudgetExceeded('maximum model calls exceeded')
+        if self.tool_calls > self.max_tool_calls:
+            raise BudgetExceeded('maximum tool calls exceeded')
+        if self.verifier_rounds > self.max_verifier_rounds:
+            raise BudgetExceeded('maximum verifier rounds exceeded')
