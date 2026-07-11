@@ -97,6 +97,18 @@ class ChatAgent:
             model_search=settings.model_search,
         )
 
+    async def start(self) -> None:
+        for dependency in (self.ollama, self.mcp):
+            start = getattr(dependency, "start", None)
+            if callable(start):
+                await start()
+
+    async def aclose(self) -> None:
+        for dependency in (self.mcp, self.ollama):
+            close = getattr(dependency, "aclose", None)
+            if callable(close):
+                await close()
+
     def _build_graph(self):
         builder = StateGraph(ChatGraphState)
         builder.add_node("prepare", self._prepare_node)

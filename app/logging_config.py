@@ -9,7 +9,11 @@ _APP_LOGGERS = [
     "app.factory",
     "app.graph",
     "app.mcp.client",
+    "app.mcp.transport",
+    "app.mcp.session",
     "app.llm.ollama",
+    "app.llm.resource_manager",
+    "app.services.inventory",
 ]
 
 
