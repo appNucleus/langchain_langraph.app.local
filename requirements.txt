@@ -4,8 +4,12 @@ pydantic>=2.13,<3
 pydantic-settings>=2.14,<3
 python-dotenv>=1.2,<2
 httpx>=0.28,<1
+
+# LangGraph 1.2.x uses langgraph-checkpoint 4.x. The PostgreSQL adapter
+# must therefore be 3.x; adapter 2.0.25 is limited to checkpoint <3.
 langgraph>=1.2,<2
-langgraph-checkpoint-postgres>=2.0.25,<3
+langgraph-checkpoint-postgres>=3.1,<4
+
 langchain-core>=1.4,<2
 langchain-ollama>=1.1,<2
 asyncpg>=0.30,<1
