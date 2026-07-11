@@ -1,17 +1,19 @@
 from __future__ import annotations
-from dataclasses import dataclass, asdict
+
+from dataclasses import asdict, dataclass
 from time import time
 from typing import Any
 
-@dataclass(frozen=True)
+
+@dataclass(frozen=True, slots=True)
 class ExecutionEvent:
     event: str
     data: dict[str, Any]
-    timestamp: float = 0.0
+    timestamp: float
+
     def as_dict(self) -> dict[str, Any]:
-        value=asdict(self)
-        value['timestamp']=self.timestamp or time()
-        return value
+        return asdict(self)
+
 
 def event(name: str, **data: Any) -> dict[str, Any]:
-    return ExecutionEvent(name, data, time()).as_dict()
+    return ExecutionEvent(event=name, data=data, timestamp=time()).as_dict()

@@ -48,7 +48,7 @@ class MCPClient:
         self._session = MCPSessionManager(
             settings.mcp_protocol_version,
             settings.mcp_client_name,
-            settings.mcp_client_version or __version__,
+            __version__,
         )
 
     @property
@@ -57,7 +57,11 @@ class MCPClient:
 
     async def start(self) -> None:
         await self._transport.start()
-        if self.settings.mcp_enabled and self.settings.mcp_session_enabled and self.settings.mcp_initialize_on_startup:
+        if (
+            self.settings.mcp_enabled
+            and self.settings.mcp_session_enabled
+            and self.settings.mcp_initialize_on_startup
+        ):
             await self.initialize()
 
     async def aclose(self) -> None:
@@ -81,14 +85,32 @@ class MCPClient:
     async def health_check(self) -> MCPToolResult:
         return await self.call_tool("health_check", {})
 
-    async def call_tool(self, name: str, arguments: dict[str, Any] | None = None) -> MCPToolResult:
+    async def call_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any] | None = None,
+    ) -> MCPToolResult:
         try:
-            result = await self._rpc("tools/call", {"name": name, "arguments": arguments or {}})
+            result = await self._rpc(
+                "tools/call",
+                {"name": name, "arguments": arguments or {}},
+            )
             parsed = parse_tool_result(result)
-            return MCPToolResult(tool=name, ok=parsed.ok, data=parsed.data, error=parsed.error)
-        except Exception as exc:  # noqa: BLE001 - preserve dependency failure as tool data.
+            return MCPToolResult(
+                tool=name,
+                ok=parsed.ok,
+                data=parsed.data,
+                error=parsed.error,
+            )
+        except Exception as exc:  # noqa: BLE001 - dependency failure becomes tool data.
             error = _format_exception(exc)
-            log_kv(logger, logging.ERROR, "mcp_client_tool_error", tool=name, error=error)
+            log_kv(
+                logger,
+                logging.ERROR,
+                "mcp_client_tool_error",
+                tool=name,
+                error=error,
+            )
             return MCPToolResult(tool=name, ok=False, data=None, error=error)
 
     async def _rpc(self, method: str, params: dict[str, Any]) -> Any:
@@ -98,8 +120,17 @@ class MCPClient:
             result, _headers = await self._send_for_session(method, params, False)
             return result
         except MCPHTTPStatusError as exc:
-            if self.settings.mcp_session_enabled and self.session_id and exc.status_code in {404, 410}:
-                log_kv(logger, logging.WARNING, "mcp_session_expired", status_code=exc.status_code)
+            if (
+                self.settings.mcp_session_enabled
+                and self.session_id
+                and exc.status_code in {404, 410}
+            ):
+                log_kv(
+                    logger,
+                    logging.WARNING,
+                    "mcp_session_expired",
+                    status_code=exc.status_code,
+                )
                 self._session.reset()
                 await self.initialize()
                 result, _headers = await self._send_for_session(method, params, False)
@@ -119,22 +150,35 @@ class MCPClient:
             request_id = await self._next_id()
             payload = request_envelope(request_id, method, params)
 
-        headers = self._headers()
-        log_kv(logger, logging.DEBUG, "mcp_jsonrpc_request", method=method, session=bool(self.session_id))
-        body, response_headers = await self._transport.post(payload, headers=headers, allow_empty=notification)
-        normalized_headers = {key.lower(): value for key, value in response_headers.items()}
-
+        log_kv(
+            logger,
+            logging.DEBUG,
+            "mcp_jsonrpc_request",
+            method=method,
+            session=bool(self.session_id),
+        )
+        body, response_headers = await self._transport.post(
+            payload,
+            headers=self._headers(),
+            allow_empty=notification,
+        )
+        normalized_headers = {
+            key.lower(): value for key, value in response_headers.items()
+        }
         if notification:
             return None, normalized_headers
         if body is None:
             raise MCPProtocolError(f"MCP method {method} returned an empty response.")
+
         response = validate_response(body, expected_id=request_id)
         if response.error is not None:
             raise MCPClientError(f"MCP JSON-RPC error for {method}: {response.error}")
         return response.result, normalized_headers
 
     def _headers(self) -> dict[str, str]:
-        protocol_version = self._session.state.protocol_version or self.settings.mcp_protocol_version
+        protocol_version = (
+            self._session.state.protocol_version or self.settings.mcp_protocol_version
+        )
         headers = {
             "Accept": "application/json, text/event-stream",
             "Content-Type": "application/json",
@@ -152,4 +196,4 @@ class MCPClient:
 
 def _format_exception(exc: BaseException) -> str:
     text = str(exc).strip()
-    return f"{type(exc).__name__}: {text}" if text else f"{type(exc).__name__}: {exc!r}"
+    return f"{type(exc).__name__}: {text}" if text else type(exc).__name__

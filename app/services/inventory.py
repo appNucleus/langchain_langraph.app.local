@@ -67,22 +67,31 @@ class InventoryService:
 
     async def load(self, *, force_refresh: bool = False) -> RuntimeInventory:
         now = monotonic()
-        if not force_refresh and self._cache is not None and now - self._cached_at <= self.settings.inventory_cache_ttl_seconds:
-            return self._with_cache_metadata(self._cache, cached=True)
+        if self._is_fresh(now, force_refresh):
+            return self._with_cache_metadata(self._cache, cached=True)  # type: ignore[arg-type]
 
         async with self._lock:
             now = monotonic()
-            if not force_refresh and self._cache is not None and now - self._cached_at <= self.settings.inventory_cache_ttl_seconds:
-                return self._with_cache_metadata(self._cache, cached=True)
+            if self._is_fresh(now, force_refresh):
+                return self._with_cache_metadata(self._cache, cached=True)  # type: ignore[arg-type]
 
             models_result, tools_result = await asyncio.gather(
-                self._load_models(), self._load_tools(), return_exceptions=False
+                self._load_models(),
+                self._load_tools(),
             )
             models, model_error = models_result
             tools, tool_error = tools_result
-            errors = {key: value for key, value in (("ollama", model_error), ("mcp", tool_error)) if value}
+            errors = {
+                key: value
+                for key, value in (("ollama", model_error), ("mcp", tool_error))
+                if value
+            }
 
-            if errors and self._cache is not None and now - self._cached_at <= self.settings.inventory_stale_if_error_seconds:
+            if (
+                errors
+                and self._cache is not None
+                and now - self._cached_at <= self.settings.inventory_stale_if_error_seconds
+            ):
                 stale = RuntimeInventory(
                     models=self._cache.models,
                     tools=self._cache.tools,
@@ -102,14 +111,18 @@ class InventoryService:
         self._cache = None
         self._cached_at = 0.0
 
+    def _is_fresh(self, now: float, force_refresh: bool) -> bool:
+        return (
+            not force_refresh
+            and self._cache is not None
+            and now - self._cached_at <= self.settings.inventory_cache_ttl_seconds
+        )
+
     async def _load_models(self) -> tuple[list[dict[str, Any]], str | None]:
         if self.settings.llm_backend != "ollama":
             return [], None
         try:
-            if hasattr(self.ollama, "list_models"):
-                return await self.ollama.list_models(), None
-            health = await self.ollama.health()
-            return [{"name": name} for name in health.get("models", [])], None
+            return await self.ollama.list_models(), None
         except Exception as exc:  # noqa: BLE001
             error = _format_exception(exc)
             log_kv(logger, logging.WARNING, "inventory_ollama_error", error=error)
@@ -125,7 +138,12 @@ class InventoryService:
             log_kv(logger, logging.WARNING, "inventory_mcp_error", error=error)
             return [], error
 
-    def _with_cache_metadata(self, inventory: RuntimeInventory, *, cached: bool) -> RuntimeInventory:
+    def _with_cache_metadata(
+        self,
+        inventory: RuntimeInventory,
+        *,
+        cached: bool,
+    ) -> RuntimeInventory:
         return RuntimeInventory(
             models=inventory.models,
             tools=inventory.tools,
@@ -136,7 +154,7 @@ class InventoryService:
 
 
 class ModelSelector:
-    """Resolve roles only to compatible live models; never choose an arbitrary first model."""
+    """Resolve roles only to compatible live models."""
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -147,16 +165,34 @@ class ModelSelector:
         available = inventory.model_names if inventory else []
         if not available:
             return configured
+
         for candidate in self._preferred_candidates(role):
             if candidate in available and self._compatible(role, candidate):
                 return candidate
+
         fallback = self.settings.model_fallback
         if fallback in available and self._compatible(role, fallback):
             return fallback
         raise RuntimeError(f"No compatible installed Ollama model is available for role {role!r}.")
 
-    def configured_roles(self, inventory: RuntimeInventory | None = None) -> dict[str, dict[str, Any]]:
-        roles = ["planner", "simple", "general", "search", "reasoning", "fast_reasoning", "heavy", "synthesis", "writer", "classifier", "vision", "fallback"]
+    def configured_roles(
+        self,
+        inventory: RuntimeInventory | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        roles = [
+            "planner",
+            "simple",
+            "general",
+            "search",
+            "reasoning",
+            "fast_reasoning",
+            "heavy",
+            "synthesis",
+            "writer",
+            "classifier",
+            "vision",
+            "fallback",
+        ]
         output: dict[str, dict[str, Any]] = {}
         for role in roles:
             configured = self.settings.model_for_key(role)
@@ -166,11 +202,21 @@ class ModelSelector:
             except RuntimeError as exc:
                 resolved = None
                 error = str(exc)
-            output[role] = {"configured": configured, "resolved": resolved, "available": resolved is not None, "error": error}
+            output[role] = {
+                "configured": configured,
+                "resolved": resolved,
+                "available": resolved is not None,
+                "error": error,
+            }
+
         available = set(inventory.model_names if inventory else [])
         output["embedding"] = {
             "configured": self.settings.embedding_model,
-            "resolved": self.settings.embedding_model if not available or self.settings.embedding_model in available else None,
+            "resolved": (
+                self.settings.embedding_model
+                if not available or self.settings.embedding_model in available
+                else None
+            ),
             "available": not available or self.settings.embedding_model in available,
             "chat_model": False,
         }
@@ -186,47 +232,124 @@ class ModelSelector:
 
     def _preferred_candidates(self, key: str) -> list[str]:
         preferences = {
-            "planner": [self.settings.model_planner, self.settings.model_general, self.settings.model_classifier, self.settings.model_search],
-            "simple": [self.settings.model_simple, self.settings.model_general, self.settings.model_fallback],
-            "general": [self.settings.model_general, self.settings.model_simple, self.settings.model_search, self.settings.model_fallback],
-            "search": [self.settings.model_search, self.settings.model_general, self.settings.model_fallback],
-            "reasoning": [self.settings.model_reasoning, self.settings.model_fast_reasoning, self.settings.model_heavy, self.settings.model_search],
-            "fast_reasoning": [self.settings.model_fast_reasoning, self.settings.model_reasoning, self.settings.model_general, self.settings.model_fallback],
-            "heavy": [self.settings.model_heavy, self.settings.model_synthesis, self.settings.model_reasoning, self.settings.model_search],
-            "synthesis": [self.settings.model_synthesis, self.settings.model_heavy, self.settings.model_reasoning, self.settings.model_search],
-            "writer": [self.settings.model_writer, self.settings.model_general, self.settings.model_synthesis, self.settings.model_fallback],
-            "classifier": [self.settings.model_classifier, self.settings.model_general, self.settings.model_simple, self.settings.model_fallback],
+            "planner": [
+                self.settings.model_planner,
+                self.settings.model_general,
+                self.settings.model_classifier,
+                self.settings.model_search,
+            ],
+            "simple": [
+                self.settings.model_simple,
+                self.settings.model_general,
+                self.settings.model_fallback,
+            ],
+            "general": [
+                self.settings.model_general,
+                self.settings.model_simple,
+                self.settings.model_search,
+                self.settings.model_fallback,
+            ],
+            "search": [
+                self.settings.model_search,
+                self.settings.model_general,
+                self.settings.model_fallback,
+            ],
+            "reasoning": [
+                self.settings.model_reasoning,
+                self.settings.model_fast_reasoning,
+                self.settings.model_heavy,
+                self.settings.model_search,
+            ],
+            "fast_reasoning": [
+                self.settings.model_fast_reasoning,
+                self.settings.model_reasoning,
+                self.settings.model_general,
+                self.settings.model_fallback,
+            ],
+            "heavy": [
+                self.settings.model_heavy,
+                self.settings.model_synthesis,
+                self.settings.model_reasoning,
+                self.settings.model_search,
+            ],
+            "synthesis": [
+                self.settings.model_synthesis,
+                self.settings.model_heavy,
+                self.settings.model_reasoning,
+                self.settings.model_search,
+            ],
+            "writer": [
+                self.settings.model_writer,
+                self.settings.model_general,
+                self.settings.model_synthesis,
+                self.settings.model_fallback,
+            ],
+            "classifier": [
+                self.settings.model_classifier,
+                self.settings.model_general,
+                self.settings.model_simple,
+                self.settings.model_fallback,
+            ],
             "vision": [self.settings.model_vision],
             "fallback": [self.settings.model_fallback, self.settings.model_general],
         }
         merged: list[str] = []
-        for candidate in preferences.get(key, [self.settings.model_for_key(key), self.settings.model_fallback]):
+        for candidate in preferences.get(
+            key,
+            [self.settings.model_for_key(key), self.settings.model_fallback],
+        ):
             if candidate and candidate not in merged:
                 merged.append(candidate)
         return merged
 
 
-def build_inventory_payload(settings: Settings, inventory: RuntimeInventory, selector: ModelSelector) -> dict[str, Any]:
+def normalize_inventory(value: RuntimeInventory | dict[str, Any]) -> RuntimeInventory:
+    """Normalize legacy graph inventory dictionaries for a safe transition."""
+    if isinstance(value, RuntimeInventory):
+        return value
+    return RuntimeInventory(
+        models=[item for item in value.get("models", []) if isinstance(item, dict)],
+        tools=[item for item in value.get("tools", []) if isinstance(item, dict)],
+        errors={str(k): str(v) for k, v in value.get("errors", {}).items()},
+        cached=bool(value.get("cached", False)),
+        age_seconds=float(value.get("age_seconds", 0.0) or 0.0),
+    )
+
+
+def build_inventory_payload(
+    settings: Settings,
+    inventory: RuntimeInventory | dict[str, Any],
+    selector: ModelSelector | Any,
+) -> dict[str, Any]:
+    runtime = normalize_inventory(inventory)
+    effective_selector = selector if hasattr(selector, "configured_roles") else ModelSelector(settings)
     return {
-        "service": {"name": settings.app_name, "environment": settings.environment, "backend": settings.llm_backend},
+        "service": {
+            "name": settings.app_name,
+            "environment": settings.environment,
+            "backend": settings.llm_backend,
+        },
         "ollama": {
             "base_url": settings.ollama_base_url,
-            "models": inventory.models,
-            "model_names": inventory.model_names,
-            "configured_roles": selector.configured_roles(inventory),
+            "models": runtime.models,
+            "model_names": runtime.model_names,
+            "configured_roles": effective_selector.configured_roles(runtime),
             "model_task_catalog": settings.model_role_catalog(),
         },
         "mcp": {
             "enabled": settings.mcp_enabled,
             "server_url": settings.mcp_server_url,
-            "tools": inventory.tools,
-            "tool_names": inventory.tool_names,
+            "tools": runtime.tools,
+            "tool_names": runtime.tool_names,
         },
-        "cache": {"cached": inventory.cached, "age_seconds": round(inventory.age_seconds, 3)},
-        "errors": inventory.errors,
+        "cache": {
+            "cached": runtime.cached,
+            "age_seconds": round(runtime.age_seconds, 3),
+        },
+        "errors": runtime.errors,
     }
 
 
 def _format_exception(exc: BaseException) -> str:
     text = str(exc).strip()
-    return f"{type(exc).__name__}: {text}" if text else f"{type(exc).__name__}: {exc!r}"
+    return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
