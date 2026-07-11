@@ -1,11 +1,11 @@
 [build-system]
-requires = ["setuptools>=69", "wheel"]
+requires = ["setuptools>=69"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "langchain-langraph-app"
 dynamic = ["version"]
-description = "FastAPI + LangGraph app server with live Ollama/MCP inventory, bounded execution, and worker-verifier orchestration."
+description = "FastAPI + LangGraph app server with live Ollama/MCP inventory, dynamic routing, and a bounded worker-verifier workflow."
 requires-python = ">=3.12"
 readme = "README.md"
 license = { text = "MIT" }
