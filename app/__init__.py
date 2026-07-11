@@ -1,8 +1,9 @@
-"""LangChain/LangGraph FastAPI application package."""
+"""Application package metadata.
 
-# Keep this value synchronized with ``pyproject.toml``.
-# The FastAPI factory imports it for the OpenAPI document, root endpoint,
-# and health response during application startup.
-__version__ = "0.4.0"
+This module is the single source of truth for the application version.
+Do not duplicate the version in settings, environment files, or API modules.
+"""
+
+__version__ = "0.4.1"
 
 __all__ = ["__version__"]
