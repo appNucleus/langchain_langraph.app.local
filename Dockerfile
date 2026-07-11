@@ -2,7 +2,8 @@ FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    LANGGRAPH_STRICT_MSGPACK=true
 
 WORKDIR /app
 
@@ -11,7 +12,11 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
+
+# Install the complete runtime dependency graph, then fail the image build
+# immediately if any installed package has an incompatible requirement.
+RUN python -m pip install --no-cache-dir -r /app/requirements.txt \
+    && python -m pip check
 
 COPY app /app/app
 
