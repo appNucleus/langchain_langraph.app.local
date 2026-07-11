@@ -4,6 +4,7 @@ import asyncio
 import json
 from collections.abc import AsyncIterator
 from typing import Any
+from uuid import uuid4
 
 from langgraph.graph import END, START, StateGraph
 
@@ -26,9 +27,9 @@ from app.schemas.worker import WorkerResult
 from app.services.answer_quality import deterministic_output_issues
 from app.services.context_builder import build_context
 from app.services.evidence import evidence_from_metadata
-from app.state.in_memory import BoundedInMemoryStore
-from app.tools.executor import ToolApprovalRequired, ToolExecutor
 from app.settings import Settings
+from app.state import StateRuntime
+from app.tools.executor import ToolApprovalRequired, ToolExecutor
 
 
 def encode_sse(event_name: str, data: object) -> str:
@@ -41,7 +42,7 @@ class _Selector:
 
 
 class ChatAgent:
-    """Phase 3 runtime: Phase 2 worker/verifier graph plus bounded execution and live dependencies."""
+    """Phase 4 runtime with durable checkpoints and pluggable state backends."""
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -53,21 +54,29 @@ class ChatAgent:
         self.mcp = MCPClient(settings)
         self.tool_executor = ToolExecutor(self.mcp, settings)
         self.selector = _Selector(settings)
-        self.memory = BoundedInMemoryStore(
-            ttl_seconds=settings.state_ttl_seconds,
-            max_sessions=settings.state_max_sessions,
-            max_messages=settings.state_max_history_messages,
-        )
-        self.graph = self._build_graph()
+        self.state_runtime = StateRuntime(settings)
+        self.memory = self.state_runtime.conversations
+        self.graph = self._build_graph(self.state_runtime.checkpointer)
 
     async def start(self) -> None:
+        await self.state_runtime.start()
+        self.memory = self.state_runtime.conversations
+        self.graph = self._build_graph(self.state_runtime.checkpointer)
         if self.settings.llm_backend == "ollama":
             await self.ollama.start()
         if self.settings.mcp_enabled:
             await self.mcp.start()
 
     async def aclose(self) -> None:
-        await asyncio.gather(self.ollama.aclose(), self.mcp.aclose(), return_exceptions=True)
+        await asyncio.gather(
+            self.ollama.aclose(),
+            self.mcp.aclose(),
+            self.state_runtime.aclose(),
+            return_exceptions=True,
+        )
+
+    async def persistence_health(self) -> dict[str, Any]:
+        return await self.state_runtime.health()
 
     async def load_inventory(self) -> dict[str, object]:
         models: list[dict[str, Any]] = []
@@ -85,7 +94,7 @@ class ChatAgent:
                 errors["mcp"] = str(exc)
         return {"models": models, "tools": tools, "errors": errors}
 
-    def _build_graph(self):
+    def _build_graph(self, checkpointer: Any):
         builder = StateGraph(AgentGraphState)
         builder.add_node("plan", self._plan)
         builder.add_node("worker", self._worker)
@@ -101,14 +110,21 @@ class ChatAgent:
         builder.add_conditional_edges(
             "verify",
             after_verification,
-            {"advance": "advance", "revise": "revise", "research": "research", "replan": "replan"},
+            {
+                "advance": "advance",
+                "revise": "revise",
+                "research": "research",
+                "replan": "replan",
+            },
         )
         builder.add_edge("revise", "verify")
         builder.add_edge("research", "worker")
         builder.add_edge("replan", "worker")
-        builder.add_conditional_edges("advance", after_advance, {"worker": "worker", "finalize": "finalize"})
+        builder.add_conditional_edges(
+            "advance", after_advance, {"worker": "worker", "finalize": "finalize"}
+        )
         builder.add_edge("finalize", END)
-        return builder.compile()
+        return builder.compile(checkpointer=checkpointer)
 
     @staticmethod
     def _budget(state: AgentGraphState) -> ExecutionBudget:
@@ -123,7 +139,13 @@ class ChatAgent:
         if self.settings.llm_backend != "ollama":
             plan = ExecutionPlan(
                 goal=state["message"],
-                tasks=[PlanTask(id="t1", objective=state["message"], completion_criteria=["Answer directly and completely"])],
+                tasks=[
+                    PlanTask(
+                        id="t1",
+                        objective=state["message"],
+                        completion_criteria=["Answer directly and completely"],
+                    )
+                ],
             )
         else:
             budget.model_calls += 1
@@ -157,7 +179,10 @@ class ChatAgent:
             "previous_verification": state.get("verification"),
         }
         if self.settings.llm_backend != "ollama":
-            result = WorkerResult(answer=f"Echo mode is active.\n\nMessage received: {state['message']}", confidence=0.5)
+            result = WorkerResult(
+                answer=f"Echo mode is active.\n\nMessage received: {state['message']}",
+                confidence=0.5,
+            )
         else:
             budget.model_calls += 1
             budget.check()
@@ -179,12 +204,19 @@ class ChatAgent:
             report = VerificationReport(
                 verdict="pass",
                 task_complete=False,
-                issues=[VerificationIssue(code="budget_exhausted", description=str(exc), severity="high")],
+                issues=[
+                    VerificationIssue(
+                        code="budget_exhausted", description=str(exc), severity="high"
+                    )
+                ],
                 required_actions=[],
                 confidence=0.2,
             )
-            return {**state, "verification": report.model_dump(), "termination_reason": str(exc)}
-
+            return {
+                **state,
+                "verification": report.model_dump(),
+                "termination_reason": str(exc),
+            }
         issues = deterministic_output_issues(state["worker_result"]["answer"])
         if self.settings.llm_backend != "ollama":
             report = VerificationReport(
@@ -199,19 +231,33 @@ class ChatAgent:
                 budget.check()
             except BudgetExceeded as exc:
                 report = VerificationReport(
-                    verdict="pass", task_complete=False,
-                    issues=[VerificationIssue(code="budget_exhausted", description=str(exc), severity="high")],
-                    required_actions=[], confidence=0.2,
+                    verdict="pass",
+                    task_complete=False,
+                    issues=[
+                        VerificationIssue(
+                            code="budget_exhausted",
+                            description=str(exc),
+                            severity="high",
+                        )
+                    ],
+                    required_actions=[],
+                    confidence=0.2,
                 )
-                return {**state, "verification": report.model_dump(), "termination_reason": str(exc)}
+                return {
+                    **state,
+                    "verification": report.model_dump(),
+                    "termination_reason": str(exc),
+                }
             with span("graph.verify"):
-                report = await self.verifier.verify({
-                    "user_request": state["message"],
-                    "task": self._current_task(state),
-                    "worker_result": state["worker_result"],
-                    "evidence": state.get("evidence", []),
-                    "deterministic_issues": issues,
-                })
+                report = await self.verifier.verify(
+                    {
+                        "user_request": state["message"],
+                        "task": self._current_task(state),
+                        "worker_result": state["worker_result"],
+                        "evidence": state.get("evidence", []),
+                        "deterministic_issues": issues,
+                    }
+                )
         return {**state, "verification": report.model_dump()}
 
     async def _revise(self, state: AgentGraphState) -> AgentGraphState:
@@ -219,12 +265,22 @@ class ChatAgent:
         budget.model_calls += 1
         budget.check()
         payload = {
-            "user_request": state["message"], "task": self._current_task(state),
-            "worker_result": state["worker_result"], "verification": state["verification"],
+            "user_request": state["message"],
+            "task": self._current_task(state),
+            "worker_result": state["worker_result"],
+            "verification": state["verification"],
             "evidence": state.get("evidence", []),
         }
-        result = await self.worker.revise(payload) if self.settings.llm_backend == "ollama" else WorkerResult.model_validate(state["worker_result"])
-        return {**state, "worker_result": result.model_dump(), "iterations": state.get("iterations", 0) + 1}
+        result = (
+            await self.worker.revise(payload)
+            if self.settings.llm_backend == "ollama"
+            else WorkerResult.model_validate(state["worker_result"])
+        )
+        return {
+            **state,
+            "worker_result": result.model_dump(),
+            "iterations": state.get("iterations", 0) + 1,
+        }
 
     async def _research(self, state: AgentGraphState) -> AgentGraphState:
         rounds = state.get("research_rounds", 0) + 1
@@ -232,82 +288,154 @@ class ChatAgent:
             verification = dict(state["verification"])
             verification["verdict"] = "revise"
             return {**state, "verification": verification, "research_rounds": rounds}
-
         metadata = dict(state.get("metadata", {}))
-        query = str(metadata.get("research_query") or self._current_task(state).get("objective") or state["message"])
+        query = str(
+            metadata.get("research_query")
+            or self._current_task(state).get("objective")
+            or state["message"]
+        )
         tool = str(metadata.get("research_tool") or "web_search_and_scrape")
-        arguments = {"query": query, "pages": int(metadata.get("pages", 3)), "prefer_official": True}
+        arguments = {
+            "query": query,
+            "pages": int(metadata.get("pages", 3)),
+            "prefer_official": True,
+        }
         try:
-            result = await self.tool_executor.execute(tool, arguments, budget=self._budget(state), metadata=metadata)
+            result = await self.tool_executor.execute(
+                tool, arguments, budget=self._budget(state), metadata=metadata
+            )
             evidence = metadata.setdefault("evidence", [])
-            evidence.append({
-                "id": f"research-{rounds}", "source": tool,
-                "content": result.data if result.ok else f"Tool failed: {result.error}",
-            })
+            evidence.append(
+                {
+                    "id": f"research-{rounds}",
+                    "source": tool,
+                    "content": result.data if result.ok else f"Tool failed: {result.error}",
+                }
+            )
         except (ToolApprovalRequired, BudgetExceeded) as exc:
-            metadata.setdefault("evidence", []).append({"id": f"research-{rounds}", "source": tool, "content": str(exc)})
+            metadata.setdefault("evidence", []).append(
+                {"id": f"research-{rounds}", "source": tool, "content": str(exc)}
+            )
         return {**state, "metadata": metadata, "research_rounds": rounds}
 
     async def _replan(self, state: AgentGraphState) -> AgentGraphState:
         replans = state.get("replans", 0) + 1
         if replans > self.settings.phase2_max_replans:
-            verification = dict(state["verification"]); verification["verdict"] = "revise"
+            verification = dict(state["verification"])
+            verification["verdict"] = "revise"
             return {**state, "verification": verification, "replans": replans}
-        budget = self._budget(state); budget.model_calls += 1; budget.check()
-        plan = await self.planner.plan(state["message"]) if self.settings.llm_backend == "ollama" else ExecutionPlan.model_validate(state["plan"])
-        return {**state, "plan": plan.model_dump(), "task_index": 0, "replans": replans}
+        budget = self._budget(state)
+        budget.model_calls += 1
+        budget.check()
+        plan = (
+            await self.planner.plan(state["message"])
+            if self.settings.llm_backend == "ollama"
+            else ExecutionPlan.model_validate(state["plan"])
+        )
+        return {
+            **state,
+            "plan": plan.model_dump(),
+            "task_index": 0,
+            "replans": replans,
+        }
 
     async def _advance(self, state: AgentGraphState) -> AgentGraphState:
         results = list(state.get("task_results", []))
-        results.append({"task": self._current_task(state), "worker_result": state["worker_result"], "verification": state["verification"]})
-        return {**state, "task_results": results, "task_index": state.get("task_index", 0) + 1, "verification": {}, "worker_result": {}}
+        results.append(
+            {
+                "task": self._current_task(state),
+                "worker_result": state["worker_result"],
+                "verification": state["verification"],
+            }
+        )
+        return {
+            **state,
+            "task_results": results,
+            "task_index": state.get("task_index", 0) + 1,
+            "verification": {},
+            "worker_result": {},
+        }
 
     async def _finalize(self, state: AgentGraphState) -> AgentGraphState:
         results = state.get("task_results", [])
         if self.settings.llm_backend == "ollama" and len(results) > 1:
-            budget = self._budget(state); budget.model_calls += 1; budget.check()
-            response = await self.synthesizer.synthesize({"user_request": state["message"], "verified_results": results})
+            budget = self._budget(state)
+            budget.model_calls += 1
+            budget.check()
+            response = await self.synthesizer.synthesize(
+                {"user_request": state["message"], "verified_results": results}
+            )
         else:
-            response = results[-1]["worker_result"]["answer"] if results else state.get("worker_result", {}).get("answer", "")
-        return {**state, "response": response, "backend": self.settings.llm_backend, "model": self.settings.model_general}
+            response = (
+                results[-1]["worker_result"]["answer"]
+                if results
+                else state.get("worker_result", {}).get("answer", "")
+            )
+        return {
+            **state,
+            "response": response,
+            "backend": self.settings.llm_backend,
+            "model": self.settings.model_general,
+        }
 
     async def ainvoke(self, request: ChatRequest) -> ChatResponse:
+        thread_id = request.thread_id or str(uuid4())
         budget = ExecutionBudget(
             self.settings.execution_max_duration_seconds,
             self.settings.execution_max_model_calls,
             self.settings.execution_max_tool_calls,
             self.settings.execution_max_verifier_rounds,
         )
-        history = await self.memory.get(request.thread_id)
+        history = await self.memory.get(thread_id)
         metrics.inc("chat.requests")
+        config = {"configurable": {"thread_id": thread_id}}
         with span("chat.total"):
-            result = await self.graph.ainvoke({
-                "message": request.message,
-                "system_prompt": request.system_prompt or self.settings.default_system_prompt,
-                "metadata": request.metadata,
-                "history": history,
-                "execution_budget": budget,
-            })
+            result = await self.graph.ainvoke(
+                {
+                    "message": request.message,
+                    "system_prompt": request.system_prompt
+                    or self.settings.default_system_prompt,
+                    "metadata": request.metadata,
+                    "history": history,
+                    "execution_budget": budget,
+                },
+                config=config,
+            )
         await self.memory.append(
-            request.thread_id,
+            thread_id,
             {"role": "user", "content": request.message},
             {"role": "assistant", "content": result["response"]},
         )
         return ChatResponse.from_result(
-            thread_id=request.thread_id,
-            response=result["response"], backend=result["backend"], model=result.get("model"),
+            thread_id=thread_id,
+            response=result["response"],
+            backend=result["backend"],
+            model=result.get("model"),
             metadata={
-                **request.metadata, "phase": "3", "plan": result.get("plan"),
-                "verification": result.get("task_results"), "iterations": result.get("iterations"),
+                **request.metadata,
+                "phase": "4",
+                "persistence": {
+                    "state_backend": self.settings.state_backend,
+                    "checkpoint_backend": self.settings.checkpoint_backend,
+                    "artifact_backend": self.settings.artifact_backend,
+                },
+                "plan": result.get("plan"),
+                "verification": result.get("task_results"),
+                "iterations": result.get("iterations"),
                 "termination_reason": result.get("termination_reason"),
-                "usage": {"model_calls": budget.model_calls, "tool_calls": budget.tool_calls,
-                          "verifier_rounds": budget.verifier_rounds, "elapsed_seconds": round(budget.elapsed_seconds, 3)},
+                "usage": {
+                    "model_calls": budget.model_calls,
+                    "tool_calls": budget.tool_calls,
+                    "verifier_rounds": budget.verifier_rounds,
+                    "elapsed_seconds": round(budget.elapsed_seconds, 3),
+                },
             },
         )
 
-    async def astream_events(self, request: ChatRequest) -> AsyncIterator[dict[str, object]]:
+    async def astream_events(
+        self, request: ChatRequest
+    ) -> AsyncIterator[dict[str, object]]:
         yield event("request_started", thread_id=request.thread_id)
-        # LangGraph node events are emitted immediately; final answer remains compatible with all Phase 2 agents.
         yield event("planning_started")
         task = asyncio.create_task(self.ainvoke(request))
         while not task.done():
