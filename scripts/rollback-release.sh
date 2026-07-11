@@ -65,7 +65,7 @@ docker compose --env-file "$ROLLBACK_STATE_DIR/runtime.env" up \
   --wait-timeout 120
 popd >/dev/null
 
-"$script_dir/smoke-test.sh" rollback
+bash "$script_dir/smoke-test.sh" rollback
 
 docker image rm "$ROLLBACK_IMAGE" >/dev/null 2>&1 || true
 docker image prune --force >/dev/null || true
