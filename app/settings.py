@@ -27,7 +27,7 @@ class Settings(BaseSettings):
     )
 
     app_name: str = "LangChain LangGraph App"
-    app_version: str = "0.5.0"
+    app_version: str = "0.6.0-phase1"
     environment: str = "local"
     log_level: str = "INFO"
 
@@ -40,6 +40,12 @@ class Settings(BaseSettings):
     # Ollama server.
     ollama_base_url: str = "http://ollama.home.arpa:11434"
     ollama_timeout_seconds: float = 240.0
+    ollama_connect_timeout_seconds: float = 10.0
+    ollama_pool_timeout_seconds: float = 30.0
+    ollama_max_connections: int = 20
+    ollama_max_keepalive_connections: int = 10
+    ollama_max_concurrent_requests: int = 2
+    ollama_max_concurrent_heavy_requests: int = 1
     ollama_temperature: float = 0.1
     ollama_num_predict: int = 2048
     ollama_stream_num_predict: int = 2048
@@ -72,7 +78,18 @@ class Settings(BaseSettings):
     # MCP server. Use DNS/Caddy/network routing, not Docker-internal host aliases.
     mcp_enabled: bool = True
     mcp_server_url: str = "https://mcp.home.arpa/mcp"
+    # mcp_timeout_seconds remains as a backward-compatible umbrella value.
     mcp_timeout_seconds: float = 75.0
+    mcp_connect_timeout_seconds: float = 10.0
+    mcp_read_timeout_seconds: float = 75.0
+    mcp_write_timeout_seconds: float = 30.0
+    mcp_pool_timeout_seconds: float = 30.0
+    mcp_max_connections: int = 20
+    mcp_max_keepalive_connections: int = 10
+    mcp_session_enabled: bool = True
+    mcp_initialize_on_startup: bool = False
+    mcp_client_name: str = "app.local"
+    mcp_client_version: str = "0.6.0-phase1"
     mcp_verify_tls: bool = False
     mcp_follow_redirects: bool = True
     mcp_protocol_version: str = "2025-03-26"
@@ -90,6 +107,13 @@ class Settings(BaseSettings):
     default_news_lookback_days: int = 7
     default_forecast_days: int = 7
 
+    # Short-lived runtime inventory cache. Set to 0 to disable caching.
+    inventory_cache_ttl_seconds: float = 30.0
+    inventory_stale_if_error_seconds: float = 300.0
+
+    # Shared HTTP connection lifetime.
+    http_keepalive_expiry_seconds: float = 30.0
+
     # Sub-answer validation/retry behavior. This blocks broken outputs like "**" or "1".
     min_answer_chars: int = 80
     max_answer_retries: int = 2
@@ -97,6 +121,9 @@ class Settings(BaseSettings):
     # In-memory session history. This is intentionally simple and local.
     session_history_messages: int = 12
     max_history_message_chars: int = 1600
+    max_conversation_sessions: int = 500
+    conversation_session_ttl_seconds: float = 21600.0
+    conversation_cleanup_interval_seconds: float = 300.0
 
     default_system_prompt: str = Field(
         default=(
