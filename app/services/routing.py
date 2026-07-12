@@ -1,279 +1,405 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
-from typing import Any
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any, Iterable
 
+from app.services.inventory import ModelSelector, RuntimeInventory
 from app.settings import Settings
 
-
-URL_RE = re.compile(r"https?://[^\s)>'\"]+", re.IGNORECASE)
-TICKER_RE = re.compile(r"(?:\$|\b)([A-Z]{1,5})(?:\b)")
-ROAD_RE = re.compile(r"\b(?:I|US|SR|IN|KY|OH|MI|IL)[-\s]?\d{1,4}\b", re.IGNORECASE)
+_CURRENT_TERMS = {
+    "current",
+    "currently",
+    "latest",
+    "live",
+    "today",
+    "tonight",
+    "tomorrow",
+    "yesterday",
+    "recent",
+    "recently",
+    "now",
+    "this week",
+    "last night",
+    "breaking",
+}
+_SEARCH_TERMS = {
+    "find",
+    "search",
+    "look up",
+    "research",
+    "source",
+    "evidence",
+    "news",
+    "weather",
+    "forecast",
+    "score",
+    "match",
+    "game",
+    "fifa",
+    "world cup",
+    "critic",
+    "criticism",
+    "reaction",
+    "report",
+}
+_REASONING_TERMS = {
+    "analyze",
+    "analysis",
+    "compare",
+    "comparison",
+    "critic",
+    "criticism",
+    "tradeoff",
+    "risk",
+    "recommend",
+    "recommendation",
+    "why",
+    "evaluate",
+    "architecture",
+    "diagnostic",
+}
+_WRITE_MARKERS = {
+    "send",
+    "create",
+    "delete",
+    "remove",
+    "update",
+    "modify",
+    "write",
+    "draft",
+    "post",
+    "publish",
+    "book",
+    "purchase",
+    "order",
+    "cancel",
+    "forward",
+    "reply",
+}
 
 
 @dataclass(frozen=True)
-class QueryPlan:
-    intent: str
-    tools: list[str] = field(default_factory=list)
-    model_key: str = "general"
-    needs_query_rewrite: bool = False
-    reason: str = ""
-
-    @property
-    def uses_tools(self) -> bool:
-        return bool(self.tools)
+class TaskRoutingDecision:
+    requires_external_evidence: bool
+    worker_role: str
+    verifier_role: str
+    reason: str
 
 
-class ModelRouter:
-    """Deterministic first-pass router for model and MCP tool selection.
+@dataclass(frozen=True)
+class ModelRoutingDecision:
+    role: str
+    model: str
+    reason: str
 
-    This is intentionally explicit and testable. The LLM is not trusted to
-    decide when to send mail, call tools, or choose expensive models. Metadata
-    can override tools for controlled tests/integrations, but unsafe operations
-    still require explicit arguments in graph tool argument construction.
+
+@dataclass(frozen=True)
+class ToolRoutingDecision:
+    name: str
+    arguments: dict[str, Any]
+    score: int
+    reason: str
+
+
+class RuntimeRouter:
+    """Deterministic runtime router over live Ollama and MCP inventory.
+
+    The router deliberately does not let an LLM invent unavailable model or tool
+    names. It classifies the task, resolves the role through ``ModelSelector``,
+    and ranks only MCP tools reported by the live inventory.
     """
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        self.models = ModelSelector(settings)
 
-    def plan(self, message: str, metadata: dict[str, Any] | None = None) -> QueryPlan:
-        text = message.strip()
-        lower = text.lower()
+    @staticmethod
+    def execution_context() -> dict[str, str]:
+        now = datetime.now(timezone.utc)
+        return {
+            "execution_time_utc": now.isoformat(),
+            "execution_date_utc": now.date().isoformat(),
+            "relative_date_rule": (
+                "Resolve relative dates such as today/yesterday from execution_time_utc; "
+                "do not invent a calendar date when external evidence is required."
+            ),
+        }
+
+    def classify_task(
+        self,
+        *,
+        user_request: str,
+        task: dict[str, Any] | None,
+    ) -> TaskRoutingDecision:
+        task = task or {}
+        required = task.get("required_evidence") or []
+        objective = str(task.get("objective") or "")
+        text = self._normalize(f"{user_request} {objective} {' '.join(map(str, required))}")
+
+        current = self._contains_any(text, _CURRENT_TERMS)
+        search = self._contains_any(text, _SEARCH_TERMS)
+        explicitly_requires_evidence = bool(required)
+        requires_external = current or search or explicitly_requires_evidence
+        reasoning = self._contains_any(text, _REASONING_TERMS)
+
+        if requires_external:
+            worker_role = "search"
+            reason = "current/search/evidence-dependent task"
+        elif reasoning:
+            worker_role = "reasoning"
+            reason = "analysis/reasoning task"
+        elif len(text.split()) <= 18:
+            worker_role = "simple"
+            reason = "short stable task"
+        else:
+            worker_role = "general"
+            reason = "general task"
+
+        verifier_role = "reasoning" if reasoning or requires_external else "fast_reasoning"
+        return TaskRoutingDecision(
+            requires_external_evidence=requires_external,
+            worker_role=worker_role,
+            verifier_role=verifier_role,
+            reason=reason,
+        )
+
+    def select_model(
+        self,
+        *,
+        role: str,
+        inventory: RuntimeInventory,
+        reason: str,
+    ) -> ModelRoutingDecision:
+        model = self.models.resolve(role, inventory)
+        return ModelRoutingDecision(role=role, model=model, reason=reason)
+
+    def select_tools(
+        self,
+        *,
+        user_request: str,
+        task: dict[str, Any] | None,
+        required_actions: Iterable[str] = (),
+        inventory: RuntimeInventory,
+        metadata: dict[str, Any] | None = None,
+        limit: int = 3,
+    ) -> list[ToolRoutingDecision]:
         metadata = metadata or {}
+        task = task or {}
+        action_text = " ".join(str(item) for item in required_actions if item)
+        objective = str(task.get("objective") or "")
+        query = " ".join(part for part in (objective, action_text, user_request) if part).strip()
+        normalized = self._normalize(query)
 
-        forced_tools = _normalize_tool_list(metadata.get("force_tools") or metadata.get("tools"))
-        if forced_tools:
-            return QueryPlan(
-                intent=str(metadata.get("intent") or "forced_tools"),
-                tools=[tool for tool in forced_tools if tool in TOOLS_SUPPORTED],
-                model_key=str(metadata.get("model_key") or "general"),
-                needs_query_rewrite=bool(metadata.get("rewrite_query", False)),
-                reason="Tools were explicitly requested by request metadata.",
-            )
-
-        urls = extract_urls(text)
-
-        if _contains_any(lower, ["mcp health", "tool health", "health check", "check tools"]):
-            return QueryPlan("tool_health", ["health_check"], "simple", False, "MCP health/tool check request.")
-
-        if urls:
-            if _contains_any(lower, ["image", "images", "photo", "picture", "thumbnail", "extract image"]):
-                return QueryPlan(
-                    intent="image_url_extraction",
-                    tools=["extract_image_urls"],
-                    model_key="vision",
-                    needs_query_rewrite=False,
-                    reason="URL plus image extraction intent.",
+        decisions: list[ToolRoutingDecision] = []
+        for tool in inventory.tools:
+            name = str(tool.get("name") or "").strip()
+            if not name or not self._read_only_candidate(name):
+                continue
+            description = str(tool.get("description") or "")
+            score, reasons = self._tool_score(name, description, normalized)
+            arguments = self._arguments_for_tool(tool, query, metadata)
+            if arguments is None:
+                continue
+            if score <= 0:
+                continue
+            decisions.append(
+                ToolRoutingDecision(
+                    name=name,
+                    arguments=arguments,
+                    score=score,
+                    reason=", ".join(reasons) or "generic read-only research tool",
                 )
-            return QueryPlan(
-                intent="url_scrape",
-                tools=["scrape_url"],
-                model_key="search",
-                needs_query_rewrite=False,
-                reason="URL provided; scrape before answering.",
             )
 
-        if _contains_any(lower, ["weather", "forecast", "temperature", "rain", "snow", "storm", "wind", "humid"]):
-            return QueryPlan("weather", ["weather_lookup"], "search", True, "Weather/current forecast request.")
+        decisions.sort(key=lambda item: (-item.score, item.name))
+        return decisions[: max(1, limit)]
 
-        if _contains_any(lower, ["image", "screenshot", "photo", "picture", "chart", "diagram", "visual"]):
-            return QueryPlan("vision", [], "vision", False, "Visual/image-related request; route to the vision model when image input is available.")
+    @staticmethod
+    def _normalize(value: str) -> str:
+        return " ".join(value.lower().split())
 
-        if _contains_any(lower, ["embedding", "vector", "semantic search", "rag index", "similarity search"]):
-            return QueryPlan("embedding_or_rag", [], "general", False, "Embedding/RAG planning request; embedding model is cataloged for vector tasks, chat answer uses a generative model.")
+    @staticmethod
+    def _contains_any(text: str, terms: set[str]) -> bool:
+        return any(term in text for term in terms)
 
-        if _contains_any(lower, ["road condition", "traffic", "closure", "closed road", "accident on", "construction on"]):
-            return QueryPlan(
-                "road_condition",
-                ["road_condition_search"],
-                "search",
-                True,
-                "Road condition requests require fresh official/state data.",
+    @staticmethod
+    def _read_only_candidate(name: str) -> bool:
+        normalized = name.lower().replace("-", "_")
+        parts = set(filter(None, re.split(r"[^a-z0-9]+", normalized)))
+        return not bool(parts.intersection(_WRITE_MARKERS))
+
+    def _tool_score(self, name: str, description: str, query: str) -> tuple[int, list[str]]:
+        haystack = self._normalize(f"{name} {description}")
+        score = 0
+        reasons: list[str] = []
+
+        if "weather" in query or "forecast" in query:
+            score += self._score_terms(haystack, ("weather", "forecast", "climate"), 12)
+            if any(term in haystack for term in ("weather", "forecast")):
+                reasons.append("weather capability")
+
+        if any(term in query for term in ("fifa", "football", "soccer", "match", "game", "score")):
+            score += self._score_terms(
+                haystack,
+                ("sports", "football", "soccer", "fifa", "match", "score", "news"),
+                10,
             )
+            if any(term in haystack for term in ("sports", "football", "soccer", "news")):
+                reasons.append("sports/news capability")
 
-        if _contains_any(lower, ["world cup", "match result", "match results", "score", "scores", "fixture", "fixtures", "standings", "who won", "final score"]):
-            return QueryPlan(
-                "sports_or_match_results",
-                ["web_search_and_scrape", "news_search"],
-                "search",
-                True,
-                "Sports/match results are current information and need search plus page evidence.",
-            )
+        if self._contains_any(query, _CURRENT_TERMS) or "news" in query:
+            score += self._score_terms(haystack, ("news", "search", "web", "scrape"), 8)
+            if any(term in haystack for term in ("news", "search", "web")):
+                reasons.append("fresh-information capability")
 
-        if self._looks_like_stock_request(text):
-            tools = ["stock_quote"]
-            if _contains_any(lower, ["why", "move", "moved", "down", "up", "drop", "gain", "reason"]):
-                tools = ["explain_stock_move"]
-            elif _contains_any(lower, ["news", "latest", "recent", "today", "this week"]):
-                tools = ["stock_quote", "stock_news"]
-            return QueryPlan(
-                "stock",
-                tools,
-                "search",
-                True,
-                "Stock/market request requires quote/news evidence.",
-            )
+        if any(term in query for term in ("critic", "reaction", "report", "source", "evidence")):
+            score += self._score_terms(haystack, ("news", "search", "web", "scrape", "article"), 7)
+            if any(term in haystack for term in ("news", "search", "scrape")):
+                reasons.append("source-discovery capability")
 
-        if _contains_any(lower, ["latest", "today", "current", "recent", "breaking", "news", "update", "this week"]):
-            return QueryPlan("news", ["news_search"], "search", True, "Fresh news/current-events request.")
+        # General safe research fallback. Combined search+scrape tools are useful
+        # when no domain-specific MCP tool exists.
+        score += self._score_terms(haystack, ("search", "web", "news", "scrape", "fetch"), 3)
+        if name in {"web_search_and_scrape", "web_search", "news_search"}:
+            score += 4
+            reasons.append("known read-only research fallback")
+        return score, reasons
 
-        if _contains_any(lower, ["quick search", "search only", "web search", "find links", "search result"]):
-            return QueryPlan(
-                "web_search",
-                ["web_search"],
-                "search",
-                True,
-                "Lightweight search request without page scraping.",
-            )
+    @staticmethod
+    def _score_terms(haystack: str, terms: tuple[str, ...], weight: int) -> int:
+        return sum(weight for term in terms if term in haystack)
 
-        if _contains_any(lower, ["search", "internet", "web", "look up", "find online", "source", "reference"]):
-            return QueryPlan(
-                "web_research",
-                ["web_search_and_scrape"],
-                "search",
-                True,
-                "Explicit web research request.",
-            )
+    def _arguments_for_tool(
+        self,
+        tool: dict[str, Any],
+        query: str,
+        metadata: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        schema = tool.get("inputSchema") or tool.get("input_schema") or {}
+        if not isinstance(schema, dict):
+            return None
+        properties = schema.get("properties") or {}
+        if not isinstance(properties, dict):
+            properties = {}
+        required = schema.get("required") or []
+        if not isinstance(required, list):
+            required = []
 
-        if _contains_any(lower, ["email", "mail", "inbox", "draft"]):
-            if _contains_any(lower, ["send draft", "send the draft"]):
-                return QueryPlan(
-                    "mail_send_draft",
-                    ["mail_send_draft"],
-                    "general",
-                    False,
-                    "Draft-send request; graph requires draft_id and confirmation_token metadata.",
-                )
-            if _contains_any(lower, ["create draft", "draft an email", "email draft", "write draft"]):
-                return QueryPlan(
-                    "mail_create_draft",
-                    ["mail_create_draft"],
-                    "general",
-                    False,
-                    "Email draft request; send is never automatic.",
-                )
-            if _contains_any(lower, ["read", "open", "message id"]):
-                return QueryPlan("mail_read", ["mail_read"], "general", False, "Mail read intent.")
-            return QueryPlan("mail_search", ["mail_search"], "general", True, "Mail search intent.")
+        pages = self._safe_int(metadata.get("pages"), default=3, minimum=1, maximum=10)
+        arguments: dict[str, Any] = {}
+        for prop, definition in properties.items():
+            if not isinstance(prop, str):
+                continue
+            prop_lower = prop.lower()
+            definition = definition if isinstance(definition, dict) else {}
+            value: Any | None = None
+            if prop_lower in {"query", "q", "search_query", "search", "text", "prompt"}:
+                value = query
+            elif prop_lower in {"pages", "limit", "count", "max_results", "num_results"}:
+                value = pages
+            elif prop_lower in {"prefer_official", "official_only"}:
+                value = True
+            elif prop_lower in {"location", "city", "place"}:
+                value = self._extract_location(query) or query
+            elif prop_lower in metadata:
+                value = metadata[prop_lower]
+            elif prop in metadata:
+                value = metadata[prop]
+            elif "default" in definition:
+                continue
+            elif prop in required:
+                value = self._fallback_required_value(definition, query, pages)
+                if value is None:
+                    return None
 
-        if _contains_any(lower, ["classify", "classification", "intent", "routing", "query type"]):
-            return QueryPlan(
-                "classification",
-                [],
-                "classifier",
-                False,
-                "Classification/routing request; use the compact classifier model.",
-            )
+            if value is not None:
+                arguments[prop] = value
 
-        if _contains_any(lower, ["rewrite", "polish", "draft", "write an email", "documentation", "readme", "report"]):
-            return QueryPlan(
-                "writing",
-                [],
-                "writer",
-                False,
-                "Writing/rewrite/documentation request; use the writer model.",
-            )
+        # Some MCP search tools omit a detailed schema. Preserve compatibility
+        # with the repository's established search-tool contract.
+        if not properties:
+            arguments = {"query": query, "pages": pages, "prefer_official": True}
 
-        if _contains_any(lower, ["math", "algorithm", "logic", "prove", "calculate", "equation"]):
-            return QueryPlan(
-                "fast_reasoning",
-                [],
-                "fast_reasoning",
-                False,
-                "Math/logic/algorithm request; use the fast reasoning model first.",
-            )
+        return arguments
 
-        if _contains_any(lower, ["architect", "architecture", "design", "debug", "explain why", "reason", "tradeoff", "compare", "analyze"]):
-            return QueryPlan(
-                "reasoning",
-                [],
-                "reasoning",
-                False,
-                "Moderate reasoning request without required fresh data.",
-            )
-
-        if len(text) < 120 and "?" not in text:
-            return QueryPlan("simple", [], "simple", False, "Short simple request.")
-
-        return QueryPlan("general", [], "general", False, "General assistant request.")
-
-    def _looks_like_stock_request(self, text: str) -> bool:
-        lower = text.lower()
-        stock_words = ["stock", "share", "ticker", "market cap", "earnings", "price target", "nasdaq", "nyse"]
-        if any(word in lower for word in stock_words):
+    @staticmethod
+    def _fallback_required_value(
+        definition: dict[str, Any], query: str, pages: int
+    ) -> Any | None:
+        value_type = definition.get("type")
+        if value_type == "string" or value_type is None:
+            return query
+        if value_type == "integer":
+            return pages
+        if value_type == "number":
+            return float(pages)
+        if value_type == "boolean":
             return True
-        # Avoid treating all uppercase acronyms as stocks unless finance verbs are present.
-        if _contains_any(lower, ["quote", "trading", "premarket", "after hours"]):
-            return bool(extract_ticker(text))
-        return False
+        return None
+
+    @staticmethod
+    def _safe_int(value: Any, *, default: int, minimum: int, maximum: int) -> int:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            parsed = default
+        return max(minimum, min(maximum, parsed))
+
+    @staticmethod
+    def _extract_location(query: str) -> str | None:
+        match = re.search(
+            r"\b(?:in|for|at|near)\s+([A-Z][A-Za-z .'-]+?)(?:[?.!,]|\s+(?:today|tomorrow|yesterday|now)\b|$)",
+            query,
+        )
+        return match.group(1).strip() if match else None
 
 
-TOOLS_SUPPORTED = {
-    "health_check",
-    "web_search",
-    "web_search_and_scrape",
-    "scrape_url",
-    "extract_image_urls",
-    "weather_lookup",
-    "stock_quote",
-    "stock_news",
-    "explain_stock_move",
-    "news_search",
-    "road_condition_search",
-    "mail_search",
-    "mail_read",
-    "mail_create_draft",
-    "mail_send_draft",
-}
+def build_fresh_run_state(
+    *,
+    message: str,
+    system_prompt: str,
+    metadata: dict[str, Any],
+    history: list[dict[str, Any]],
+    execution_budget: Any,
+    request_id: str,
+    inventory: RuntimeInventory,
+    backend: str,
+) -> dict[str, Any]:
+    """Return a complete per-invocation state that overwrites stale checkpoints.
 
+    LangGraph merges supplied input with the latest checkpoint for a thread. Every
+    transient channel is therefore included explicitly, including ``None`` and
+    empty containers, so a completed/terminated prior run cannot affect the new
+    request while external conversation history remains available separately.
+    """
 
-def extract_urls(text: str) -> list[str]:
-    return [match.group(0).rstrip(".,;]") for match in URL_RE.finditer(text)]
-
-
-def extract_ticker(text: str) -> str | None:
-    common_non_tickers = {"I", "A", "THE", "AND", "OR", "AI", "LLM", "USA", "API", "MCP", "AWS", "IN"}
-    for match in TICKER_RE.finditer(text):
-        token = match.group(1).upper()
-        if token not in common_non_tickers:
-            return token
-    return None
-
-
-def extract_road(text: str) -> str | None:
-    match = ROAD_RE.search(text)
-    return match.group(0).upper().replace(" ", "-") if match else None
-
-
-def extract_location(text: str, metadata: dict[str, Any] | None = None) -> str:
-    metadata = metadata or {}
-    for key in ["location", "city", "default_location"]:
-        if metadata.get(key):
-            return str(metadata[key])
-
-    lower = text.lower()
-    for marker in [" in ", " near ", " around ", " for "]:
-        if marker in lower:
-            idx = lower.rfind(marker)
-            candidate = text[idx + len(marker) :].strip(" ?.!")
-            if candidate:
-                candidate = re.split(r"\b(today|tomorrow|this week|now|tonight|forecast|weather)\b", candidate, flags=re.I)[0]
-                candidate = candidate.strip(" ,;:-")
-                if candidate:
-                    return candidate
-    return "Indianapolis, IN"
-
-
-def _contains_any(text: str, needles: list[str]) -> bool:
-    return any(needle in text for needle in needles)
-
-
-def _normalize_tool_list(value: Any) -> list[str]:
-    if not value:
-        return []
-    if isinstance(value, str):
-        return [item.strip() for item in value.split(",") if item.strip()]
-    if isinstance(value, list):
-        return [str(item).strip() for item in value if str(item).strip()]
-    return []
+    return {
+        "message": message,
+        "system_prompt": system_prompt,
+        "metadata": dict(metadata),
+        "history": list(history),
+        "execution_budget": execution_budget,
+        "request_id": request_id,
+        "inventory": inventory.as_dict(),
+        "routing": {},
+        "selected_models": {},
+        "selected_tool": None,
+        "selected_tools": {},
+        "researched_task_ids": [],
+        "plan": {},
+        "task_index": 0,
+        "task_results": [],
+        "worker_result": {},
+        "verification": {},
+        "evidence": [],
+        "iterations": 0,
+        "research_rounds": 0,
+        "replans": 0,
+        "next_action": "",
+        "response": "",
+        "backend": backend,
+        "model": None,
+        "termination_reason": None,
+    }

@@ -29,11 +29,9 @@ def create_app(
     app_settings = settings or get_settings()
     configure_logging(app_settings.log_level)
     agent = chat_agent or ChatAgent(app_settings)
-    inventory_service = InventoryService(
-        app_settings,
-        agent.ollama,
-        agent.mcp,
-    )
+    inventory_service = getattr(agent, "inventory_service", None)
+    if inventory_service is None:
+        inventory_service = InventoryService(app_settings, agent.ollama, agent.mcp)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
@@ -146,6 +144,7 @@ def create_app(
     async def ready_health(request: Request) -> JSONResponse:
         current_agent: ChatAgent = request.app.state.chat_agent
         current_settings: Settings = request.app.state.settings
+        current_inventory_service: InventoryService = request.app.state.inventory_service
         payload: dict[str, Any] = {
             "status": "ready",
             "service": current_settings.app_name,
@@ -154,39 +153,39 @@ def create_app(
         }
         ready = True
 
+        # Reuse the single-flight TTL inventory rather than forcing /api/tags and
+        # MCP health tool calls on every orchestrator probe. The first probe still
+        # validates both dependencies; later probes are cheap until the TTL expires.
+        live_inventory = await current_inventory_service.load()
         if current_settings.llm_backend == "ollama":
-            try:
-                payload["dependencies"]["ollama"] = (
-                    await current_agent.ollama.health()
-                )
-            except Exception as exc:
-                ready = False
-                payload["dependencies"]["ollama"] = {
-                    "status": "unavailable",
-                    "error": _safe_error(
-                        exc,
-                        expose=current_settings.expose_internal_health_details,
-                    ),
-                }
+            ollama_error = live_inventory.errors.get("ollama")
+            ollama_ready = not ollama_error and bool(live_inventory.model_names)
+            payload["dependencies"]["ollama"] = {
+                "status": "available" if ollama_ready else "unavailable",
+                "model_count": len(live_inventory.model_names),
+                "cached": live_inventory.cached,
+                "error": (
+                    ollama_error
+                    if current_settings.expose_internal_health_details
+                    else ("Dependency unavailable." if ollama_error else None)
+                ),
+            }
+            ready = ready and ollama_ready
 
         if current_settings.mcp_enabled:
-            try:
-                result = await current_agent.mcp.health_check()
-                payload["dependencies"]["mcp"] = {
-                    "status": "available" if result.ok else "unavailable",
-                    "ok": result.ok,
-                    "error": result.error,
-                }
-                ready = ready and result.ok
-            except Exception as exc:
-                ready = False
-                payload["dependencies"]["mcp"] = {
-                    "status": "unavailable",
-                    "error": _safe_error(
-                        exc,
-                        expose=current_settings.expose_internal_health_details,
-                    ),
-                }
+            mcp_error = live_inventory.errors.get("mcp")
+            mcp_ready = not mcp_error
+            payload["dependencies"]["mcp"] = {
+                "status": "available" if mcp_ready else "unavailable",
+                "tool_count": len(live_inventory.tool_names),
+                "cached": live_inventory.cached,
+                "error": (
+                    mcp_error
+                    if current_settings.expose_internal_health_details
+                    else ("Dependency unavailable." if mcp_error else None)
+                ),
+            }
+            ready = ready and mcp_ready
 
         try:
             payload["dependencies"]["persistence"] = (
@@ -214,8 +213,15 @@ def create_app(
 
     @app.get("/health/live")
     async def live_health(request: Request) -> JSONResponse:
-        # Kept unchanged because liveness/readiness separation is Phase 3 scope.
-        return await ready_health(request)
+        current_settings: Settings = request.app.state.settings
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content={
+                "status": "alive",
+                "service": current_settings.app_name,
+                "version": __version__,
+            },
+        )
 
     @app.get("/api/inventory", dependencies=[Depends(require_api_key)])
     async def inventory(request: Request) -> dict[str, object]:
