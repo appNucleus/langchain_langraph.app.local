@@ -15,16 +15,25 @@ from app.graph import ChatAgent, encode_sse
 from app.logging_config import configure_logging, log_kv
 from app.observability.metrics import metrics
 from app.schemas.chat import ChatRequest, ChatResponse
-from app.services.inventory import build_inventory_payload
+from app.services.inventory import InventoryService, build_inventory_payload
 from app.settings import Settings, get_settings
 
 logger = logging.getLogger(__name__)
 
 
-def create_app(*, settings: Settings | None = None, chat_agent: ChatAgent | None = None) -> FastAPI:
+def create_app(
+    *,
+    settings: Settings | None = None,
+    chat_agent: ChatAgent | None = None,
+) -> FastAPI:
     app_settings = settings or get_settings()
     configure_logging(app_settings.log_level)
     agent = chat_agent or ChatAgent(app_settings)
+    inventory_service = InventoryService(
+        app_settings,
+        agent.ollama,
+        agent.mcp,
+    )
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
@@ -49,8 +58,13 @@ def create_app(*, settings: Settings | None = None, chat_agent: ChatAgent | None
                 logger,
                 logging.ERROR,
                 "app_dependency_start_error",
-                error=_safe_error(exc, expose=app_settings.expose_internal_health_details),
+                error=_safe_error(
+                    exc,
+                    expose=app_settings.expose_internal_health_details,
+                ),
             )
+            # Preserve the existing Phase 3/4 startup policy. Phase 1 only
+            # activates shared clients and inventory caching.
             if app_settings.persistence_required:
                 raise
         try:
@@ -72,6 +86,8 @@ def create_app(*, settings: Settings | None = None, chat_agent: ChatAgent | None
     )
     app.state.settings = app_settings
     app.state.chat_agent = agent
+    app.state.inventory_service = inventory_service
+
     app.add_middleware(
         CORSMiddleware,
         allow_origins=app_settings.cors_origins,
@@ -81,7 +97,10 @@ def create_app(*, settings: Settings | None = None, chat_agent: ChatAgent | None
     )
 
     @app.exception_handler(Exception)
-    async def unhandled_exception_handler(_request: Request, exc: Exception) -> JSONResponse:
+    async def unhandled_exception_handler(
+        _request: Request,
+        exc: Exception,
+    ) -> JSONResponse:
         metrics.inc("api.unhandled_error")
         log_kv(logger, logging.ERROR, "api_unhandled_error", error=repr(exc))
         return JSONResponse(
@@ -95,7 +114,10 @@ def create_app(*, settings: Settings | None = None, chat_agent: ChatAgent | None
     ) -> None:
         current_settings: Settings = request.app.state.settings
         if current_settings.api_key and x_api_key != current_settings.api_key:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or missing API key.")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid or missing API key.",
+            )
 
     @app.get("/")
     async def root(request: Request) -> dict[str, str]:
@@ -114,7 +136,11 @@ def create_app(*, settings: Settings | None = None, chat_agent: ChatAgent | None
     @app.get("/health")
     async def health(request: Request) -> dict[str, object]:
         current_settings: Settings = request.app.state.settings
-        return {"status": "ok", "service": current_settings.app_name, "version": __version__}
+        return {
+            "status": "ok",
+            "service": current_settings.app_name,
+            "version": __version__,
+        }
 
     @app.get("/health/ready")
     async def ready_health(request: Request) -> JSONResponse:
@@ -130,12 +156,17 @@ def create_app(*, settings: Settings | None = None, chat_agent: ChatAgent | None
 
         if current_settings.llm_backend == "ollama":
             try:
-                payload["dependencies"]["ollama"] = await current_agent.ollama.health()
+                payload["dependencies"]["ollama"] = (
+                    await current_agent.ollama.health()
+                )
             except Exception as exc:
                 ready = False
                 payload["dependencies"]["ollama"] = {
                     "status": "unavailable",
-                    "error": _safe_error(exc, expose=current_settings.expose_internal_health_details),
+                    "error": _safe_error(
+                        exc,
+                        expose=current_settings.expose_internal_health_details,
+                    ),
                 }
 
         if current_settings.mcp_enabled:
@@ -151,42 +182,68 @@ def create_app(*, settings: Settings | None = None, chat_agent: ChatAgent | None
                 ready = False
                 payload["dependencies"]["mcp"] = {
                     "status": "unavailable",
-                    "error": _safe_error(exc, expose=current_settings.expose_internal_health_details),
+                    "error": _safe_error(
+                        exc,
+                        expose=current_settings.expose_internal_health_details,
+                    ),
                 }
 
         try:
-            payload["dependencies"]["persistence"] = await current_agent.persistence_health()
+            payload["dependencies"]["persistence"] = (
+                await current_agent.persistence_health()
+            )
         except Exception as exc:
             if current_settings.persistence_enabled:
                 ready = False
             payload["dependencies"]["persistence"] = {
                 "status": "unavailable",
-                "error": _safe_error(exc, expose=current_settings.expose_internal_health_details),
+                "error": _safe_error(
+                    exc,
+                    expose=current_settings.expose_internal_health_details,
+                ),
             }
 
         if not ready:
             payload["status"] = "not_ready"
         return JSONResponse(
-            status_code=status.HTTP_200_OK if ready else status.HTTP_503_SERVICE_UNAVAILABLE,
+            status_code=(
+                status.HTTP_200_OK if ready else status.HTTP_503_SERVICE_UNAVAILABLE
+            ),
             content=payload,
         )
 
     @app.get("/health/live")
     async def live_health(request: Request) -> JSONResponse:
+        # Kept unchanged because liveness/readiness separation is Phase 3 scope.
         return await ready_health(request)
 
     @app.get("/api/inventory", dependencies=[Depends(require_api_key)])
     async def inventory(request: Request) -> dict[str, object]:
         current_agent: ChatAgent = request.app.state.chat_agent
         current_settings: Settings = request.app.state.settings
-        live_inventory = await current_agent.load_inventory()
-        return build_inventory_payload(current_settings, live_inventory, current_agent.selector)
+        current_inventory_service: InventoryService = (
+            request.app.state.inventory_service
+        )
+        live_inventory = await current_inventory_service.load()
+        return build_inventory_payload(
+            current_settings,
+            live_inventory,
+            current_agent.selector,
+        )
 
     @app.get("/api/metrics", dependencies=[Depends(require_api_key)])
     async def application_metrics() -> dict[str, Any]:
-        return {"service": app_settings.app_name, "version": __version__, **metrics.snapshot()}
+        return {
+            "service": app_settings.app_name,
+            "version": __version__,
+            **metrics.snapshot(),
+        }
 
-    @app.post("/api/chat", response_model=ChatResponse, dependencies=[Depends(require_api_key)])
+    @app.post(
+        "/api/chat",
+        response_model=ChatResponse,
+        dependencies=[Depends(require_api_key)],
+    )
     async def chat(request: Request, chat_request: ChatRequest) -> ChatResponse:
         current_agent: ChatAgent = request.app.state.chat_agent
         metrics.inc("api.chat.requests")
@@ -197,7 +254,10 @@ def create_app(*, settings: Settings | None = None, chat_agent: ChatAgent | None
             raise
 
     @app.post("/api/chat/stream", dependencies=[Depends(require_api_key)])
-    async def chat_stream(request: Request, chat_request: ChatRequest) -> StreamingResponse:
+    async def chat_stream(
+        request: Request,
+        chat_request: ChatRequest,
+    ) -> StreamingResponse:
         current_agent: ChatAgent = request.app.state.chat_agent
         metrics.inc("api.chat_stream.requests")
 
@@ -215,7 +275,12 @@ def create_app(*, settings: Settings | None = None, chat_agent: ChatAgent | None
                 metrics.inc("api.chat_stream.error")
                 yield encode_sse(
                     "error",
-                    {"message": _safe_error(exc, expose=app_settings.expose_internal_health_details)},
+                    {
+                        "message": _safe_error(
+                            exc,
+                            expose=app_settings.expose_internal_health_details,
+                        )
+                    },
                 )
 
         return StreamingResponse(
