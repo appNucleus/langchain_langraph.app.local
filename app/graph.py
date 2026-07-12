@@ -9,6 +9,7 @@ from uuid import uuid4
 
 from langgraph.graph import END, START, StateGraph
 
+from app.agents.base import StructuredOutputError
 from app.agents.planner import PlannerAgent
 from app.agents.prompts import PLANNER_PROMPT
 from app.agents.synthesizer import SynthesizerAgent
@@ -23,12 +24,13 @@ from app.observability.events import event
 from app.observability.metrics import metrics
 from app.observability.tracing import span
 from app.schemas.chat import ChatRequest, ChatResponse
+from app.schemas.evidence import EvidenceItem
 from app.schemas.execution import BudgetExceeded, ExecutionBudget
 from app.schemas.planning import ExecutionPlan, PlanTask
 from app.schemas.verification import VerificationIssue, VerificationReport
 from app.schemas.worker import WorkerResult
 from app.services.answer_quality import deterministic_output_issues
-from app.services.context_builder import build_context
+from app.services.context_builder import build_context, context_character_count
 from app.services.evidence import evidence_from_metadata
 from app.services.inventory import InventoryService, RuntimeInventory, normalize_inventory
 from app.services.routing import (
@@ -240,6 +242,55 @@ class ChatAgent:
             return budget, self._budget_termination(state, node=node, exc=exc)
         return budget, None
 
+    def _model_output_termination(
+        self,
+        state: AgentGraphState,
+        *,
+        node: str,
+        exc: StructuredOutputError,
+    ) -> AgentGraphState:
+        reason = (
+            f"{node} could not produce valid structured output after "
+            f"{len(exc.attempted_models)} bounded attempt(s)"
+        )
+        metrics.inc("graph.structured_output_terminated")
+        self._log_node(
+            logging.ERROR,
+            "graph_structured_output_terminated",
+            node=node,
+            state=state,
+            schema=exc.schema_name,
+            primary_model=exc.primary_model,
+            attempted_models=",".join(exc.attempted_models),
+            attempts=len(exc.attempted_models),
+            reason=reason,
+        )
+        return {**state, "termination_reason": reason}
+
+    @staticmethod
+    def _state_evidence(state: AgentGraphState) -> list[EvidenceItem]:
+        output: list[EvidenceItem] = []
+        for raw in state.get("evidence", []):
+            try:
+                output.append(EvidenceItem.model_validate(raw))
+            except Exception:  # noqa: BLE001 - invalid evidence is excluded and logged elsewhere
+                continue
+        return output
+
+    def _worker_context_limit(self) -> int:
+        num_ctx = int(getattr(self.settings, "ollama_num_ctx", 8192))
+        reserve = int(
+            getattr(self.settings, "structured_output_reserve_tokens", 1536)
+        )
+        chars_per_token = float(
+            getattr(self.settings, "structured_prompt_chars_per_token", 3.0)
+        )
+        # Reserve additional space for system instructions, task JSON, history,
+        # the WorkerResult schema, and wrapper syntax.
+        evidence_tokens = max(700, num_ctx - reserve - 2600)
+        derived = int(evidence_tokens * chars_per_token)
+        return max(2000, min(self.settings.phase2_max_context_chars, derived))
+
     @staticmethod
     def _inventory(state: AgentGraphState) -> RuntimeInventory:
         return normalize_inventory(state.get("inventory") or {})
@@ -326,10 +377,14 @@ class ChatAgent:
         return updated
 
     @staticmethod
-    def _serialize_tool_data(value: Any) -> str:
-        if isinstance(value, str):
-            return value
-        return json.dumps(value, ensure_ascii=False, default=str)
+    def _serialize_tool_data(value: Any, *, max_chars: int) -> tuple[str, bool, int]:
+        raw = value if isinstance(value, str) else json.dumps(
+            value, ensure_ascii=False, default=str
+        )
+        original_chars = len(raw)
+        if original_chars <= max_chars:
+            return raw, False, original_chars
+        return raw[:max_chars] + "…[tool result truncated]", True, original_chars
 
     @staticmethod
     def _partial_response(state: AgentGraphState) -> str:
@@ -396,16 +451,22 @@ class ChatAgent:
                 "history_is_context_only": True,
             }
             planner = PlannerAgent(self.settings, planner_model)
-            with span("graph.plan"):
-                plan = await planner.invoke_json(
-                    system=PLANNER_PROMPT,
-                    payload={
-                        "request": state["message"],
-                        "runtime_context": runtime_context,
-                    },
-                    schema=ExecutionPlan,
+            try:
+                with span("graph.plan"):
+                    plan = await planner.invoke_json(
+                        system=PLANNER_PROMPT,
+                        payload={
+                            "request": state["message"],
+                            "runtime_context": runtime_context,
+                        },
+                        schema=ExecutionPlan,
+                    )
+            except StructuredOutputError as exc:
+                return self._model_output_termination(
+                    state, node="plan", exc=exc
                 )
 
+        request_evidence = evidence_from_metadata(state.get("metadata", {}))
         result: AgentGraphState = {
             **state,
             "plan": plan.model_dump(),
@@ -413,7 +474,7 @@ class ChatAgent:
             "task_results": [],
             "worker_result": {},
             "verification": {},
-            "evidence": [],
+            "evidence": [item.model_dump() for item in request_evidence],
             "iterations": 0,
             "research_rounds": 0,
             "replans": 0,
@@ -425,6 +486,7 @@ class ChatAgent:
             "selected_tool": None,
             "selected_tools": {},
             "researched_task_ids": [],
+            "research_queries": {},
         }
         result = self._set_next_action(result)
         self._log_node(
@@ -446,9 +508,34 @@ class ChatAgent:
             return terminated
 
         task = self._current_task(state)
-        evidence = evidence_from_metadata(state.get("metadata", {}))
-        context = build_context(evidence, self.settings.phase2_max_context_chars)
+        evidence = self._state_evidence(state)
+        context_limit = self._worker_context_limit()
+        context = build_context(
+            evidence,
+            context_limit,
+            max_item_chars=min(
+                int(getattr(self.settings, "research_max_evidence_chars_per_query", 6000)),
+                context_limit,
+            ),
+        )
         routing = self._route_current_task(state)
+        log_kv(
+            logger,
+            logging.INFO,
+            "graph_worker_context_prepared",
+            request_id=state.get("request_id"),
+            run_id=(state.get("metadata") or {}).get("run_id"),
+            task_id=task.get("id"),
+            evidence_items=len(context),
+            evidence_chars=context_character_count(context),
+            context_limit_chars=context_limit,
+            truncated_items=sum(
+                1
+                for item in context
+                if bool((item.get("metadata") or {}).get("context_truncated"))
+            ),
+            history_messages=len(state.get("history", [])),
+        )
         payload = {
             "user_request": state["message"],
             "system_instruction": state.get("system_prompt"),
@@ -481,8 +568,13 @@ class ChatAgent:
             if terminated:
                 return terminated
             worker = WorkerAgent(self.settings, worker_model)
-            with span("graph.worker"):
-                result = await worker.execute(payload)
+            try:
+                with span("graph.worker"):
+                    result = await worker.execute(payload)
+            except StructuredOutputError as exc:
+                return self._model_output_termination(
+                    state, node="worker", exc=exc
+                )
 
         updated: AgentGraphState = {
             **state,
@@ -573,22 +665,27 @@ class ChatAgent:
                     state, node="verify:model_call", exc=exc, verification=report
                 )
             verifier = VerifierAgent(self.settings, verifier_model)
-            with span("graph.verify"):
-                report = await verifier.verify(
-                    {
-                        "user_request": state["message"],
-                        "system_instruction": state.get("system_prompt"),
-                        "execution_context": self.router.execution_context(),
-                        "task": self._current_task(state),
-                        "worker_result": state["worker_result"],
-                        "evidence": state.get("evidence", []),
-                        "deterministic_issues": issues,
-                        "verification_rules": [
-                            "Current factual claims require supplied external evidence.",
-                            "Request research when evidence is absent or insufficient.",
-                            "A pass verdict requires task_complete=true.",
-                        ],
-                    }
+            try:
+                with span("graph.verify"):
+                    report = await verifier.verify(
+                        {
+                            "user_request": state["message"],
+                            "system_instruction": state.get("system_prompt"),
+                            "execution_context": self.router.execution_context(),
+                            "task": self._current_task(state),
+                            "worker_result": state["worker_result"],
+                            "evidence": state.get("evidence", []),
+                            "deterministic_issues": issues,
+                            "verification_rules": [
+                                "Current factual claims require supplied external evidence.",
+                                "Request research when evidence is absent or insufficient.",
+                                "A pass verdict requires task_complete=true.",
+                            ],
+                        }
+                    )
+            except StructuredOutputError as exc:
+                return self._model_output_termination(
+                    state, node="verify", exc=exc
                 )
 
         updated: AgentGraphState = {
@@ -639,11 +736,17 @@ class ChatAgent:
             "verification": state["verification"],
             "evidence": state.get("evidence", []),
         }
-        result = (
-            await WorkerAgent(self.settings, revision_model).revise(payload)
-            if self.settings.llm_backend == "ollama"
-            else WorkerResult.model_validate(state["worker_result"])
-        )
+        if self.settings.llm_backend == "ollama":
+            try:
+                result = await WorkerAgent(
+                    self.settings, revision_model
+                ).revise(payload)
+            except StructuredOutputError as exc:
+                return self._model_output_termination(
+                    state, node="revise", exc=exc
+                )
+        else:
+            result = WorkerResult.model_validate(state["worker_result"])
         updated: AgentGraphState = {
             **state,
             "worker_result": result.model_dump(),
@@ -698,112 +801,197 @@ class ChatAgent:
         metadata = dict(state.get("metadata", {}))
         verification = state.get("verification") or {}
         required_actions = verification.get("required_actions") or []
-        candidates = self.router.select_tools(
+        task = self._current_task(state)
+        task_id = str(task.get("id") or f"task-{state.get('task_index', 0)}")
+        queries = self.router.build_research_queries(
             user_request=state["message"],
-            task=self._current_task(state),
+            task=task,
             required_actions=required_actions,
-            inventory=self._inventory(state),
-            metadata=metadata,
-            limit=3,
+            limit=self.settings.research_max_queries_per_task,
         )
+        research_queries = dict(state.get("research_queries") or {})
+        research_queries[task_id] = queries
+        fingerprints = [self.router.query_fingerprint(query) for query in queries]
         log_kv(
             logger,
             logging.INFO,
-            "graph_tool_candidates",
+            "graph_research_queries",
             request_id=state.get("request_id"),
             run_id=metadata.get("run_id"),
-            task_id=self._current_task(state).get("id"),
-            candidates=",".join(item.name for item in candidates),
-            candidate_count=len(candidates),
-            available_tool_count=len(self._inventory(state).tool_names),
+            task_id=task_id,
+            round=rounds,
+            query_count=len(queries),
+            query_fingerprints=",".join(fingerprints),
+            query_lengths=",".join(str(len(query)) for query in queries),
         )
-        if not candidates:
-            updated: AgentGraphState = {
-                **state,
-                "research_rounds": rounds,
-                "termination_reason": (
-                    "external evidence is required, but no compatible read-only MCP "
-                    "research tool is available"
-                ),
-            }
-            self._log_node(
-                logging.WARNING,
-                "graph_research_no_tool",
-                node="research",
-                state=updated,
-            )
-            return updated
 
         failures: list[dict[str, str]] = []
-        successful_tool: str | None = None
-        successful_data: Any = None
-        for candidate in candidates:
+        successful_tools: list[str] = []
+        evidence = self._state_evidence(state)
+        retrieved_at = self.router.execution_context()["execution_time_utc"]
+
+        for query_index, query in enumerate(queries, start=1):
+            query_fingerprint = self.router.query_fingerprint(query)
+            candidates = self.router.select_tools(
+                user_request=state["message"],
+                task=task,
+                required_actions=required_actions,
+                inventory=self._inventory(state),
+                metadata=metadata,
+                limit=3,
+                query=query,
+            )
             log_kv(
                 logger,
                 logging.INFO,
-                "graph_tool_selected",
+                "graph_tool_candidates",
                 request_id=state.get("request_id"),
                 run_id=metadata.get("run_id"),
-                task_id=self._current_task(state).get("id"),
-                tool=candidate.name,
-                score=candidate.score,
-                reason=candidate.reason,
-                argument_keys=",".join(sorted(candidate.arguments)),
+                task_id=task_id,
+                query_index=query_index,
+                query_fingerprint=query_fingerprint,
+                candidates=",".join(item.name for item in candidates),
+                candidate_count=len(candidates),
+                available_tool_count=len(self._inventory(state).tool_names),
             )
-            try:
-                result = await self.tool_executor.execute(
-                    candidate.name,
-                    candidate.arguments,
-                    budget=self._budget(state),
-                    metadata=metadata,
-                )
-            except ToolApprovalRequired as exc:
-                failures.append({"tool": candidate.name, "error": str(exc)})
-                log_kv(
-                    logger,
-                    logging.WARNING,
-                    "graph_tool_rejected",
-                    tool=candidate.name,
-                    reason="approval_required",
+            if not candidates:
+                failures.append(
+                    {
+                        "query_fingerprint": query_fingerprint,
+                        "tool": "",
+                        "error": "no compatible read-only tool",
+                    }
                 )
                 continue
-            except BudgetExceeded as exc:
-                return self._budget_termination(
-                    state, node="research:tool_call", exc=exc
-                )
 
-            if result.ok:
-                successful_tool = candidate.name
-                successful_data = result.data
+            query_succeeded = False
+            for candidate in candidates:
+                log_kv(
+                    logger,
+                    logging.INFO,
+                    "graph_tool_selected",
+                    request_id=state.get("request_id"),
+                    run_id=metadata.get("run_id"),
+                    task_id=task_id,
+                    query_index=query_index,
+                    query_fingerprint=query_fingerprint,
+                    tool=candidate.name,
+                    score=candidate.score,
+                    reason=candidate.reason,
+                    argument_keys=",".join(sorted(candidate.arguments)),
+                )
+                try:
+                    result = await self.tool_executor.execute(
+                        candidate.name,
+                        candidate.arguments,
+                        budget=self._budget(state),
+                        metadata=metadata,
+                    )
+                except ToolApprovalRequired as exc:
+                    failures.append(
+                        {
+                            "query_fingerprint": query_fingerprint,
+                            "tool": candidate.name,
+                            "error": str(exc),
+                        }
+                    )
+                    log_kv(
+                        logger,
+                        logging.WARNING,
+                        "graph_tool_rejected",
+                        tool=candidate.name,
+                        query_fingerprint=query_fingerprint,
+                        reason="approval_required",
+                    )
+                    continue
+                except BudgetExceeded as exc:
+                    terminated = self._budget_termination(
+                        state, node="research:tool_call", exc=exc
+                    )
+                    terminated["research_queries"] = research_queries
+                    terminated["evidence"] = [item.model_dump() for item in evidence]
+                    return terminated
+
+                if not result.ok:
+                    failures.append(
+                        {
+                            "query_fingerprint": query_fingerprint,
+                            "tool": candidate.name,
+                            "error": str(result.error or "tool failed"),
+                        }
+                    )
+                    log_kv(
+                        logger,
+                        logging.WARNING,
+                        "graph_research_result",
+                        tool=candidate.name,
+                        round=rounds,
+                        query_index=query_index,
+                        query_fingerprint=query_fingerprint,
+                        ok=False,
+                        error=result.error,
+                    )
+                    continue
+
+                content, truncated, original_chars = self._serialize_tool_data(
+                    result.data,
+                    max_chars=self.settings.research_max_evidence_chars_per_query,
+                )
+                evidence_id = f"research-{task_id}-{rounds}-{query_index}"
+                evidence.append(
+                    EvidenceItem(
+                        id=evidence_id,
+                        source=candidate.name,
+                        content=content,
+                        metadata={
+                            "task_id": task_id,
+                            "retrieved_at": retrieved_at,
+                            "query_fingerprint": query_fingerprint,
+                            "query_index": query_index,
+                            "original_content_chars": original_chars,
+                            "storage_truncated": truncated,
+                        },
+                    )
+                )
+                successful_tools.append(candidate.name)
+                query_succeeded = True
                 log_kv(
                     logger,
                     logging.INFO,
                     "graph_research_result",
                     tool=candidate.name,
                     round=rounds,
+                    query_index=query_index,
+                    query_fingerprint=query_fingerprint,
+                    evidence_id=evidence_id,
                     ok=True,
+                    evidence_chars=len(content),
+                    original_content_chars=original_chars,
+                    truncated=truncated,
                 )
                 break
 
-            failures.append({"tool": candidate.name, "error": str(result.error or "tool failed")})
-            log_kv(
-                logger,
-                logging.WARNING,
-                "graph_research_result",
-                tool=candidate.name,
-                round=rounds,
-                ok=False,
-                error=result.error,
-            )
+            if not query_succeeded:
+                log_kv(
+                    logger,
+                    logging.WARNING,
+                    "graph_research_query_failed",
+                    task_id=task_id,
+                    round=rounds,
+                    query_index=query_index,
+                    query_fingerprint=query_fingerprint,
+                )
 
         metadata.setdefault("research_failures", []).extend(failures)
-        if successful_tool is None:
-            updated = {
+        if not successful_tools:
+            updated: AgentGraphState = {
                 **state,
                 "metadata": metadata,
                 "research_rounds": rounds,
+                "research_queries": research_queries,
+                "evidence": [item.model_dump() for item in evidence],
                 "termination_reason": (
-                    "all compatible read-only MCP research tools failed; "
+                    "all compatible read-only MCP research attempts failed; "
                     "no current evidence was retrieved"
                 ),
             }
@@ -812,31 +1000,28 @@ class ChatAgent:
                 "graph_research_failed",
                 node="research",
                 state=updated,
-                attempted_tools=len(candidates),
+                attempted_queries=len(queries),
+                attempted_failures=len(failures),
             )
             return updated
 
-        task_id = str(self._current_task(state).get("id") or f"task-{state.get('task_index', 0)}")
-        evidence = metadata.setdefault("evidence", [])
-        evidence.append(
-            {
-                "id": f"research-{task_id}-{rounds}",
-                "source": successful_tool,
-                "content": self._serialize_tool_data(successful_data),
-                "task_id": task_id,
-                "retrieved_at": self.router.execution_context()["execution_time_utc"],
-            }
+        researched = list(
+            dict.fromkeys([*(state.get("researched_task_ids") or []), task_id])
         )
-        researched = list(dict.fromkeys([*(state.get("researched_task_ids") or []), task_id]))
+        unique_tools = list(dict.fromkeys(successful_tools))
         selected_tools = dict(state.get("selected_tools") or {})
-        selected_tools[task_id] = successful_tool
+        selected_tools[task_id] = (
+            unique_tools[0] if len(unique_tools) == 1 else unique_tools
+        )
         updated = {
             **state,
             "metadata": metadata,
             "research_rounds": rounds,
+            "research_queries": research_queries,
             "researched_task_ids": researched,
-            "selected_tool": successful_tool,
+            "selected_tool": unique_tools[0],
             "selected_tools": selected_tools,
+            "evidence": [item.model_dump() for item in evidence],
             "next_action": "worker",
         }
         self._log_node(
@@ -844,8 +1029,11 @@ class ChatAgent:
             "graph_node_complete",
             node="research",
             state=updated,
-            tool=successful_tool,
+            tools=",".join(unique_tools),
+            successful_queries=len(successful_tools),
+            requested_queries=len(queries),
             evidence_items=len(evidence),
+            evidence_chars=sum(len(item.content) for item in evidence),
         )
         return updated
 
@@ -887,23 +1075,29 @@ class ChatAgent:
 
         if self.settings.llm_backend == "ollama":
             planner = PlannerAgent(self.settings, planner_model)
-            plan = await planner.invoke_json(
-                system=PLANNER_PROMPT,
-                payload={
-                    "request": state["message"],
-                    "runtime_context": {
-                        **self.router.execution_context(),
-                        "available_mcp_tools": self._inventory(state).tool_names,
-                        "prior_plan": state.get("plan"),
-                        "failed_task": self._current_task(state),
-                        "verification": state.get("verification"),
+            try:
+                plan = await planner.invoke_json(
+                    system=PLANNER_PROMPT,
+                    payload={
+                        "request": state["message"],
+                        "runtime_context": {
+                            **self.router.execution_context(),
+                            "available_mcp_tools": self._inventory(state).tool_names,
+                            "prior_plan": state.get("plan"),
+                            "failed_task": self._current_task(state),
+                            "verification": state.get("verification"),
+                        },
                     },
-                },
-                schema=ExecutionPlan,
-            )
+                    schema=ExecutionPlan,
+                )
+            except StructuredOutputError as exc:
+                return self._model_output_termination(
+                    state, node="replan", exc=exc
+                )
         else:
             plan = ExecutionPlan.model_validate(state["plan"])
 
+        request_evidence = evidence_from_metadata(state.get("metadata", {}))
         updated = {
             **state,
             "plan": plan.model_dump(),
@@ -911,9 +1105,11 @@ class ChatAgent:
             "task_results": [],
             "worker_result": {},
             "verification": {},
+            "evidence": [item.model_dump() for item in request_evidence],
             "research_rounds": 0,
             "replans": replans,
             "researched_task_ids": [],
+            "research_queries": {},
             "selected_models": self._with_selected_model(
                 state, node="replan", model=planner_model
             ),
@@ -930,6 +1126,7 @@ class ChatAgent:
 
     async def _advance(self, state: AgentGraphState) -> AgentGraphState:
         results = list(state.get("task_results", []))
+        request_evidence = evidence_from_metadata(state.get("metadata", {}))
         results.append(
             {
                 "task": self._current_task(state),
@@ -945,7 +1142,7 @@ class ChatAgent:
             "task_index": state.get("task_index", 0) + 1,
             "verification": {},
             "worker_result": {},
-            "evidence": [],
+            "evidence": [item.model_dump() for item in request_evidence],
             "research_rounds": 0,
             "selected_tool": None,
             "next_action": "worker",
@@ -1052,6 +1249,10 @@ class ChatAgent:
         )
         history = await self.memory.get(thread_id)
         runtime_inventory = await self.inventory_service.load()
+        system_decision = self.router.prepare_system_prompt(
+            message=request.message,
+            provided=request.system_prompt,
+        )
         metrics.inc("chat.requests")
         config = {"configurable": {"thread_id": thread_id}}
         log_kv(
@@ -1081,13 +1282,27 @@ class ChatAgent:
             inventory_errors=",".join(sorted(runtime_inventory.errors)),
         )
 
+        log_kv(
+            logger,
+            logging.INFO,
+            "graph_system_prompt_prepared",
+            thread_id=thread_id,
+            request_id=request_id,
+            source=system_decision.source,
+            domain=system_decision.domain,
+            prompt_chars=len(system_decision.prompt),
+            requires_external_evidence=system_decision.requires_external_evidence,
+        )
+
         # LangGraph merges a new invocation into the prior checkpoint for the same
         # thread. Explicitly reset every per-run channel so conversation history
         # is retained while an old plan/result/termination reason cannot leak into
         # the new request.
         initial_state: AgentGraphState = build_fresh_run_state(
             message=request.message,
-            system_prompt=request.system_prompt or self.settings.default_system_prompt,
+            system_prompt=system_decision.prompt,
+            system_prompt_source=system_decision.source,
+            request_domain=system_decision.domain,
             metadata=request.metadata,
             history=history,
             execution_budget=budget,
@@ -1126,6 +1341,41 @@ class ChatAgent:
                 "selected_models": {},
                 "selected_tool": None,
                 "selected_tools": {},
+                "research_queries": {},
+            }
+        except StructuredOutputError as exc:
+            metrics.inc("graph.unhandled_structured_output_error")
+            reason = (
+                f"structured output failed for {exc.schema_name} after "
+                f"{len(exc.attempted_models)} bounded attempt(s)"
+            )
+            log_kv(
+                logger,
+                logging.ERROR,
+                "graph_unhandled_structured_output_error",
+                thread_id=thread_id,
+                request_id=request_id,
+                run_id=request.metadata.get("run_id"),
+                schema=exc.schema_name,
+                primary_model=exc.primary_model,
+                attempted_models=",".join(exc.attempted_models),
+                reason=reason,
+            )
+            result = {
+                "response": (
+                    "Execution stopped safely before a verified answer could be "
+                    f"produced: {reason}."
+                ),
+                "backend": self.settings.llm_backend,
+                "model": None,
+                "termination_reason": reason,
+                "plan": None,
+                "task_results": [],
+                "iterations": 0,
+                "selected_models": {},
+                "selected_tool": None,
+                "selected_tools": {},
+                "research_queries": {},
             }
 
         await self.memory.append(
@@ -1168,6 +1418,12 @@ class ChatAgent:
                 "selected_models": result.get("selected_models"),
                 "selected_tool": result.get("selected_tool"),
                 "selected_tools": result.get("selected_tools"),
+                "research_queries": result.get("research_queries"),
+                "system_prompt": {
+                    "source": system_decision.source,
+                    "domain": system_decision.domain,
+                    "generated": system_decision.source == "derived",
+                },
                 "inventory": {
                     "models": runtime_inventory.model_names,
                     "tools": runtime_inventory.tool_names,

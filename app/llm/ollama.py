@@ -288,6 +288,11 @@ class OllamaClient:
                     "ollama_chat_request",
                     model=model,
                     messages=len(messages),
+                    message_chars=sum(len(str(item.get("content") or "")) for item in messages),
+                    num_ctx=payload.get("options", {}).get("num_ctx"),
+                    num_predict=payload.get("options", {}).get("num_predict"),
+                    structured=bool(response_format is not None),
+                    think=payload.get("think"),
                 )
                 response = await client.post("/api/chat", json=payload)
                 response.raise_for_status()
@@ -392,7 +397,11 @@ class OllamaClient:
             try:
                 response = await client.post(
                     "/api/embed",
-                    json={"model": model, "input": text, "keep_alive": self.settings.ollama_keep_alive},
+                    json={
+                        "model": model,
+                        "input": text,
+                        "keep_alive": self.settings.ollama_keep_alive,
+                    },
                 )
                 response.raise_for_status()
                 data = response.json()
@@ -441,6 +450,7 @@ class OllamaClient:
                 if num_predict is None
                 else num_predict
             ),
+            "num_ctx": int(getattr(self.settings, "ollama_num_ctx", 8192)),
         }
         if options:
             merged_options.update(dict(options))
