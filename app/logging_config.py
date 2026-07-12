@@ -8,6 +8,7 @@ _APP_LOGGERS = [
     "app",
     "app.factory",
     "app.graph",
+    "app.agents.base",
     "app.mcp.client",
     "app.mcp.transport",
     "app.mcp.session",
@@ -49,7 +50,9 @@ def configure_logging(level: str = "INFO") -> None:
 def log_kv(logger: logging.Logger, level: int, event: str, **fields: Any) -> None:
     """Log compact key=value style events that are easy to grep in docker logs."""
 
-    clean_fields = {key: _safe_value(value) for key, value in fields.items() if value is not None}
+    clean_fields = {
+        key: _safe_value(value) for key, value in fields.items() if value is not None
+    }
     suffix = " ".join(f"{key}={value}" for key, value in clean_fields.items())
     logger.log(level, "%s%s", event, f" {suffix}" if suffix else "")
 
