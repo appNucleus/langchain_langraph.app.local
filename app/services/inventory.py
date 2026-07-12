@@ -8,6 +8,7 @@ from typing import Any
 
 from app.llm.model_registry import capabilities_for
 from app.logging_config import log_kv
+from app.observability.metrics import metrics
 from app.settings import Settings
 
 logger = logging.getLogger(__name__)
@@ -44,113 +45,174 @@ class RuntimeInventory:
 
     def as_dict(self) -> dict[str, Any]:
         return {
-            "models": self.models,
+            "models": _copy_dicts(self.models),
             "model_names": self.model_names,
-            "tools": self.tools,
+            "tools": _copy_dicts(self.tools),
             "tool_names": self.tool_names,
-            "errors": self.errors,
+            "errors": dict(self.errors),
             "cached": self.cached,
             "age_seconds": round(self.age_seconds, 3),
         }
 
 
+@dataclass
+class _SourceCache:
+    value: list[dict[str, Any]] | None = None
+    cached_at: float = 0.0
+
+
 class InventoryService:
-    """Concurrent, short-lived cache for Ollama and MCP capability discovery."""
+    """Single-flight cache for live Ollama models and MCP tool definitions.
+
+    Model and tool sources have independent stale caches. If MCP is temporarily
+    unavailable while Ollama refresh succeeds, callers receive the new model list
+    plus stale tools and an explicit MCP error rather than losing both sources.
+    """
 
     def __init__(self, settings: Settings, ollama_client: Any, mcp_client: Any) -> None:
         self.settings = settings
         self.ollama = ollama_client
         self.mcp = mcp_client
-        self._cache: RuntimeInventory | None = None
-        self._cached_at = 0.0
+        self._models = _SourceCache()
+        self._tools = _SourceCache()
         self._lock = asyncio.Lock()
 
     async def load(self, *, force_refresh: bool = False) -> RuntimeInventory:
         now = monotonic()
-        if self._is_fresh(now, force_refresh):
-            return self._with_cache_metadata(self._cache, cached=True)  # type: ignore[arg-type]
+        if not force_refresh and self._both_fresh(now):
+            metrics.inc("inventory.cache_hit")
+            return self._snapshot(cached=True, now=now)
 
         async with self._lock:
             now = monotonic()
-            if self._is_fresh(now, force_refresh):
-                return self._with_cache_metadata(self._cache, cached=True)  # type: ignore[arg-type]
+            if not force_refresh and self._both_fresh(now):
+                metrics.inc("inventory.cache_hit")
+                return self._snapshot(cached=True, now=now)
 
-            models_result, tools_result = await asyncio.gather(
-                self._load_models(),
-                self._load_tools(),
-            )
-            models, model_error = models_result
-            tools, tool_error = tools_result
+            started = monotonic()
+            model_task = self._load_models(force_refresh=force_refresh)
+            tool_task = self._load_tools(force_refresh=force_refresh)
+            models_result, tools_result = await asyncio.gather(model_task, tool_task)
+            models, model_error, models_stale = models_result
+            tools, tool_error, tools_stale = tools_result
             errors = {
                 key: value
-                for key, value in (("ollama", model_error), ("mcp", tool_error))
+                for key, value in (
+                    ("ollama", model_error),
+                    ("mcp", tool_error),
+                )
                 if value
             }
+            metrics.observe("inventory.refresh_seconds", monotonic() - started)
+            metrics.inc("inventory.refresh")
+            if errors:
+                metrics.inc("inventory.refresh_with_errors")
 
-            if (
-                errors
-                and self._cache is not None
-                and now - self._cached_at <= self.settings.inventory_stale_if_error_seconds
-            ):
-                stale = RuntimeInventory(
-                    models=self._cache.models,
-                    tools=self._cache.tools,
-                    errors=errors,
-                    cached=True,
-                    age_seconds=now - self._cached_at,
-                )
-                log_kv(logger, logging.WARNING, "inventory_stale_cache_used", errors=errors)
-                return stale
-
-            fresh = RuntimeInventory(models=models, tools=tools, errors=errors)
-            self._cache = fresh
-            self._cached_at = now
-            return fresh
+            return RuntimeInventory(
+                models=models,
+                tools=tools,
+                errors=errors,
+                cached=models_stale or tools_stale,
+                age_seconds=max(
+                    self._source_age(self._models, monotonic()),
+                    self._source_age(self._tools, monotonic()),
+                ),
+            )
 
     def invalidate(self) -> None:
-        self._cache = None
-        self._cached_at = 0.0
+        self._models = _SourceCache()
+        self._tools = _SourceCache()
+        invalidate_models = getattr(self.ollama, "invalidate_model_cache", None)
+        if callable(invalidate_models):
+            invalidate_models()
+        invalidate_tools = getattr(self.mcp, "invalidate_tools_cache", None)
+        if callable(invalidate_tools):
+            invalidate_tools()
 
-    def _is_fresh(self, now: float, force_refresh: bool) -> bool:
-        return (
-            not force_refresh
-            and self._cache is not None
-            and now - self._cached_at <= self.settings.inventory_cache_ttl_seconds
+    def _both_fresh(self, now: float) -> bool:
+        return self._source_fresh(self._models, now) and self._source_fresh(
+            self._tools, now
         )
 
-    async def _load_models(self) -> tuple[list[dict[str, Any]], str | None]:
+    def _source_fresh(self, source: _SourceCache, now: float) -> bool:
+        return bool(
+            source.value is not None
+            and now - source.cached_at <= self.settings.inventory_cache_ttl_seconds
+        )
+
+    def _source_stale_usable(self, source: _SourceCache, now: float) -> bool:
+        return bool(
+            source.value is not None
+            and now - source.cached_at
+            <= self.settings.inventory_stale_if_error_seconds
+        )
+
+    async def _load_models(
+        self,
+        *,
+        force_refresh: bool,
+    ) -> tuple[list[dict[str, Any]], str | None, bool]:
         if self.settings.llm_backend != "ollama":
-            return [], None
+            self._models = _SourceCache(value=[], cached_at=monotonic())
+            return [], None, False
         try:
-            return await self.ollama.list_models(), None
-        except Exception as exc:  # noqa: BLE001
+            values = await self.ollama.list_models(
+                force_refresh=force_refresh,
+                allow_stale=False,
+            )
+            models = [dict(item) for item in values if isinstance(item, dict)]
+            self._models = _SourceCache(value=models, cached_at=monotonic())
+            return _copy_dicts(models), None, False
+        except Exception as exc:  # dependency error is represented in inventory
             error = _format_exception(exc)
             log_kv(logger, logging.WARNING, "inventory_ollama_error", error=error)
-            return [], error
+            now = monotonic()
+            if self._source_stale_usable(self._models, now):
+                metrics.inc("inventory.ollama_stale_used")
+                return _copy_dicts(self._models.value or []), error, True
+            return [], error, False
 
-    async def _load_tools(self) -> tuple[list[dict[str, Any]], str | None]:
+    async def _load_tools(
+        self,
+        *,
+        force_refresh: bool,
+    ) -> tuple[list[dict[str, Any]], str | None, bool]:
         if not self.settings.mcp_enabled:
-            return [], None
+            self._tools = _SourceCache(value=[], cached_at=monotonic())
+            return [], None, False
         try:
-            return await self.mcp.list_tools(), None
-        except Exception as exc:  # noqa: BLE001
+            values = await self.mcp.list_tools(
+                force_refresh=force_refresh,
+                allow_stale=False,
+            )
+            tools = [dict(item) for item in values if isinstance(item, dict)]
+            self._tools = _SourceCache(value=tools, cached_at=monotonic())
+            return _copy_dicts(tools), None, False
+        except Exception as exc:  # dependency error is represented in inventory
             error = _format_exception(exc)
             log_kv(logger, logging.WARNING, "inventory_mcp_error", error=error)
-            return [], error
+            now = monotonic()
+            if self._source_stale_usable(self._tools, now):
+                metrics.inc("inventory.mcp_stale_used")
+                return _copy_dicts(self._tools.value or []), error, True
+            return [], error, False
 
-    def _with_cache_metadata(
-        self,
-        inventory: RuntimeInventory,
-        *,
-        cached: bool,
-    ) -> RuntimeInventory:
+    def _snapshot(self, *, cached: bool, now: float) -> RuntimeInventory:
         return RuntimeInventory(
-            models=inventory.models,
-            tools=inventory.tools,
-            errors=inventory.errors,
+            models=_copy_dicts(self._models.value or []),
+            tools=_copy_dicts(self._tools.value or []),
             cached=cached,
-            age_seconds=max(0.0, monotonic() - self._cached_at),
+            age_seconds=max(
+                self._source_age(self._models, now),
+                self._source_age(self._tools, now),
+            ),
         )
+
+    @staticmethod
+    def _source_age(source: _SourceCache, now: float) -> float:
+        if source.value is None or source.cached_at <= 0:
+            return 0.0
+        return max(0.0, now - source.cached_at)
 
 
 class ModelSelector:
@@ -159,21 +221,25 @@ class ModelSelector:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
 
-    def resolve(self, key: str | None, inventory: RuntimeInventory | None = None) -> str:
+    def resolve(
+        self,
+        key: str | None,
+        inventory: RuntimeInventory | None = None,
+    ) -> str:
         role = key or "general"
         configured = self.settings.model_for_key(role)
         available = inventory.model_names if inventory else []
         if not available:
             return configured
-
         for candidate in self._preferred_candidates(role):
             if candidate in available and self._compatible(role, candidate):
                 return candidate
-
         fallback = self.settings.model_fallback
         if fallback in available and self._compatible(role, fallback):
             return fallback
-        raise RuntimeError(f"No compatible installed Ollama model is available for role {role!r}.")
+        raise RuntimeError(
+            f"No compatible installed Ollama model is available for role {role!r}."
+        )
 
     def configured_roles(
         self,
@@ -291,7 +357,10 @@ class ModelSelector:
                 self.settings.model_fallback,
             ],
             "vision": [self.settings.model_vision],
-            "fallback": [self.settings.model_fallback, self.settings.model_general],
+            "fallback": [
+                self.settings.model_fallback,
+                self.settings.model_general,
+            ],
         }
         merged: list[str] = []
         for candidate in preferences.get(
@@ -305,6 +374,7 @@ class ModelSelector:
 
 def normalize_inventory(value: RuntimeInventory | dict[str, Any]) -> RuntimeInventory:
     """Normalize legacy graph inventory dictionaries for a safe transition."""
+
     if isinstance(value, RuntimeInventory):
         return value
     return RuntimeInventory(
@@ -322,7 +392,9 @@ def build_inventory_payload(
     selector: ModelSelector | Any,
 ) -> dict[str, Any]:
     runtime = normalize_inventory(inventory)
-    effective_selector = selector if hasattr(selector, "configured_roles") else ModelSelector(settings)
+    effective_selector = (
+        selector if hasattr(selector, "configured_roles") else ModelSelector(settings)
+    )
     return {
         "service": {
             "name": settings.app_name,
@@ -348,6 +420,10 @@ def build_inventory_payload(
         },
         "errors": runtime.errors,
     }
+
+
+def _copy_dicts(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [dict(item) for item in items]
 
 
 def _format_exception(exc: BaseException) -> str:
