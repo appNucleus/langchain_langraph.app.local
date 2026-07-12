@@ -23,6 +23,10 @@ class MCPSessionError(MCPError):
     pass
 
 
+class MCPSessionExpiredError(MCPSessionError):
+    """The server expired a session and the original call was not safely replayed."""
+
+
 class MCPToolError(MCPError):
     pass
 

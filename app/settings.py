@@ -78,6 +78,7 @@ class Settings(BaseSettings):
     mcp_protocol_version: str = "2025-06-18"
     mcp_client_name: str = "langchain-langraph-app"
 
+    # Shared capability inventory cache
     inventory_cache_ttl_seconds: int = Field(default=60, ge=1, le=3600)
     inventory_stale_if_error_seconds: int = Field(default=300, ge=0, le=86400)
 
@@ -92,7 +93,6 @@ class Settings(BaseSettings):
     execution_max_model_calls: int = Field(default=8, ge=1, le=50)
     execution_max_tool_calls: int = Field(default=10, ge=0, le=100)
     execution_max_verifier_rounds: int = Field(default=3, ge=1, le=10)
-
     state_ttl_seconds: int = Field(default=3600, ge=60, le=2_592_000)
     state_max_sessions: int = Field(default=1000, ge=10, le=100000)
     state_max_history_messages: int = Field(default=30, ge=2, le=500)
@@ -101,33 +101,24 @@ class Settings(BaseSettings):
     detailed_tracing_enabled: bool = True
     expose_internal_health_details: bool = False
 
-    # Phase 4: backends are independent so deployments can use PostgreSQL
-    # checkpoints with Redis history/cache or PostgreSQL for both.
+    # Phase 4 persistence backends. These remain independent so deployments can
+    # use PostgreSQL checkpoints with Redis history, or PostgreSQL for both.
     state_backend: Literal["memory", "redis", "postgres"] = "memory"
     checkpoint_backend: Literal["memory", "postgres"] = "memory"
     artifact_backend: Literal["disabled", "minio"] = "disabled"
-
     database_url: str = ""
     postgres_pool_min_size: int = Field(default=1, ge=1, le=20)
     postgres_pool_max_size: int = Field(default=10, ge=1, le=100)
     postgres_command_timeout_seconds: float = Field(default=30, gt=0, le=300)
     postgres_auto_setup: bool = True
-
     redis_url: str = ""
     redis_key_prefix: str = "langgraph"
-
     minio_endpoint: str = "dbs.home.arpa:9000"
     minio_access_key: str = ""
     minio_secret_key: str = ""
     minio_bucket: str = "langchain-langraph-app"
     minio_secure: bool = False
-
     persistence_required: bool = False
-
-    default_system_prompt: str = (
-        "You are a precise, evidence-grounded assistant. "
-        "Be honest about uncertainty and missing tools."
-    )
 
     @property
     def cors_origins(self) -> list[str]:
@@ -139,11 +130,13 @@ class Settings(BaseSettings):
     @property
     def ollama_max_concurrent_requests(self) -> int:
         """Backward-compatible Phase 1 name used by older resource managers."""
+
         return self.ollama_max_concurrency
 
     @property
     def ollama_max_concurrent_heavy_requests(self) -> int:
         """Backward-compatible Phase 1 name used by older resource managers."""
+
         return self.ollama_heavy_max_concurrency
 
     def model_for_key(self, key: str | None) -> str:
@@ -151,6 +144,8 @@ class Settings(BaseSettings):
         return self.model_role_catalog().get(role, self.model_general)
 
     def model_role_catalog(self) -> dict[str, str]:
+        """Return each role exactly once, avoiding silent duplicate-key overrides."""
+
         return {
             "planner": self.model_planner,
             "simple": self.model_simple,
@@ -165,7 +160,6 @@ class Settings(BaseSettings):
             "vision": self.model_vision,
             "fallback": self.model_fallback,
             "embedding": self.embedding_model,
-            "fallback": self.model_fallback,
         }
 
     @property

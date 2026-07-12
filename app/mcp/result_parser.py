@@ -14,6 +14,12 @@ class ParsedToolResult:
 
 
 def parse_tool_result(result: Any) -> ParsedToolResult:
+    """Normalize an MCP tools/call result.
+
+    ``structuredContent`` has precedence over textual content. ``isError=true``
+    always produces ``ok=False`` even when useful structured error data exists.
+    """
+
     if not isinstance(result, dict):
         return ParsedToolResult(ok=True, data=result, raw=None)
 
@@ -58,5 +64,7 @@ def _extract_error(data: Any) -> str:
             if value:
                 return str(value)
     if isinstance(data, list):
-        return "; ".join(str(item) for item in data if item) or "MCP tool returned isError=true."
+        return "; ".join(str(item) for item in data if item) or (
+            "MCP tool returned isError=true."
+        )
     return str(data) if data else "MCP tool returned isError=true."
