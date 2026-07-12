@@ -188,3 +188,43 @@ async def test_two_failed_attempts_raise_diagnostic_error() -> None:
     assert "thinking_chars=100" in message
     assert "qwen3.5:4b" in message
     assert len(client.calls) == 2
+
+@pytest.mark.asyncio
+async def test_structured_attempt_logs_explain_fallback(caplog: pytest.LogCaptureFixture) -> None:
+    client = FakeOllamaClient(
+        [
+            _response(
+                "",
+                model="deepseek-r1:8b",
+                done_reason="length",
+                eval_count=2048,
+                message={"content": "", "thinking": "x" * 50},
+            ),
+            _response(
+                '{"verdict":"pass","task_complete":true,"issues":[],"required_actions":[],"confidence":0.9}',
+                model="qwen3.5:4b",
+                done_reason="stop",
+                eval_count=60,
+            ),
+        ]
+    )
+    agent = StructuredAgent(
+        _settings(),
+        model="deepseek-r1:8b",
+        ollama_client=client,  # type: ignore[arg-type]
+    )
+
+    with caplog.at_level("INFO", logger="app.agents.base"):
+        result = await agent.invoke_json(
+            system="Verify the result.",
+            payload={},
+            schema=VerificationLikeResult,
+        )
+
+    assert result.verdict == "pass"
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("structured_output_attempt" in message for message in messages)
+    assert any("structured_output_empty" in message for message in messages)
+    assert any("structured_output_fallback" in message for message in messages)
+    assert any("structured_output_valid" in message for message in messages)
+    assert any("eval_count=2048" in message for message in messages)
