@@ -68,3 +68,24 @@ def test_inventory_endpoint_uses_shared_inventory_service_cache() -> None:
     assert second.json()["cache"]["cached"] is True
     assert agent.ollama.calls == 1
     assert agent.mcp.calls == 1
+
+
+def test_readiness_uses_cached_inventory_and_liveness_is_process_only() -> None:
+    settings = Settings(
+        llm_backend="ollama",
+        mcp_enabled=True,
+        inventory_cache_ttl_seconds=60,
+    )
+    agent = FakeAgent(settings)
+    app = create_app(settings=settings, chat_agent=agent)  # type: ignore[arg-type]
+
+    with TestClient(app) as client:
+        ready_one = client.get("/health/ready")
+        ready_two = client.get("/health/ready")
+        live = client.get("/health/live")
+
+    assert ready_one.status_code == ready_two.status_code == 200
+    assert live.status_code == 200
+    assert live.json()["status"] == "alive"
+    assert agent.ollama.calls == 1
+    assert agent.mcp.calls == 1
