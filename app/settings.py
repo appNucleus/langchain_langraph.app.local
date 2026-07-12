@@ -34,6 +34,12 @@ class Settings(BaseSettings):
     ollama_model: str = "qwen3.5:4b"
     ollama_temperature: float = Field(default=0.2, ge=0.0, le=2.0)
     ollama_num_predict: int = Field(default=2048, ge=-1, le=131072)
+    # Explicit API context window. Ollama commonly defaults to 4096 tokens on
+    # smaller-VRAM systems, which is too small for structured agent prompts that
+    # include retrieved evidence and a JSON schema.
+    ollama_num_ctx: int = Field(default=8192, ge=2048, le=262144)
+    structured_output_reserve_tokens: int = Field(default=1536, ge=256, le=32768)
+    structured_prompt_chars_per_token: float = Field(default=3.0, ge=1.0, le=8.0)
     ollama_think: bool = False
     ollama_timeout_seconds: float = Field(default=180.0, gt=0)
     ollama_connect_timeout_seconds: float = Field(default=10.0, gt=0)
@@ -87,6 +93,8 @@ class Settings(BaseSettings):
     phase2_max_research_rounds: int = Field(default=2, ge=0, le=5)
     phase2_max_replans: int = Field(default=1, ge=0, le=3)
     phase2_max_context_chars: int = Field(default=16000, ge=2000, le=100000)
+    research_max_queries_per_task: int = Field(default=3, ge=1, le=8)
+    research_max_evidence_chars_per_query: int = Field(default=6000, ge=500, le=50000)
 
     # Phase 3 global execution budgets
     execution_max_duration_seconds: float = Field(default=180.0, ge=5, le=1800)

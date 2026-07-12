@@ -141,6 +141,8 @@ def test_fresh_run_state_explicitly_clears_all_stale_checkpoint_channels() -> No
     state = build_fresh_run_state(
         message="new sports request",
         system_prompt="sports analyst",
+        system_prompt_source="request",
+        request_domain="sports",
         metadata={"safe_read_only_test": True},
         history=[{"role": "assistant", "content": "old weather answer"}],
         execution_budget=sentinel_budget,
@@ -212,6 +214,8 @@ async def test_fresh_state_overwrites_stale_langgraph_checkpoint_for_same_thread
     old_state = build_fresh_run_state(
         message="old weather request",
         system_prompt="weather",
+        system_prompt_source="request",
+        request_domain="weather",
         metadata={},
         history=[],
         execution_budget="budget-1",
@@ -224,6 +228,8 @@ async def test_fresh_state_overwrites_stale_langgraph_checkpoint_for_same_thread
     new_state = build_fresh_run_state(
         message="new sports request",
         system_prompt="sports",
+        system_prompt_source="request",
+        request_domain="sports",
         metadata={},
         history=[{"role": "assistant", "content": "old weather answer"}],
         execution_budget="budget-2",
@@ -252,7 +258,9 @@ from app.schemas.worker import Claim, WorkerResult
 
 
 @pytest.mark.asyncio
-async def test_full_graph_reuses_conversation_thread_without_reusing_old_run_state(monkeypatch, caplog) -> None:
+async def test_full_graph_reuses_conversation_thread_without_reusing_old_run_state(
+    monkeypatch, caplog
+) -> None:
     import logging
 
     caplog.set_level(logging.INFO, logger="app.graph")
@@ -372,7 +380,7 @@ async def test_full_graph_reuses_conversation_thread_without_reusing_old_run_sta
                 "and find criticism of the red card?"
             ),
             thread_id="reused-thread",
-            system_prompt="Act as a sports analyst",
+            system_prompt="",
         )
     )
 
@@ -382,6 +390,12 @@ async def test_full_graph_reuses_conversation_thread_without_reusing_old_run_sta
     assert second.metadata["selected_models"]["worker:sports-task"] == "qwen3.5:9b"
     assert second.metadata["selected_models"]["verify:sports-task"] == "deepseek-r1:8b"
     assert second.metadata["selected_tools"]["sports-task"] == "sports_news_search"
+    assert second.metadata["system_prompt"] == {
+        "source": "derived",
+        "domain": "sports",
+        "generated": True,
+    }
+    assert len(second.metadata["research_queries"]["sports-task"]) >= 2
     assert used_tools[-1] == "sports_news_search"
 
     messages = "\n".join(record.getMessage() for record in caplog.records)

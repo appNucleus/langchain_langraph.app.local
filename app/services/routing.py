@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
 
 from app.services.inventory import ModelSelector, RuntimeInventory
@@ -81,6 +82,14 @@ _WRITE_MARKERS = {
 
 
 @dataclass(frozen=True)
+class SystemPromptDecision:
+    prompt: str
+    source: str
+    domain: str
+    requires_external_evidence: bool
+
+
+@dataclass(frozen=True)
 class TaskRoutingDecision:
     requires_external_evidence: bool
     worker_role: str
@@ -121,11 +130,155 @@ class RuntimeRouter:
         return {
             "execution_time_utc": now.isoformat(),
             "execution_date_utc": now.date().isoformat(),
+            "yesterday_date_utc": (now.date() - timedelta(days=1)).isoformat(),
             "relative_date_rule": (
                 "Resolve relative dates such as today/yesterday from execution_time_utc; "
                 "do not invent a calendar date when external evidence is required."
             ),
         }
+
+    def prepare_system_prompt(
+        self, *, message: str, provided: str | None
+    ) -> SystemPromptDecision:
+        """Return a non-empty system instruction for every request.
+
+        A caller-supplied non-blank prompt is preserved. When it is absent or
+        blank, a deterministic instruction is derived from the current message
+        so request handling does not require a separate model call merely to
+        construct the system prompt.
+        """
+
+        supplied = str(provided or "").strip()
+        normalized = self._normalize(message)
+        domain = self._domain_for_text(normalized)
+        current = self._contains_any(normalized, _CURRENT_TERMS | _SEARCH_TERMS)
+        if supplied:
+            return SystemPromptDecision(
+                prompt=supplied,
+                source="request",
+                domain=domain,
+                requires_external_evidence=current,
+            )
+
+        role = {
+            "sports": "sports research analyst",
+            "weather": "weather analyst",
+            "software": "senior software and AI systems analyst",
+            "finance": "financial research analyst",
+        }.get(domain, "evidence-grounded research analyst")
+        prompt = (
+            f"Act as a {role}. Treat the current user message as authoritative. "
+            "Break compound requests into the smallest useful research or analysis "
+            "steps, choose only live compatible read-only tools, and choose models "
+            "according to each step's capability needs. For current or uncertain "
+            "claims, use external evidence instead of model memory. Preserve source "
+            "references, distinguish facts from inference, state unresolved "
+            "uncertainty, and do not perform write operations unless the user "
+            "explicitly requests and separately authorizes them."
+        )
+        return SystemPromptDecision(
+            prompt=prompt,
+            source="derived",
+            domain=domain,
+            requires_external_evidence=current,
+        )
+
+    def build_research_queries(
+        self,
+        *,
+        user_request: str,
+        task: dict[str, Any] | None,
+        required_actions: Iterable[str] = (),
+        limit: int | None = None,
+    ) -> list[str]:
+        """Create bounded task-specific research queries without inventing facts.
+
+        The execution plan already decomposes compound requests into tasks. This
+        method creates one or more source-discovery queries for the current task
+        from its objective, required evidence, and verifier-required actions.
+        """
+
+        task = task or {}
+        maximum = max(1, int(limit or self.settings.research_max_queries_per_task))
+        objective = str(task.get("objective") or "").strip()
+        required_evidence = task.get("required_evidence") or []
+        actions = [str(item).strip() for item in required_actions if str(item).strip()]
+        context = self.execution_context()
+        date_hint = ""
+        normalized = self._normalize(user_request)
+        if "yesterday" in normalized:
+            date_hint = f" event date {context['yesterday_date_utc']}"
+        elif "today" in normalized or "current" in normalized or "latest" in normalized:
+            date_hint = f" as of {context['execution_date_utc']}"
+
+        candidates: list[str] = []
+        if objective:
+            candidates.append(f"{objective}{date_hint}. {user_request}")
+        for item in required_evidence:
+            text = str(item).strip()
+            if text:
+                candidates.append(f"{text}{date_hint}. {objective or user_request}")
+        for action in actions:
+            candidates.append(f"{action}{date_hint}. {objective or user_request}")
+        candidates.append(f"{user_request}{date_hint}")
+
+        output: list[str] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            compact = " ".join(candidate.split()).strip(" .")
+            if not compact:
+                continue
+            compact = compact[:800]
+            key = compact.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            output.append(compact)
+            if len(output) >= maximum:
+                break
+        return output or [user_request[:800]]
+
+    @staticmethod
+    def query_fingerprint(query: str) -> str:
+        return hashlib.sha256(query.encode("utf-8")).hexdigest()[:12]
+
+    @staticmethod
+    def _domain_for_text(text: str) -> str:
+        if any(
+            term in text
+            for term in (
+                "fifa",
+                "football",
+                "soccer",
+                "match",
+                "game",
+                "red card",
+                "world cup",
+            )
+        ):
+            return "sports"
+        if any(term in text for term in ("weather", "forecast", "temperature", "rain", "snow")):
+            return "weather"
+        if any(
+            term in text
+            for term in (
+                "python",
+                "fastapi",
+                "langgraph",
+                "langchain",
+                "ollama",
+                "mcp",
+                "api",
+                "code",
+            )
+        ):
+            return "software"
+        if any(
+            term in text
+            for term in ("stock", "market", "investment", "credit", "apr", "finance")
+        ):
+            return "finance"
+        return "general"
 
     def classify_task(
         self,
@@ -184,13 +337,16 @@ class RuntimeRouter:
         inventory: RuntimeInventory,
         metadata: dict[str, Any] | None = None,
         limit: int = 3,
+        query: str | None = None,
     ) -> list[ToolRoutingDecision]:
         metadata = metadata or {}
         task = task or {}
         action_text = " ".join(str(item) for item in required_actions if item)
         objective = str(task.get("objective") or "")
-        query = " ".join(part for part in (objective, action_text, user_request) if part).strip()
-        normalized = self._normalize(query)
+        resolved_query = str(query or "").strip() or " ".join(
+            part for part in (objective, action_text, user_request) if part
+        ).strip()
+        normalized = self._normalize(resolved_query)
 
         decisions: list[ToolRoutingDecision] = []
         for tool in inventory.tools:
@@ -199,7 +355,7 @@ class RuntimeRouter:
                 continue
             description = str(tool.get("description") or "")
             score, reasons = self._tool_score(name, description, normalized)
-            arguments = self._arguments_for_tool(tool, query, metadata)
+            arguments = self._arguments_for_tool(tool, resolved_query, metadata)
             if arguments is None:
                 continue
             if score <= 0:
@@ -350,7 +506,10 @@ class RuntimeRouter:
     @staticmethod
     def _extract_location(query: str) -> str | None:
         match = re.search(
-            r"\b(?:in|for|at|near)\s+([A-Z][A-Za-z .'-]+?)(?:[?.!,]|\s+(?:today|tomorrow|yesterday|now)\b|$)",
+            (
+                r"\b(?:in|for|at|near)\s+([A-Z][A-Za-z .'-]+?)"
+                r"(?:[?.!,]|\s+(?:today|tomorrow|yesterday|now)\b|$)"
+            ),
             query,
         )
         return match.group(1).strip() if match else None
@@ -360,6 +519,8 @@ def build_fresh_run_state(
     *,
     message: str,
     system_prompt: str,
+    system_prompt_source: str,
+    request_domain: str,
     metadata: dict[str, Any],
     history: list[dict[str, Any]],
     execution_budget: Any,
@@ -378,6 +539,8 @@ def build_fresh_run_state(
     return {
         "message": message,
         "system_prompt": system_prompt,
+        "system_prompt_source": system_prompt_source,
+        "request_domain": request_domain,
         "metadata": dict(metadata),
         "history": list(history),
         "execution_budget": execution_budget,
@@ -388,6 +551,7 @@ def build_fresh_run_state(
         "selected_tool": None,
         "selected_tools": {},
         "researched_task_ids": [],
+        "research_queries": {},
         "plan": {},
         "task_index": 0,
         "task_results": [],
