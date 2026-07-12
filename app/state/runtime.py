@@ -4,6 +4,7 @@ from contextlib import AbstractAsyncContextManager
 from typing import Any
 
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 
 from app.settings import Settings
 from app.state.base import ConversationStore
@@ -13,13 +14,32 @@ from app.state.postgres import PostgresConversationStore
 from app.state.redis import RedisConversationStore
 
 
+def _checkpoint_serializer() -> JsonPlusSerializer:
+    """Create the checkpoint serializer used by every state backend.
+
+    The Docker image enables ``LANGGRAPH_STRICT_MSGPACK=true``. The graph state
+    intentionally contains one application-defined dataclass,
+    ``ExecutionBudget``. Strict MsgPack deserialization blocks custom classes
+    unless they are explicitly allowlisted, so keep the allowlist narrow and
+    identical for memory and PostgreSQL checkpointers.
+    """
+
+    return JsonPlusSerializer(
+        allowed_msgpack_modules=(
+            ("app.schemas.execution", "ExecutionBudget"),
+        )
+    )
+
+
 class StateRuntime:
     """Owns Phase 4 state backends and LangGraph checkpointer lifecycle."""
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        self.conversations: ConversationStore | BoundedInMemoryStore = self._memory_store()
-        self.checkpointer: Any = InMemorySaver()
+        self.conversations: ConversationStore | BoundedInMemoryStore = (
+            self._memory_store()
+        )
+        self.checkpointer: Any = InMemorySaver(serde=_checkpoint_serializer())
         self.artifacts: MinioArtifactStore | None = None
         self._checkpoint_context: AbstractAsyncContextManager[Any] | None = None
         self._started = False
@@ -35,11 +55,15 @@ class StateRuntime:
 
         if self.settings.checkpoint_backend == "postgres":
             if not self.settings.database_url:
-                raise RuntimeError("DATABASE_URL is required for PostgreSQL checkpoints")
+                raise RuntimeError(
+                    "DATABASE_URL is required for PostgreSQL checkpoints"
+                )
+
             from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
             self._checkpoint_context = AsyncPostgresSaver.from_conn_string(
-                self.settings.database_url
+                self.settings.database_url,
+                serde=_checkpoint_serializer(),
             )
             self.checkpointer = await self._checkpoint_context.__aenter__()
             if self.settings.postgres_auto_setup:
@@ -60,12 +84,15 @@ class StateRuntime:
     async def aclose(self) -> None:
         if self.artifacts is not None:
             await self.artifacts.aclose()
+
         close = getattr(self.conversations, "aclose", None)
         if callable(close):
             await close()
+
         if self._checkpoint_context is not None:
             await self._checkpoint_context.__aexit__(None, None, None)
-            self._checkpoint_context = None
+
+        self._checkpoint_context = None
         self._started = False
 
     async def health(self) -> dict[str, Any]:
@@ -74,19 +101,29 @@ class StateRuntime:
             "checkpoint_backend": self.settings.checkpoint_backend,
             "artifact_backend": self.settings.artifact_backend,
         }
+
         health = getattr(self.conversations, "health", None)
         if callable(health):
             payload["conversation"] = await health()
         else:
-            payload["conversation"] = {"status": "available", "backend": "memory"}
+            payload["conversation"] = {
+                "status": "available",
+                "backend": "memory",
+            }
+
         if self.artifacts is not None:
             payload["artifacts"] = await self.artifacts.health()
+
         return payload
 
-    def _build_conversation_store(self) -> ConversationStore | BoundedInMemoryStore:
+    def _build_conversation_store(
+        self,
+    ) -> ConversationStore | BoundedInMemoryStore:
         if self.settings.state_backend == "postgres":
             if not self.settings.database_url:
-                raise RuntimeError("DATABASE_URL is required for STATE_BACKEND=postgres")
+                raise RuntimeError(
+                    "DATABASE_URL is required for STATE_BACKEND=postgres"
+                )
             return PostgresConversationStore(
                 self.settings.database_url,
                 min_pool_size=self.settings.postgres_pool_min_size,
@@ -94,6 +131,7 @@ class StateRuntime:
                 max_messages=self.settings.state_max_history_messages,
                 command_timeout=self.settings.postgres_command_timeout_seconds,
             )
+
         if self.settings.state_backend == "redis":
             if not self.settings.redis_url:
                 raise RuntimeError("REDIS_URL is required for STATE_BACKEND=redis")
@@ -103,6 +141,7 @@ class StateRuntime:
                 ttl_seconds=self.settings.state_ttl_seconds,
                 max_messages=self.settings.state_max_history_messages,
             )
+
         return self._memory_store()
 
     def _memory_store(self) -> BoundedInMemoryStore:
