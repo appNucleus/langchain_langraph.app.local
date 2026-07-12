@@ -104,6 +104,7 @@ async def test_structured_agent_uses_ollama_json_schema_and_shared_client() -> N
     assert observed_payload["stream"] is False
     assert observed_payload["keep_alive"] == settings.ollama_keep_alive
     assert observed_payload["options"]["temperature"] == 0.0  # type: ignore[index]
+    assert observed_payload["options"]["num_ctx"] == settings.ollama_num_ctx  # type: ignore[index]
     await client.aclose()
 
 

@@ -8,6 +8,8 @@ from app.schemas.execution import ExecutionBudget
 class AgentGraphState(TypedDict, total=False):
     message: str
     system_prompt: str
+    system_prompt_source: str
+    request_domain: str
     metadata: dict[str, Any]
     history: list[dict[str, Any]]
     execution_budget: ExecutionBudget
@@ -17,8 +19,9 @@ class AgentGraphState(TypedDict, total=False):
     routing: dict[str, Any]
     selected_models: dict[str, str]
     selected_tool: str | None
-    selected_tools: dict[str, str]
+    selected_tools: dict[str, Any]
     researched_task_ids: list[str]
+    research_queries: dict[str, list[str]]
 
     plan: dict[str, Any]
     task_index: int
