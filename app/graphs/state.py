@@ -6,18 +6,19 @@ from app.schemas.execution import ExecutionBudget
 
 
 class AgentGraphState(TypedDict, total=False):
-    """Complete mutable state shared by all LangGraph nodes.
-
-    Every value supplied to ``StateGraph.ainvoke()`` and later read by a graph
-    node must be declared here. LangGraph builds its state channels from this
-    schema; undeclared input keys are not available to nodes.
-    """
-
     message: str
     system_prompt: str
     metadata: dict[str, Any]
     history: list[dict[str, Any]]
     execution_budget: ExecutionBudget
+    request_id: str
+
+    inventory: dict[str, Any]
+    routing: dict[str, Any]
+    selected_models: dict[str, str]
+    selected_tool: str | None
+    selected_tools: dict[str, str]
+    researched_task_ids: list[str]
 
     plan: dict[str, Any]
     task_index: int
