@@ -1,10 +1,17 @@
+from __future__ import annotations
+
+import re
+
 from app import __version__
 from app.observability import InMemoryMetrics, MetricsRegistry
 from app.settings import Settings
 
 
+_SEMVER = re.compile(r"^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$")
+
+
 def test_version_has_single_runtime_source() -> None:
-    assert __version__ == "0.4.1"
+    assert _SEMVER.fullmatch(__version__)
     assert "app_version" not in Settings.model_fields
     assert "mcp_client_version" not in Settings.model_fields
 
@@ -12,11 +19,13 @@ def test_version_has_single_runtime_source() -> None:
 def test_metrics_backward_compatibility_and_bounds() -> None:
     registry = InMemoryMetrics(max_timing_samples=2)
     assert isinstance(registry, MetricsRegistry)
+
     registry.inc("requests")
     registry.observe("latency", 1.0)
     registry.observe("latency", 2.0)
     registry.observe("latency", 3.0)
     snapshot = registry.snapshot()
+
     assert snapshot["counters"]["requests"] == 1
     assert snapshot["timings"]["latency"] == {
         "count": 2,

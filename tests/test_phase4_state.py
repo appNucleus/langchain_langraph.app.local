@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -29,6 +29,7 @@ def test_postgres_requires_database_url() -> None:
         database_url="",
     )
     runtime = StateRuntime(settings)
+
     with pytest.raises(RuntimeError, match="DATABASE_URL"):
         runtime._build_conversation_store()
 
@@ -40,11 +41,16 @@ async def test_redis_store_bounds_and_expires_history() -> None:
         ttl_seconds=60,
         max_messages=2,
     )
-    pipeline = AsyncMock()
-    pipeline.__aenter__.return_value = pipeline
-    pipeline.__aexit__.return_value = None
+
+    # redis.asyncio.Redis.pipeline() is a synchronous factory that returns an
+    # asynchronous context manager. Mock that contract rather than making the
+    # factory itself an AsyncMock/coroutine.
+    pipeline = MagicMock()
+    pipeline.__aenter__ = AsyncMock(return_value=pipeline)
+    pipeline.__aexit__ = AsyncMock(return_value=None)
     pipeline.execute = AsyncMock(return_value=[])
-    client = AsyncMock()
+
+    client = MagicMock()
     client.pipeline.return_value = pipeline
     store._client = client
 
@@ -54,7 +60,15 @@ async def test_redis_store_bounds_and_expires_history() -> None:
         {"role": "assistant", "content": "hi"},
     )
 
+    client.pipeline.assert_called_once_with(transaction=True)
     pipeline.rpush.assert_called_once()
-    pipeline.ltrim.assert_called_once_with("langgraph:conversation:thread-1", -2, -1)
-    pipeline.expire.assert_called_once_with("langgraph:conversation:thread-1", 60)
+    pipeline.ltrim.assert_called_once_with(
+        "langgraph:conversation:thread-1",
+        -2,
+        -1,
+    )
+    pipeline.expire.assert_called_once_with(
+        "langgraph:conversation:thread-1",
+        60,
+    )
     pipeline.execute.assert_awaited_once()
