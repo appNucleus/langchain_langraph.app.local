@@ -89,6 +89,10 @@ class Settings(BaseSettings):
     ollama_required: bool = True
     mcp_required: bool = False
 
+    # Backward-compatible deterministic query-rewriter defaults.
+    default_forecast_days: int = Field(default=7, ge=1, le=14)
+    default_news_lookback_days: int = Field(default=7, ge=1, le=90)
+
     # Shared capability inventory cache
     inventory_cache_ttl_seconds: int = Field(default=60, ge=1, le=3600)
     inventory_stale_if_error_seconds: int = Field(default=300, ge=0, le=86400)

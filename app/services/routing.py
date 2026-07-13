@@ -515,6 +515,174 @@ class RuntimeRouter:
         return match.group(1).strip() if match else None
 
 
+
+# ---------------------------------------------------------------------------
+# Legacy deterministic-routing compatibility
+# ---------------------------------------------------------------------------
+# ``RuntimeRouter`` is the active LangGraph runtime router.  The lightweight
+# ``ModelRouter`` contract remains public because ``QueryRewriter`` and older
+# callers/tests still depend on it.  Keep this shim deterministic and free of
+# model/tool network calls.
+
+
+@dataclass(frozen=True)
+class QueryPlan:
+    """Backward-compatible deterministic query-routing result."""
+
+    intent: str
+    tools: list[str]
+    model_key: str = "general"
+    needs_query_rewrite: bool = False
+
+
+class ModelRouter:
+    """Backward-compatible first-pass query classifier.
+
+    This classifier is intentionally independent from ``RuntimeRouter``.  It is
+    used only by the deterministic query rewriter and legacy callers.  The
+    active multi-agent graph continues to use live-inventory-based
+    ``RuntimeRouter`` selection.
+    """
+
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+
+    def plan(self, message: str) -> QueryPlan:
+        text = " ".join(str(message or "").lower().split())
+
+        if re.search(r"https?://\S+", message or "", flags=re.IGNORECASE):
+            return QueryPlan("url_scrape", ["scrape_url"], "general")
+
+        if self._contains(text, "send draft", "send email", "email draft"):
+            return QueryPlan("mail_send_draft", ["mail_send_draft"], "writer")
+
+        if self._contains(text, "check tools health", "tool health", "mcp health"):
+            return QueryPlan("tool_health", ["health_check"], "simple")
+
+        if self._contains(
+            text,
+            "weather",
+            "forecast",
+            "temperature",
+            "rain",
+            "snow",
+            "humidity",
+        ):
+            return QueryPlan("weather", ["weather_lookup"], "search", True)
+
+        if self._contains(text, "stock", "shares", "ticker", "market price"):
+            return QueryPlan("stock", ["stock_quote"], "search", True)
+
+        if self._contains(
+            text,
+            "world cup",
+            "fifa",
+            "football",
+            "soccer",
+            "match result",
+            "match results",
+            "final score",
+            "game result",
+            "game results",
+        ):
+            return QueryPlan(
+                "sports_or_match_results",
+                ["sports_search"],
+                "search",
+                True,
+            )
+
+        if self._contains(
+            text,
+            "road condition",
+            "road closure",
+            "traffic closure",
+            "construction traffic",
+        ):
+            return QueryPlan("road_condition", ["road_conditions"], "search", True)
+
+        if self._contains(text, "search email", "find email", "mail search"):
+            return QueryPlan("mail_search", ["mail_search"], "search", True)
+
+        if self._contains(text, "latest news", "breaking news", "recent news"):
+            return QueryPlan("news", ["news_search"], "search", True)
+
+        if self._contains(text, "quick search", "web search", "search for"):
+            return QueryPlan("web_search", ["web_search"], "search", True)
+
+        if self._contains(
+            text,
+            "research",
+            "authoritative sources",
+            "official documentation",
+            "find sources",
+        ):
+            return QueryPlan("web_research", ["web_search_and_scrape"], "search", True)
+
+        return QueryPlan("general", [], "general", False)
+
+    @staticmethod
+    def _contains(text: str, *needles: str) -> bool:
+        return any(needle in text for needle in needles)
+
+
+def extract_ticker(message: str) -> str | None:
+    """Extract a likely US-style ticker symbol from a natural-language query."""
+
+    text = str(message or "")
+    dollar = re.search(r"\$([A-Z][A-Z0-9.\-]{0,9})\b", text)
+    if dollar:
+        return dollar.group(1)
+
+    contextual = re.search(
+        r"\b([A-Z][A-Z0-9.\-]{0,9})\b(?=\s+(?:stock|shares|ticker)\b)",
+        text,
+    )
+    if contextual:
+        return contextual.group(1)
+    return None
+
+
+def extract_location(message: str, metadata: dict[str, Any] | None = None) -> str:
+    """Extract a location, preferring an explicit request metadata value."""
+
+    metadata = metadata or {}
+    for key in ("location", "city", "place"):
+        value = str(metadata.get(key) or "").strip()
+        if value:
+            return value
+
+    text = str(message or "")
+    match = re.search(
+        (
+            r"\b(?:in|for|at|near)\s+([A-Z][A-Za-z .,'\-]+?)"
+            r"(?=[?.!,]|\s+(?:today|tomorrow|yesterday|now)\b|$)"
+        ),
+        text,
+    )
+    if match:
+        return match.group(1).strip(" ,")
+    return "current location"
+
+
+def extract_road(message: str) -> str | None:
+    """Extract a common interstate, US-route, state-route, or named-road token."""
+
+    text = str(message or "")
+    numbered = re.search(
+        r"\b(?:I[- ]?\d{1,3}|US[- ]?\d{1,3}|SR[- ]?\d{1,3}|IN[- ]?\d{1,3})\b",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if numbered:
+        return re.sub(r"\s+", "-", numbered.group(0).upper())
+
+    named = re.search(
+        r"\b([A-Z][A-Za-z0-9'\- ]+\s(?:Road|Rd|Street|St|Avenue|Ave|Boulevard|Blvd|Highway|Hwy))\b",
+        text,
+    )
+    return named.group(1).strip() if named else None
+
 def build_fresh_run_state(
     *,
     message: str,
