@@ -3,7 +3,12 @@ from __future__ import annotations
 from typing import Any
 
 from app.factory import create_app
-from app.schemas.chat import ChatRequest, build_chat_request_openapi_examples
+from app.schemas.chat import (
+    CHAT_REQUEST_EXAMPLE_PATH,
+    ChatRequest,
+    build_chat_request_openapi_examples,
+    load_chat_request_example,
+)
 from app.settings import Settings
 
 
@@ -18,6 +23,7 @@ def _settings() -> Settings:
         artifact_storage_required=False,
         final_verification_enabled=False,
         state_backend="memory",
+        run_repository_backend="memory",
         checkpoint_backend="memory",
         artifact_backend="disabled",
         resume_token_secret="test-secret",
@@ -26,7 +32,6 @@ def _settings() -> Settings:
 
 def test_chat_request_defaults_are_defined_by_the_model() -> None:
     request = ChatRequest(message="Continue the analysis")
-
     assert request.model_dump(mode="json") == {
         "message": "Continue the analysis",
         "thread_id": None,
@@ -39,25 +44,31 @@ def test_chat_request_defaults_are_defined_by_the_model() -> None:
     }
 
 
-def test_openapi_uses_the_in_memory_request_example(
-    in_memory_chat_request_example: dict[str, Any],
-) -> None:
-    schema = create_app(settings=_settings()).openapi()
+def test_runtime_default_request_example_is_minimal_and_valid() -> None:
+    example = load_chat_request_example(CHAT_REQUEST_EXAMPLE_PATH)
+    assert example == {"message": "Continue the analysis"}
+    assert ChatRequest.model_validate(example).message == "Continue the analysis"
 
+
+def test_openapi_uses_the_runtime_request_example(
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setattr(
+        "app.factory.load_chat_request_example",
+        lambda: load_chat_request_example(CHAT_REQUEST_EXAMPLE_PATH),
+    )
+    schema = create_app(settings=_settings()).openapi()
     for path in ("/api/chat", "/api/chat/stream"):
         examples = schema["paths"][path]["post"]["requestBody"]["content"][
             "application/json"
         ]["examples"]
-        assert examples["default"]["value"] == in_memory_chat_request_example
+        assert examples["default"]["value"] == {
+            "message": "Continue the analysis"
+        }
 
 
 def test_openapi_example_builder_returns_a_defensive_copy() -> None:
-    source = {
-        "message": "example",
-        "metadata": {"source": "in-memory"},
-    }
-
+    source = {"message": "example", "metadata": {"source": "in-memory"}}
     examples = build_chat_request_openapi_examples(source)
     examples["default"]["value"]["metadata"]["source"] = "mutated"
-
     assert source["metadata"]["source"] == "in-memory"

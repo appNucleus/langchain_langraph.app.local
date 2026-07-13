@@ -1,32 +1,56 @@
 # Runtime Architecture
 
-This document describes the implementation present on the `release` baseline used for the naming-normalization change. Source and tests remain authoritative when this document and runtime behavior disagree.
+This document describes the Stage 1 and Stage 2 runtime contract. Source and tests remain authoritative when documentation and runtime behavior disagree.
 
 ## API lifecycle
 
 1. `create_app()` resolves settings and constructs `ChatRuntimeAgent`.
-2. FastAPI lifespan starts persistence, Ollama, and MCP according to required/optional policy.
-3. `/api/chat` validates `ChatRequest`, normalizes identity, enters the same-conversation gate, and executes the graph.
+2. FastAPI lifespan starts conversation storage, the run repository, checkpoints, artifacts, Ollama, and MCP according to required/optional policy.
+3. `/api/chat` validates `ChatRequest`, normalizes identity, resolves the durable run, acquires a conversation lease, and executes the graph.
 4. `/api/chat/stream` wraps the same invocation in an SSE generator.
-5. Lifespan shutdown closes Ollama, MCP, and persistence resources.
+5. Lifespan shutdown closes all external resources.
 
-## Request lifecycle
+## Request and run lifecycle
 
 ```text
 validate request
   -> normalize conversation/run identity
-  -> acquire process-local conversation gate
-  -> check process-local completed response registry
+  -> canonicalize and version request hash
+  -> enter process-local fast-path gate
+  -> create or resolve durable run record
+  -> replay a terminal stored response when available
+  -> validate explicit resume token and resumable status
   -> inspect checkpoint for conflict or resume
+  -> acquire distributed conversation lease and fencing token
+  -> renew lease while graph execution is active
   -> load conversation history and live inventory
   -> derive or preserve system instruction
   -> invoke checkpointed graph
-  -> append history idempotently within the current store view
-  -> cache completed response in the process-local registry
+  -> persist truthful terminal run outcome
+  -> append the user/assistant turn idempotently by run_id
+  -> mark history committed or leave it for deterministic reconciliation
+  -> release lease
   -> return response and resume token
 ```
 
-Conversation continuity, run identity, and LangGraph execution-thread identity are separate concepts. The gate and run registry are not distributed correctness boundaries.
+Conversation continuity, durable run identity, and LangGraph execution-thread identity are separate concepts. The local gate is not a distributed correctness boundary. With `RUN_REPOSITORY_BACKEND=postgres`, an expiring PostgreSQL lease and monotonically increasing fencing token prevent stale owners from committing after takeover.
+
+## Durable run status
+
+Canonical statuses are:
+
+```text
+pending
+running
+interrupted
+completed
+failed
+cancelled
+expired
+reconciling
+```
+
+Only an explicitly interrupted run may be resumed. A terminal response is replayed for the same run and request hash after restart. Request-hash, state-schema, checkpoint namespace, token version, and token signature mismatches fail closed.
 
 ## Graph adjacency
 
@@ -44,25 +68,34 @@ Conversation continuity, run identity, and LangGraph execution-thread identity a
 | `revise_final` | `verify_final` |
 | `terminate` | `END` |
 
-## Model-call path
+## Model and MCP paths
 
-Model selection is role-based and constrained by live Ollama inventory. Planner, worker, verifier, reviser, synthesizer, and final verifier create structured agent calls using configured role models and bounded fallback behavior. The current execution budget records logical model-call increments; it is not yet an authoritative meter for every physical retry/fallback attempt.
+Model selection remains role-based and constrained by live Ollama inventory. The current execution budget records logical model operations rather than every physical retry/fallback attempt; authoritative physical metering belongs to Stage 3.
 
-## MCP-call path
-
-The inventory service loads live MCP tools. The runtime router ranks compatible read-only tools and constructs arguments from each tool schema. `ToolExecutor` applies side-effect policy and budget checks before the MCP client call. Caller metadata does not authorize write actions.
+The inventory service loads live MCP tools. The runtime router ranks compatible read-only tools and `ToolExecutor` enforces side-effect policy and budget checks. Caller metadata does not authorize write actions.
 
 ## Evidence lifecycle
 
-Retrieved tool results are normalized into typed evidence records with IDs, run/task/query metadata, content hashes, trust class, timestamps, truncation state, freshness, and quality fields. Current review must distinguish populated schema fields from values that are actually computed at runtime. Large evidence is not yet proven to use MinIO in the normal flow.
+Retrieved results are normalized into typed evidence records with IDs, run/task/query metadata, content hashes, trust class, timestamps, truncation, freshness, and quality fields. Full claim-grounding and artifact-lifecycle hardening belong to later stages.
 
 ## Persistence lifecycle
 
-Conversation history and checkpoints are configured independently. Memory is always available for local development. Redis or PostgreSQL can store history; memory or PostgreSQL can store checkpoints; MinIO can be enabled for artifacts. Optional startup failure falls back to memory with explicit degradation metadata. Outcome, checkpoint, and history commits are not yet one transactional unit.
+The persistence authorities are intentionally distinct:
+
+- conversation store: user-visible history;
+- run repository: status, lease, fencing, terminal response, and reconciliation state;
+- LangGraph checkpointer: resumable graph state;
+- artifact store: large external objects when enabled.
+
+The run outcome is written before conversation history. If the process stops between those operations, the next idempotent retry replays the terminal response, calls the store's `append_turn()` method, and marks `history_committed_at`. Memory, Redis, and PostgreSQL stores implement run-scoped turn deduplication; PostgreSQL uses a unique `(thread_id, run_id, message_kind)` index.
+
+## Resume-token lifecycle
+
+Version 2 tokens include a key ID, request-hash version, state-schema version, checkpoint namespace, run identity, token version, issued time, and expiry. `RESUME_TOKEN_KEYS_JSON` permits old verification keys to remain during rotation while `RESUME_TOKEN_ACTIVE_KEY_ID` selects the signing key. Incrementing a run's durable token version revokes previously issued tokens.
 
 ## Streaming lifecycle
 
-The current SSE implementation starts a background invocation, emits periodic generic work events, and cancels/awaits the task during generator cleanup. This is cancellation-aware polling, not graph-update or token streaming.
+The SSE implementation still starts a background invocation, emits periodic generic work events, and cancels/awaits the task during generator cleanup. This is cancellation-aware polling, not graph-update or token streaming.
 
 ## Deployment lifecycle
 
@@ -79,7 +112,8 @@ The image is rebuilt on the production runner and is not yet promoted by immutab
 | Compatibility item | Current behavior | Removal boundary |
 |---|---|---|
 | `thread_id` | Alias for `conversation_id` | Versioned API migration |
-| `PHASE2_*` variables | Accepted as aliases for canonical `AGENT_*` settings | After deployment migration and deprecation window |
-| `phase2_*` setting properties | Read-only aliases used by older internal callers | After all call sites use canonical settings |
-| `phase5-v1` checkpoint namespace | Retained to read existing checkpoints | Explicit checkpoint/state migration only |
-| legacy response metadata from base `ChatAgent` | Compatibility-only; production runtime emits `runtime_contract` | Versioned response contract |
+| `PHASE2_*` variables | Deprecated aliases for canonical `AGENT_*` settings | After deployment migration |
+| `phase2_*` setting properties | Read-only aliases for older internal callers | After all call sites migrate |
+| `phase5-v1` checkpoint namespace | Retained to read existing checkpoints | Explicit checkpoint migration only |
+| `RESUME_TOKEN_SECRET` | Single-key alias when no key-ring JSON is configured | After key-ring rollout |
+| memory run repository | Process-local development compatibility | Keep for local/degraded operation |

@@ -22,6 +22,22 @@ jobs:
     name: "Pre-deployment: compile, lint, and test"
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: langgraph_test
+          POSTGRES_PASSWORD: langgraph_test
+          POSTGRES_DB: langgraph_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U langgraph_test -d langgraph_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      TEST_DATABASE_URL: postgresql://langgraph_test:langgraph_test@127.0.0.1:5432/langgraph_test
     defaults:
       run:
         shell: bash
@@ -56,7 +72,9 @@ jobs:
       - name: Run unit and deterministic integration tests
         run: |
           set -euo pipefail
-          python -m pytest -v -ra --tb=long -W default             -m "not live_integration"             --junitxml=test-results/pytest.xml
+          python -m pytest -v -ra --tb=long -W default \
+            -m "not live_integration" \
+            --junitxml=test-results/pytest.xml
 
       - name: Upload test report
         if: always()
@@ -138,7 +156,13 @@ jobs:
       - name: Release candidate
         run: |
           set -euo pipefail
-          docker compose --env-file "$DEPLOY_ENV_FILE" up             --detach             --no-build             --force-recreate             --remove-orphans             --wait             --wait-timeout 120
+          docker compose --env-file "$DEPLOY_ENV_FILE" up \
+            --detach \
+            --no-build \
+            --force-recreate \
+            --remove-orphans \
+            --wait \
+            --wait-timeout 120
 
   post-deployment:
     name: "Post-deployment: smoke, API checks, backup, and rollback"

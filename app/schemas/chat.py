@@ -15,16 +15,15 @@ CHAT_REQUEST_EXAMPLE_PATH = (
     / "example_request"
     / "chat.json"
 )
+CHAT_REQUEST_COMPLETE_EXAMPLE_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "docs"
+    / "example_request"
+    / "chat-complete.json"
+)
 
 _FALLBACK_CHAT_REQUEST_EXAMPLE: dict[str, Any] = {
     "message": "Continue the analysis",
-    "thread_id": None,
-    "conversation_id": None,
-    "run_id": None,
-    "resume": False,
-    "resume_token": None,
-    "system_prompt": None,
-    "metadata": {},
 }
 
 
@@ -126,12 +125,7 @@ def _validated_chat_request_example(raw: object) -> dict[str, Any]:
 
 
 def load_chat_request_example(path: Path | None = None) -> dict[str, Any]:
-    """Load the runtime Swagger example from ``docs/example_request/chat.json``.
-
-    The file is application documentation input, not a pytest fixture. Missing,
-    malformed, or contract-invalid content falls back to a complete safe request
-    containing every public field at its default value.
-    """
+    """Load the minimal runnable Swagger example from ``chat.json``."""
 
     example_path = path or CHAT_REQUEST_EXAMPLE_PATH
     try:
@@ -148,10 +142,11 @@ def build_chat_request_openapi_examples(
 
     return {
         "default": {
-            "summary": "Default chat request",
+            "summary": "Minimal new-conversation request",
             "description": (
                 "Loaded when the application starts from "
-                "docs/example_request/chat.json."
+                "docs/example_request/chat.json. The complete optional-field example "
+                "is stored separately in docs/example_request/chat-complete.json."
             ),
             "value": deepcopy(dict(example)),
         }

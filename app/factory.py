@@ -54,6 +54,7 @@ def create_app(
             environment=app_settings.environment,
             backend=app_settings.llm_backend,
             state_backend=app_settings.state_backend,
+            run_repository_backend=app_settings.run_repository_backend,
             checkpoint_backend=app_settings.checkpoint_backend,
             artifact_backend=app_settings.artifact_backend,
         )
@@ -73,7 +74,7 @@ def create_app(
         version=__version__,
         description=(
             "FastAPI + LangGraph local assistant with bounded execution, "
-            "durable checkpoints, Ollama model routing, and MCP tools."
+            "durable run outcomes, checkpoints, Ollama model routing, and MCP tools."
         ),
         lifespan=lifespan,
     )
@@ -203,6 +204,7 @@ def create_app(
             conversation_ok = (
                 (persistence.get("conversation") or {}).get("status") == "available"
             )
+            runs_ok = (persistence.get("runs") or {}).get("status") == "available"
             checkpoint_ok = (
                 (persistence.get("checkpoint") or {}).get("status") == "available"
             )
@@ -211,7 +213,7 @@ def create_app(
                 "disabled",
             }
             if current_settings.persistence_required:
-                ready = ready and conversation_ok and checkpoint_ok
+                ready = ready and conversation_ok and runs_ok and checkpoint_ok
             if current_settings.artifact_storage_required:
                 ready = ready and artifacts_ok
         except Exception as exc:

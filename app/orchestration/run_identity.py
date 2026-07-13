@@ -5,9 +5,11 @@ import base64
 import hashlib
 import hmac
 import json
+import math
 import secrets
+import unicodedata
 from collections import OrderedDict
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from time import monotonic, time
@@ -26,6 +28,7 @@ _RESERVED_METADATA_KEYS = {
     "run_id",
     "thread_id",
 }
+_REQUEST_HASH_DOMAIN = b"langchain-langraph-chat-request-v1\0"
 
 
 class RequestIdentityError(RuntimeError):
@@ -45,9 +48,24 @@ class RunConflictError(RequestIdentityError):
     error_code = "run_conflict"
 
 
+class StaleLeaseError(RequestIdentityError):
+    status_code = 409
+    error_code = "stale_lease"
+
+
+class RunNotResumableError(RequestIdentityError):
+    status_code = 409
+    error_code = "run_not_resumable"
+
+
 class ResumeTokenInvalidError(RequestIdentityError):
     status_code = 401
     error_code = "invalid_resume_token"
+
+
+class ResumeTokenRevokedError(RequestIdentityError):
+    status_code = 401
+    error_code = "resume_revoked"
 
 
 class ResumeTokenExpiredError(RequestIdentityError):
@@ -72,18 +90,45 @@ class _RunRecord:
     response: dict[str, Any] | None = None
 
 
+def _normalize_text(value: str) -> str:
+    return unicodedata.normalize("NFC", value)
+
+
+def _canonical_json_value(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, int)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("request metadata must not contain NaN or infinity")
+        return value
+    if isinstance(value, str):
+        return _normalize_text(value)
+    if isinstance(value, Mapping):
+        return {
+            _normalize_text(str(key)): _canonical_json_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return [_canonical_json_value(item) for item in value]
+    raise TypeError(
+        f"request metadata contains unsupported value type: {type(value).__name__}"
+    )
+
+
 class RunIdentityService:
-    """Normalize request IDs and issue request-bound signed resume tokens."""
+    """Normalize request IDs and issue request-bound, rotatable resume tokens."""
 
     def __init__(self, settings: Settings) -> None:
-        configured_secret = str(settings.resume_token_secret or "").strip()
-        api_key_secret = str(settings.api_key or "").strip()
-        secret = configured_secret or api_key_secret
-        self._persistent_secret = bool(secret)
-        self._secret = (secret or secrets.token_urlsafe(48)).encode("utf-8")
         self._ttl_seconds = int(settings.resume_token_ttl_seconds)
         self._checkpoint_namespace = settings.run_checkpoint_namespace
         self._state_schema_version = int(settings.run_state_schema_version)
+        self._request_hash_version = int(settings.run_request_hash_version)
+        self._active_key_id = str(settings.resume_token_active_key_id).strip() or "primary"
+        self._keys, self._persistent_secret = self._load_keys(settings)
+        if self._active_key_id not in self._keys:
+            raise ValueError(
+                "RESUME_TOKEN_ACTIVE_KEY_ID must identify a configured signing key"
+            )
 
     @property
     def token_ttl_seconds(self) -> int:
@@ -93,6 +138,10 @@ class RunIdentityService:
     def token_persistent(self) -> bool:
         return self._persistent_secret
 
+    @property
+    def active_key_id(self) -> str:
+        return self._active_key_id
+
     def sanitized_metadata(self, request: ChatRequest) -> dict[str, Any]:
         return {
             str(key): value
@@ -101,6 +150,25 @@ class RunIdentityService:
         }
 
     def request_hash(self, request: ChatRequest) -> str:
+        canonical = json.dumps(
+            {
+                "version": self._request_hash_version,
+                "message": _normalize_text(request.message),
+                "system_prompt": (
+                    _normalize_text(request.system_prompt)
+                    if request.system_prompt is not None
+                    else None
+                ),
+                "metadata": _canonical_json_value(self.sanitized_metadata(request)),
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+            allow_nan=False,
+        ).encode("utf-8")
+        return hashlib.sha256(_REQUEST_HASH_DOMAIN + canonical).hexdigest()
+
+    def _legacy_request_hash(self, request: ChatRequest) -> str:
         canonical = json.dumps(
             {
                 "message": request.message,
@@ -130,6 +198,9 @@ class RunIdentityService:
             checkpoint_namespace=self._checkpoint_namespace,
             state_schema_version=self._state_schema_version,
             request_hash=request_hash,
+            request_hash_version=self._request_hash_version,
+            resume_token_version=1,
+            resume_token_key_id=self._active_key_id,
             resume_requested=False,
             resumed=False,
             client_supplied_run_id=supplied_run_id,
@@ -138,13 +209,16 @@ class RunIdentityService:
     def issue_resume_token(self, identity: RunIdentity) -> str:
         now = int(time())
         payload = {
-            "v": 1,
+            "v": 2,
+            "kid": self._active_key_id,
             "conversation_id": identity.conversation_id,
             "run_id": identity.run_id,
             "execution_thread_id": identity.execution_thread_id,
             "checkpoint_namespace": identity.checkpoint_namespace,
             "state_schema_version": identity.state_schema_version,
             "request_hash": identity.request_hash,
+            "request_hash_version": identity.request_hash_version,
+            "resume_token_version": identity.resume_token_version,
             "iat": now,
             "exp": now + self._ttl_seconds,
         }
@@ -157,7 +231,11 @@ class RunIdentityService:
             ).encode("utf-8")
         )
         signature = self._b64encode(
-            hmac.new(self._secret, encoded_payload.encode("ascii"), hashlib.sha256).digest()
+            hmac.new(
+                self._keys[self._active_key_id],
+                encoded_payload.encode("ascii"),
+                hashlib.sha256,
+            ).digest()
         )
         return f"{encoded_payload}.{signature}"
 
@@ -167,8 +245,9 @@ class RunIdentityService:
         *,
         request_hash: str,
     ) -> RunIdentity:
-        payload = self._decode_token(str(request.resume_token or ""))
-        if int(payload.get("v", 0)) != 1:
+        payload, key_id = self._decode_token(str(request.resume_token or ""))
+        token_format_version = int(payload.get("v", 0))
+        if token_format_version not in {1, 2}:
             raise ResumeTokenInvalidError("Unsupported resume token version")
         if int(payload.get("exp", 0) or 0) <= int(time()):
             raise ResumeTokenExpiredError("The resume token has expired")
@@ -177,6 +256,15 @@ class RunIdentityService:
         if schema_version != self._state_schema_version:
             raise IncompatibleRunStateError(
                 "The resumable run uses an incompatible state schema version"
+            )
+
+        hash_version = int(
+            payload.get("request_hash_version", self._request_hash_version)
+            or self._request_hash_version
+        )
+        if token_format_version == 2 and hash_version != self._request_hash_version:
+            raise IncompatibleRunStateError(
+                "The resumable run uses an incompatible request hash version"
             )
 
         conversation_id = str(payload.get("conversation_id") or "").strip()
@@ -202,7 +290,12 @@ class RunIdentityService:
             raise IncompatibleRunStateError(
                 "The resumable run uses an incompatible checkpoint namespace"
             )
-        if token_request_hash != request_hash:
+        expected_request_hash = (
+            self._legacy_request_hash(request)
+            if token_format_version == 1
+            else request_hash
+        )
+        if token_request_hash != expected_request_hash:
             raise ResumeTokenInvalidError(
                 "The resume token is not valid for this request payload"
             )
@@ -224,36 +317,69 @@ class RunIdentityService:
             checkpoint_namespace=checkpoint_namespace,
             state_schema_version=schema_version,
             request_hash=request_hash,
+            request_hash_version=self._request_hash_version,
+            resume_token_version=int(payload.get("resume_token_version", 1) or 1),
+            resume_token_key_id=key_id,
             resume_requested=True,
             resumed=True,
             client_supplied_run_id=bool(request.run_id),
         )
 
-    def _decode_token(self, token: str) -> dict[str, Any]:
+    def _decode_token(self, token: str) -> tuple[dict[str, Any], str]:
         try:
             encoded_payload, encoded_signature = token.split(".", 1)
         except ValueError as exc:
             raise ResumeTokenInvalidError("Malformed resume token") from exc
 
-        expected_signature = hmac.new(
-            self._secret,
-            encoded_payload.encode("ascii"),
-            hashlib.sha256,
-        ).digest()
         try:
+            raw_payload = self._b64decode(encoded_payload)
+            payload = json.loads(raw_payload.decode("utf-8"))
             supplied_signature = self._b64decode(encoded_signature)
-        except (ValueError, UnicodeError) as exc:
-            raise ResumeTokenInvalidError("Malformed resume token signature") from exc
-        if not hmac.compare_digest(expected_signature, supplied_signature):
-            raise ResumeTokenInvalidError("Resume token signature is invalid")
-
-        try:
-            payload = json.loads(self._b64decode(encoded_payload).decode("utf-8"))
         except (ValueError, UnicodeError, json.JSONDecodeError) as exc:
-            raise ResumeTokenInvalidError("Malformed resume token payload") from exc
+            raise ResumeTokenInvalidError("Malformed resume token") from exc
         if not isinstance(payload, dict):
             raise ResumeTokenInvalidError("Resume token payload must be an object")
-        return payload
+
+        candidate_key_id = str(payload.get("kid") or "").strip()
+        candidates = (
+            [(candidate_key_id, self._keys[candidate_key_id])]
+            if candidate_key_id in self._keys
+            else list(self._keys.items())
+        )
+        for key_id, secret in candidates:
+            expected_signature = hmac.new(
+                secret,
+                encoded_payload.encode("ascii"),
+                hashlib.sha256,
+            ).digest()
+            if hmac.compare_digest(expected_signature, supplied_signature):
+                return payload, key_id
+        raise ResumeTokenInvalidError("Resume token signature is invalid")
+
+    def _load_keys(self, settings: Settings) -> tuple[dict[str, bytes], bool]:
+        raw_keyring = str(settings.resume_token_keys_json or "").strip()
+        if raw_keyring:
+            try:
+                parsed = json.loads(raw_keyring)
+            except json.JSONDecodeError as exc:
+                raise ValueError("RESUME_TOKEN_KEYS_JSON must be valid JSON") from exc
+            if not isinstance(parsed, dict) or not parsed:
+                raise ValueError("RESUME_TOKEN_KEYS_JSON must be a non-empty object")
+            keys = {
+                str(key_id).strip(): str(secret).encode("utf-8")
+                for key_id, secret in parsed.items()
+                if str(key_id).strip() and str(secret)
+            }
+            if not keys:
+                raise ValueError("RESUME_TOKEN_KEYS_JSON contains no usable keys")
+            return keys, True
+
+        configured_secret = str(settings.resume_token_secret or "").strip()
+        api_key_secret = str(settings.api_key or "").strip()
+        secret = configured_secret or api_key_secret
+        if secret:
+            return {self._active_key_id: secret.encode("utf-8")}, True
+        return {self._active_key_id: secrets.token_urlsafe(48).encode("utf-8")}, False
 
     @staticmethod
     def _validate_uuid(value: str, *, field_name: str) -> None:
@@ -273,7 +399,7 @@ class RunIdentityService:
 
 
 class ConversationGate:
-    """Reject overlapping turns for one conversation in this process."""
+    """Fast-path rejection of overlapping turns inside one process."""
 
     def __init__(self) -> None:
         self._owners: dict[str, str] = {}
@@ -296,7 +422,7 @@ class ConversationGate:
 
 
 class RunRegistry:
-    """Bounded process-local idempotency registry."""
+    """Deprecated process-local idempotency registry retained for compatibility."""
 
     def __init__(self, *, ttl_seconds: int, max_records: int) -> None:
         if ttl_seconds <= 0:
