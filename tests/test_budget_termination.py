@@ -6,7 +6,7 @@ import pytest
 
 from app.graph import ChatAgent
 from app.graphs.routes import after_budgeted_step, after_verification
-from app.schemas.execution import ExecutionBudget
+from app.schemas.execution import BudgetExceeded, ExecutionBudget
 
 
 def _agent() -> ChatAgent:
@@ -50,6 +50,27 @@ def _state(*, budget: ExecutionBudget) -> dict:
         "replans": 0,
         "execution_budget": budget,
     }
+
+
+def test_budget_rejects_model_calls_above_limit() -> None:
+    budget = ExecutionBudget(60, 1, 2, 2)
+    budget.model_calls = 2
+
+    with pytest.raises(BudgetExceeded):
+        budget.check()
+
+
+def test_budget_uses_restart_safe_wall_clock() -> None:
+    budget = ExecutionBudget(
+        max_duration_seconds=60,
+        max_model_calls=2,
+        max_tool_calls=2,
+        max_verifier_rounds=2,
+    )
+
+    assert budget.started_at > 1_000_000_000
+    assert budget.elapsed_seconds >= 0
+    budget.check()
 
 
 @pytest.mark.asyncio

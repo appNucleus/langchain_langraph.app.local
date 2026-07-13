@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
 python -m compileall -q app tests
 
@@ -16,7 +16,7 @@ assert hasattr(settings, "ollama_max_concurrency")
 assert hasattr(settings, "ollama_max_concurrent_requests")
 assert hasattr(settings, "mcp_read_timeout_seconds")
 assert hasattr(settings, "inventory_cache_ttl_seconds")
-print(f"Import/startup contract OK; version={__version__}")
+print(f"Runtime import and startup contract OK; version={__version__}")
 PY
 
 python -m pytest -q
