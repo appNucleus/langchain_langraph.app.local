@@ -12,14 +12,7 @@ def build_context(
     *,
     max_item_chars: int | None = None,
 ) -> list[dict[str, object]]:
-    """Build a bounded, deduplicated evidence context.
-
-    The previous implementation could place one very large MCP result into the
-    worker prompt until the entire character allowance was consumed. Combined
-    with the JSON output schema, this could fill Ollama's context window and
-    leave only one generation token. This function now bounds both the aggregate
-    and each individual evidence item while preserving stable evidence IDs.
-    """
+    """Build bounded, deduplicated evidence with explicit provenance fields."""
 
     remaining = max(0, int(max_chars))
     per_item = max(1, int(max_item_chars or max_chars or 1))
@@ -29,35 +22,26 @@ def build_context(
     for item in items:
         if remaining <= 0:
             break
-
-        key = (item.id, item.content)
+        key = (item.id, item.content_hash)
         if key in seen:
             continue
         seen.add(key)
 
         allowed = min(remaining, per_item)
-        original = item.content
-        content = original[:allowed]
-        truncated = len(original) > len(content)
-        metadata = dict(item.metadata)
-        metadata.setdefault("original_content_chars", len(original))
+        content = item.content[:allowed]
+        context_truncated = len(item.content) > len(content)
+        record = item.prompt_record(content=content)
+        metadata = dict(record.get("metadata") or {})
+        metadata.setdefault("original_content_chars", len(item.content))
         metadata["context_content_chars"] = len(content)
-        metadata["context_truncated"] = truncated
-
-        output.append(
-            {
-                "id": item.id,
-                "source": item.source,
-                "content": content,
-                "metadata": metadata,
-            }
-        )
+        metadata["context_truncated"] = context_truncated
+        record["metadata"] = metadata
+        record["truncated"] = bool(item.truncated or context_truncated)
+        output.append(record)
         remaining -= len(content)
 
     return output
 
 
 def context_character_count(items: Iterable[dict[str, Any]]) -> int:
-    """Return only evidence-content characters, without serializing bodies."""
-
     return sum(len(str(item.get("content") or "")) for item in items)

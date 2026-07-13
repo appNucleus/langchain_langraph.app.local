@@ -566,4 +566,7 @@ def build_fresh_run_state(
         "backend": backend,
         "model": None,
         "termination_reason": None,
+        "final_verification_required": False,
+        "final_verification": {},
+        "final_revision_rounds": 0,
     }

@@ -47,3 +47,16 @@ FINALIZER_PROMPT = """Combine only the verified task answers into one direct fin
 answer. Do not mention internal agents. Preserve evidence references,
 uncertainty, and unresolved limitations. Do not invent new factual claims.
 """
+
+FINAL_VERIFIER_PROMPT = """You are the independent final-answer verifier.
+Compare the candidate final answer with the current user request and the supplied
+verified task results. Return JSON only with verdict(pass|revise),
+answer_complete, issues, required_actions, and confidence.
+
+Rules:
+- Pass only when every requested part is represented.
+- Reject factual claims that are absent from the verified task results.
+- Reject dropped uncertainty, limitations, evidence references, or unresolved unknowns.
+- Do not request new research here; identify the exact revision required.
+- A pass verdict requires answer_complete=true.
+"""

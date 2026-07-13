@@ -61,10 +61,10 @@ def create_app(
                     expose=app_settings.expose_internal_health_details,
                 ),
             )
-            # Preserve the existing Phase 3/4 startup policy. Phase 1 only
-            # activates shared clients and inventory caching.
-            if app_settings.persistence_required:
-                raise
+            # ChatAgent handles optional dependencies by entering explicit
+            # degraded mode. Any exception that reaches the lifespan is therefore
+            # a required-dependency failure and must abort startup.
+            raise
         try:
             yield
         finally:
@@ -170,7 +170,8 @@ def create_app(
                     else ("Dependency unavailable." if ollama_error else None)
                 ),
             }
-            ready = ready and ollama_ready
+            if current_settings.ollama_required:
+                ready = ready and ollama_ready
 
         if current_settings.mcp_enabled:
             mcp_error = live_inventory.errors.get("mcp")
@@ -185,14 +186,22 @@ def create_app(
                     else ("Dependency unavailable." if mcp_error else None)
                 ),
             }
-            ready = ready and mcp_ready
+            if current_settings.mcp_required:
+                ready = ready and mcp_ready
 
         try:
-            payload["dependencies"]["persistence"] = (
-                await current_agent.persistence_health()
-            )
+            persistence = await current_agent.persistence_health()
+            payload["dependencies"]["persistence"] = persistence
+            conversation_ok = (persistence.get("conversation") or {}).get("status") == "available"
+            checkpoint_ok = (persistence.get("checkpoint") or {}).get("status") == "available"
+            artifacts = persistence.get("artifacts") or {}
+            artifacts_ok = artifacts.get("status") in {"available", "disabled"}
+            if current_settings.persistence_required:
+                ready = ready and conversation_ok and checkpoint_ok
+            if current_settings.artifact_storage_required:
+                ready = ready and artifacts_ok
         except Exception as exc:
-            if current_settings.persistence_enabled:
+            if current_settings.persistence_required or current_settings.artifact_storage_required:
                 ready = False
             payload["dependencies"]["persistence"] = {
                 "status": "unavailable",
@@ -201,6 +210,10 @@ def create_app(
                     expose=current_settings.expose_internal_health_details,
                 ),
             }
+
+        startup_status = getattr(current_agent, "dependency_startup_status", None)
+        if callable(startup_status):
+            payload["startup"] = startup_status()
 
         if not ready:
             payload["status"] = "not_ready"
