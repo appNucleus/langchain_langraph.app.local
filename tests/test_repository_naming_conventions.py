@@ -21,8 +21,12 @@ _ALLOWED_COMPATIBILITY_IDENTIFIERS = {
 }
 
 
+def _python_tree(path: Path) -> ast.AST:
+    return ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+
+
 def _python_identifiers(path: Path) -> set[str]:
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    tree = _python_tree(path)
     names: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
@@ -67,5 +71,23 @@ def test_python_identifiers_use_domain_names_except_bounded_aliases() -> None:
 
     assert not violations, (
         "Numbered delivery terminology is prohibited in maintained Python identifiers:\n"
+        + "\n".join(sorted(violations))
+    )
+
+
+def test_tests_do_not_reference_json_fixture_files() -> None:
+    """Keep pytest data code-only; runtime request examples are not test fixtures."""
+
+    suffix = "." + "json"
+    violations: list[str] = []
+    for path in Path("tests").rglob("*.py"):
+        for node in ast.walk(_python_tree(path)):
+            if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+                continue
+            if node.value.strip().casefold().endswith(suffix):
+                violations.append(f"{path.as_posix()}:{node.lineno}:{node.value}")
+
+    assert not violations, (
+        "Tests must use code-defined or injected data instead of JSON fixture files:\n"
         + "\n".join(sorted(violations))
     )

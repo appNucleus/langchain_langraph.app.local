@@ -1,54 +1,35 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
-_DEFAULT_CHAT_REQUEST_EXAMPLE: dict[str, Any] = {
+CHAT_REQUEST_EXAMPLE_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "docs"
+    / "example_request"
+    / "chat.json"
+)
+
+_FALLBACK_CHAT_REQUEST_EXAMPLE: dict[str, Any] = {
     "message": "Continue the analysis",
-}
-
-
-def _load_chat_request_example() -> dict[str, Any]:
-    example_path = (
-        Path(__file__).resolve().parents[2]
-        / "docs"
-        / "example_request"
-        / "chat.json"
-    )
-    try:
-        raw = json.loads(example_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return dict(_DEFAULT_CHAT_REQUEST_EXAMPLE)
-    if not isinstance(raw, dict):
-        return dict(_DEFAULT_CHAT_REQUEST_EXAMPLE)
-    message = raw.get("message")
-    if not isinstance(message, str) or not message.strip():
-        return dict(_DEFAULT_CHAT_REQUEST_EXAMPLE)
-    return raw
-
-
-CHAT_REQUEST_EXAMPLE = _load_chat_request_example()
-CHAT_REQUEST_OPENAPI_EXAMPLES = {
-    "default": {
-        "summary": "Minimal new-conversation request",
-        "description": (
-            "Send only message to start a new conversation. The server generates "
-            "conversation and run IDs when they are omitted. A complete contract "
-            "example is stored separately in docs/example_request/chat-complete.json."
-        ),
-        "value": CHAT_REQUEST_EXAMPLE,
-    }
+    "thread_id": None,
+    "conversation_id": None,
+    "run_id": None,
+    "resume": False,
+    "resume_token": None,
+    "system_prompt": None,
+    "metadata": {},
 }
 
 
 class ChatRequest(BaseModel):
     """Public chat request with backward-compatible identity fields."""
-
-    model_config = ConfigDict(json_schema_extra={"examples": [CHAT_REQUEST_EXAMPLE]})
 
     message: str = Field(..., min_length=1, max_length=20000)
     thread_id: str | None = Field(
@@ -132,6 +113,49 @@ class ChatRequest(BaseModel):
         if self.resume_token and not self.resume:
             raise ValueError("resume must be true when resume_token is provided")
         return self
+
+
+def _validated_chat_request_example(raw: object) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        return deepcopy(_FALLBACK_CHAT_REQUEST_EXAMPLE)
+    try:
+        request = ChatRequest.model_validate(raw)
+    except ValidationError:
+        return deepcopy(_FALLBACK_CHAT_REQUEST_EXAMPLE)
+    return request.model_dump(mode="json", exclude_unset=True)
+
+
+def load_chat_request_example(path: Path | None = None) -> dict[str, Any]:
+    """Load the runtime Swagger example from ``docs/example_request/chat.json``.
+
+    The file is application documentation input, not a pytest fixture. Missing,
+    malformed, or contract-invalid content falls back to a complete safe request
+    containing every public field at its default value.
+    """
+
+    example_path = path or CHAT_REQUEST_EXAMPLE_PATH
+    try:
+        raw = json.loads(example_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return deepcopy(_FALLBACK_CHAT_REQUEST_EXAMPLE)
+    return _validated_chat_request_example(raw)
+
+
+def build_chat_request_openapi_examples(
+    example: Mapping[str, Any],
+) -> dict[str, dict[str, Any]]:
+    """Build a defensive OpenAPI example object from one validated request mapping."""
+
+    return {
+        "default": {
+            "summary": "Default chat request",
+            "description": (
+                "Loaded when the application starts from "
+                "docs/example_request/chat.json."
+            ),
+            "value": deepcopy(dict(example)),
+        }
+    }
 
 
 class ChatResponse(BaseModel):

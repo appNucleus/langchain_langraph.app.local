@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Sequence
+from copy import deepcopy
 from typing import Any
 
 import pytest
@@ -10,6 +11,37 @@ from app.factory import create_app
 from app.llm.ollama import LLMResponse
 from app.mcp.client import MCPToolResult
 from app.settings import Settings
+
+_TEST_CHAT_REQUEST_EXAMPLE: dict[str, Any] = {
+    "message": "OpenAPI example injected by pytest",
+    "thread_id": None,
+    "conversation_id": None,
+    "run_id": None,
+    "resume": False,
+    "resume_token": None,
+    "system_prompt": None,
+    "metadata": {},
+}
+
+
+@pytest.fixture()
+def in_memory_chat_request_example() -> dict[str, Any]:
+    """Return code-only OpenAPI test data; tests never read request JSON files."""
+
+    return deepcopy(_TEST_CHAT_REQUEST_EXAMPLE)
+
+
+@pytest.fixture(autouse=True)
+def isolate_request_example_files(
+    monkeypatch: pytest.MonkeyPatch,
+    in_memory_chat_request_example: dict[str, Any],
+) -> None:
+    """Keep every pytest app instance independent from runtime JSON documentation."""
+
+    monkeypatch.setattr(
+        "app.factory.load_chat_request_example",
+        lambda: deepcopy(in_memory_chat_request_example),
+    )
 
 
 class FakeOllamaClient:

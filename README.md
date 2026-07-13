@@ -71,21 +71,18 @@ The server generates conversation and run IDs when omitted. Resume tokens are si
 
 Current limitation: same-conversation exclusion and completed-response caching are process-local. Multi-worker correctness requires a durable lease and run repository and is not claimed by the current release.
 
-## Request examples
+## Request example
 
-Minimal OpenAPI/default request:
-
-```json
-{
-  "message": "Continue the analysis"
-}
-```
-
-The full optional-field contract is stored at:
+The Swagger/OpenAPI default for both chat endpoints is loaded when the
+application starts from:
 
 ```text
-docs/example_request/chat-complete.json
+docs/example_request/chat.json
 ```
+
+That file contains the complete public request shape and its default values.
+It is runtime documentation input, not a pytest fixture; tests inject equivalent
+code-defined data and do not read JSON files.
 
 ## Streaming status
 

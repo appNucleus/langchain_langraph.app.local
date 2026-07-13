@@ -94,15 +94,6 @@ def test_reusing_run_id_for_different_payload_returns_conflict() -> None:
     assert conflict.json()["detail"]["code"] == "run_conflict"
 
 
-def test_openapi_uses_stored_complete_request_example() -> None:
-    schema = create_app(settings=_settings()).openapi()
-    examples = schema["paths"]["/api/chat"]["post"]["requestBody"]["content"][
-        "application/json"
-    ]["examples"]
-    assert examples["default"]["value"]["thread_id"] is None
-    assert examples["default"]["value"]["metadata"] == {}
-
-
 def test_stream_starts_with_resumable_identity() -> None:
     app = create_app(settings=_settings())
     with TestClient(app) as client:

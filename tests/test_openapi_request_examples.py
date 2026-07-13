@@ -1,32 +1,63 @@
 from __future__ import annotations
 
-import json
-from pathlib import Path
+from typing import Any
 
-from app.schemas.chat import CHAT_REQUEST_EXAMPLE, ChatRequest
-
-
-def test_default_openapi_request_is_minimal_and_runnable() -> None:
-    assert CHAT_REQUEST_EXAMPLE == {"message": "Continue the analysis"}
-    parsed = ChatRequest.model_validate(CHAT_REQUEST_EXAMPLE)
-    assert parsed.message == "Continue the analysis"
-    assert parsed.conversation_id is None
-    assert parsed.run_id is None
-    assert ChatRequest.model_json_schema()["examples"] == [CHAT_REQUEST_EXAMPLE]
+from app.factory import create_app
+from app.schemas.chat import ChatRequest, build_chat_request_openapi_examples
+from app.settings import Settings
 
 
-def test_complete_request_contract_is_stored_separately() -> None:
-    path = Path("docs/example_request/chat-complete.json")
-    complete = json.loads(path.read_text(encoding="utf-8"))
-    assert set(complete) == {
-        "message",
-        "thread_id",
-        "conversation_id",
-        "run_id",
-        "resume",
-        "resume_token",
-        "system_prompt",
-        "metadata",
+def _settings() -> Settings:
+    return Settings(
+        _env_file=None,
+        llm_backend="echo",
+        mcp_enabled=False,
+        ollama_required=False,
+        mcp_required=False,
+        persistence_required=False,
+        artifact_storage_required=False,
+        final_verification_enabled=False,
+        state_backend="memory",
+        checkpoint_backend="memory",
+        artifact_backend="disabled",
+        resume_token_secret="test-secret",
+    )
+
+
+def test_chat_request_defaults_are_defined_by_the_model() -> None:
+    request = ChatRequest(message="Continue the analysis")
+
+    assert request.model_dump(mode="json") == {
+        "message": "Continue the analysis",
+        "thread_id": None,
+        "conversation_id": None,
+        "run_id": None,
+        "resume": False,
+        "resume_token": None,
+        "system_prompt": None,
+        "metadata": {},
     }
-    parsed = ChatRequest.model_validate(complete)
-    assert parsed.message == "Continue the analysis"
+
+
+def test_openapi_uses_the_in_memory_request_example(
+    in_memory_chat_request_example: dict[str, Any],
+) -> None:
+    schema = create_app(settings=_settings()).openapi()
+
+    for path in ("/api/chat", "/api/chat/stream"):
+        examples = schema["paths"][path]["post"]["requestBody"]["content"][
+            "application/json"
+        ]["examples"]
+        assert examples["default"]["value"] == in_memory_chat_request_example
+
+
+def test_openapi_example_builder_returns_a_defensive_copy() -> None:
+    source = {
+        "message": "example",
+        "metadata": {"source": "in-memory"},
+    }
+
+    examples = build_chat_request_openapi_examples(source)
+    examples["default"]["value"]["metadata"]["source"] = "mutated"
+
+    assert source["metadata"]["source"] == "in-memory"

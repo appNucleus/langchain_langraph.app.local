@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from copy import deepcopy
 from typing import Annotated, Any
 
-from fastapi import Body, Depends, FastAPI, Header, HTTPException, Request, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -18,19 +18,15 @@ from app.observability.metrics import metrics
 from app.orchestration.chat_runtime import ChatRuntimeAgent
 from app.orchestration.run_identity import RequestIdentityError
 from app.schemas.chat import (
-    CHAT_REQUEST_OPENAPI_EXAMPLES,
     ChatRequest,
     ChatResponse,
+    build_chat_request_openapi_examples,
+    load_chat_request_example,
 )
 from app.services.inventory import InventoryService, build_inventory_payload
 from app.settings import Settings, get_settings
 
 logger = logging.getLogger(__name__)
-
-ChatRequestBody = Annotated[
-    ChatRequest,
-    Body(openapi_examples=CHAT_REQUEST_OPENAPI_EXAMPLES),
-]
 
 
 def create_app(
@@ -39,6 +35,9 @@ def create_app(
     chat_agent: ChatAgent | None = None,
 ) -> FastAPI:
     app_settings = settings or get_settings()
+    chat_request_openapi_examples = build_chat_request_openapi_examples(
+        load_chat_request_example()
+    )
     configure_logging(app_settings.log_level)
     agent = chat_agent or ChatRuntimeAgent(app_settings)
     inventory_service = getattr(agent, "inventory_service", None)
@@ -266,7 +265,7 @@ def create_app(
         response_model=ChatResponse,
         dependencies=[Depends(require_api_key)],
     )
-    async def chat(request: Request, chat_request: ChatRequestBody) -> ChatResponse:
+    async def chat(request: Request, chat_request: ChatRequest) -> ChatResponse:
         current_agent: ChatAgent = request.app.state.chat_agent
         metrics.inc("api.chat.requests")
         try:
@@ -281,7 +280,7 @@ def create_app(
     @app.post("/api/chat/stream", dependencies=[Depends(require_api_key)])
     async def chat_stream(
         request: Request,
-        chat_request: ChatRequestBody,
+        chat_request: ChatRequest,
     ) -> StreamingResponse:
         current_agent: ChatAgent = request.app.state.chat_agent
         metrics.inc("api.chat_stream.requests")
@@ -326,17 +325,17 @@ def create_app(
 
     generated_openapi = app.openapi
 
-    def openapi_with_complete_chat_examples() -> dict[str, Any]:
+    def openapi_with_chat_request_example() -> dict[str, Any]:
         schema = generated_openapi()
         for path in ("/api/chat", "/api/chat/stream"):
             operation = (schema.get("paths") or {}).get(path, {}).get("post", {})
             content = (operation.get("requestBody") or {}).get("content", {})
             json_body = content.get("application/json")
             if isinstance(json_body, dict):
-                json_body["examples"] = deepcopy(CHAT_REQUEST_OPENAPI_EXAMPLES)
+                json_body["examples"] = deepcopy(chat_request_openapi_examples)
         return schema
 
-    app.openapi = openapi_with_complete_chat_examples  # type: ignore[method-assign]
+    app.openapi = openapi_with_chat_request_example  # type: ignore[method-assign]
     return app
 
 

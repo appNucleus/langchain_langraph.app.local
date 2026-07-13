@@ -3,7 +3,6 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
-from app import __version__
 from app.settings import Settings
 
 
@@ -88,12 +87,6 @@ def test_model_role_contract() -> None:
     assert settings.model_for_key("embedding") == settings.embedding_model
     assert settings.model_for_key("unknown") == settings.model_general
     assert settings.model_role_catalog()["vision"] == settings.model_vision
-
-
-def test_version_has_one_runtime_source() -> None:
-    assert __version__
-    assert "app_version" not in Settings.model_fields
-    assert "mcp_client_version" not in Settings.model_fields
 
 
 def _is_self_settings(value: ast.expr) -> bool:

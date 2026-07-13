@@ -12,7 +12,7 @@ from app.orchestration.run_identity import (
     ResumeTokenInvalidError,
     RunIdentityService,
 )
-from app.schemas.chat import CHAT_REQUEST_EXAMPLE, ChatRequest
+from app.schemas.chat import ChatRequest
 from app.settings import Settings
 
 
@@ -110,20 +110,6 @@ def test_resume_token_rejects_changed_request_payload() -> None:
                 resume_token=token,
             )
         )
-
-
-def test_stored_swagger_example_contains_every_request_field() -> None:
-    assert ChatRequest.model_validate(CHAT_REQUEST_EXAMPLE).message == "Continue the analysis"
-    assert set(CHAT_REQUEST_EXAMPLE) == {
-        "message",
-        "thread_id",
-        "conversation_id",
-        "run_id",
-        "resume",
-        "resume_token",
-        "system_prompt",
-        "metadata",
-    }
 
 
 @pytest.mark.asyncio
