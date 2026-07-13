@@ -2,15 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import base64
-from collections import OrderedDict
 import hashlib
 import hmac
 import json
 import secrets
+from collections import OrderedDict
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from time import monotonic, time
-from typing import Any, AsyncIterator
+from typing import Any
 from uuid import UUID, uuid4
 
 from app.schemas.chat import ChatRequest, ChatResponse
@@ -27,39 +28,39 @@ _RESERVED_METADATA_KEYS = {
 }
 
 
-class Phase5RequestError(RuntimeError):
-    """Safe API-facing Phase 5 request error."""
+class RequestIdentityError(RuntimeError):
+    """Safe API-facing request identity error."""
 
     status_code = 400
-    error_code = "phase5_request_error"
+    error_code = "request_identity_error"
 
 
-class ConversationBusyError(Phase5RequestError):
+class ConversationBusyError(RequestIdentityError):
     status_code = 409
     error_code = "conversation_busy"
 
 
-class RunConflictError(Phase5RequestError):
+class RunConflictError(RequestIdentityError):
     status_code = 409
     error_code = "run_conflict"
 
 
-class ResumeTokenInvalidError(Phase5RequestError):
+class ResumeTokenInvalidError(RequestIdentityError):
     status_code = 401
     error_code = "invalid_resume_token"
 
 
-class ResumeTokenExpiredError(Phase5RequestError):
+class ResumeTokenExpiredError(RequestIdentityError):
     status_code = 410
     error_code = "resume_expired"
 
 
-class ResumeRunNotFoundError(Phase5RequestError):
+class ResumeRunNotFoundError(RequestIdentityError):
     status_code = 404
     error_code = "resumable_run_not_found"
 
 
-class IncompatibleRunStateError(Phase5RequestError):
+class IncompatibleRunStateError(RequestIdentityError):
     status_code = 409
     error_code = "incompatible_run_state"
 
@@ -72,7 +73,7 @@ class _RunRecord:
 
 
 class RunIdentityService:
-    """Normalize legacy IDs and issue argument-bound signed resume tokens."""
+    """Normalize request IDs and issue request-bound signed resume tokens."""
 
     def __init__(self, settings: Settings) -> None:
         configured_secret = str(settings.resume_token_secret or "").strip()
@@ -90,8 +91,6 @@ class RunIdentityService:
 
     @property
     def token_persistent(self) -> bool:
-        """Whether tokens survive process restart with the configured secret."""
-
         return self._persistent_secret
 
     def sanitized_metadata(self, request: ChatRequest) -> dict[str, Any]:
@@ -120,17 +119,14 @@ class RunIdentityService:
         if request.resume:
             return self._identity_from_token(request, request_hash=request_hash)
 
-        conversation_id = (
-            request.conversation_id or request.thread_id or str(uuid4())
-        )
+        conversation_id = request.conversation_id or request.thread_id or str(uuid4())
         supplied_run_id = bool(request.run_id)
         run_id = request.run_id or str(uuid4())
         self._validate_uuid(run_id, field_name="run_id")
-        execution_thread_id = f"{conversation_id}:{run_id}"
         return RunIdentity(
             conversation_id=conversation_id,
             run_id=run_id,
-            execution_thread_id=execution_thread_id,
+            execution_thread_id=f"{conversation_id}:{run_id}",
             checkpoint_namespace=self._checkpoint_namespace,
             state_schema_version=self._state_schema_version,
             request_hash=request_hash,
@@ -161,11 +157,7 @@ class RunIdentityService:
             ).encode("utf-8")
         )
         signature = self._b64encode(
-            hmac.new(
-                self._secret,
-                encoded_payload.encode("ascii"),
-                hashlib.sha256,
-            ).digest()
+            hmac.new(self._secret, encoded_payload.encode("ascii"), hashlib.sha256).digest()
         )
         return f"{encoded_payload}.{signature}"
 
@@ -175,17 +167,14 @@ class RunIdentityService:
         *,
         request_hash: str,
     ) -> RunIdentity:
-        token = str(request.resume_token or "")
-        payload = self._decode_token(token)
+        payload = self._decode_token(str(request.resume_token or ""))
         if int(payload.get("v", 0)) != 1:
             raise ResumeTokenInvalidError("Unsupported resume token version")
-
-        expires_at = int(payload.get("exp", 0) or 0)
-        if expires_at <= int(time()):
+        if int(payload.get("exp", 0) or 0) <= int(time()):
             raise ResumeTokenExpiredError("The resume token has expired")
 
-        token_schema_version = int(payload.get("state_schema_version", 0) or 0)
-        if token_schema_version != self._state_schema_version:
+        schema_version = int(payload.get("state_schema_version", 0) or 0)
+        if schema_version != self._state_schema_version:
             raise IncompatibleRunStateError(
                 "The resumable run uses an incompatible state schema version"
             )
@@ -233,7 +222,7 @@ class RunIdentityService:
             run_id=run_id,
             execution_thread_id=execution_thread_id,
             checkpoint_namespace=checkpoint_namespace,
-            state_schema_version=token_schema_version,
+            state_schema_version=schema_version,
             request_hash=request_hash,
             resume_requested=True,
             resumed=True,
@@ -283,8 +272,8 @@ class RunIdentityService:
         return base64.urlsafe_b64decode((value + padding).encode("ascii"))
 
 
-class LocalConversationGate:
-    """Reject overlapping turns for one conversation in this app process."""
+class ConversationGate:
+    """Reject overlapping turns for one conversation in this process."""
 
     def __init__(self) -> None:
         self._owners: dict[str, str] = {}
@@ -293,8 +282,7 @@ class LocalConversationGate:
     @asynccontextmanager
     async def hold(self, identity: RunIdentity) -> AsyncIterator[None]:
         async with self._lock:
-            owner = self._owners.get(identity.conversation_id)
-            if owner is not None:
+            if identity.conversation_id in self._owners:
                 raise ConversationBusyError(
                     "Another run is already active for this conversation"
                 )
@@ -307,8 +295,8 @@ class LocalConversationGate:
                     self._owners.pop(identity.conversation_id, None)
 
 
-class LocalRunRegistry:
-    """Bounded process-local idempotency cache pending the Phase 8 repository."""
+class RunRegistry:
+    """Bounded process-local idempotency registry."""
 
     def __init__(self, *, ttl_seconds: int, max_records: int) -> None:
         if ttl_seconds <= 0:
@@ -331,7 +319,7 @@ class LocalRunRegistry:
                 return None
             _, record = stored
             self._assert_same_request(record, identity)
-            self._touch(key, record)
+            self._store(key, record)
             if record.status == "completed" and record.response is not None:
                 return ChatResponse.model_validate(record.response)
             return None
@@ -354,18 +342,13 @@ class LocalRunRegistry:
                     )
             self._store(
                 key,
-                _RunRecord(
-                    request_hash=identity.request_hash,
-                    status="running",
-                ),
+                _RunRecord(request_hash=identity.request_hash, status="running"),
             )
 
     async def complete(self, identity: RunIdentity, response: ChatResponse) -> None:
-        key = (identity.conversation_id, identity.run_id)
         async with self._lock:
-            self._purge(monotonic())
             self._store(
-                key,
+                (identity.conversation_id, identity.run_id),
                 _RunRecord(
                     request_hash=identity.request_hash,
                     status="completed",
@@ -376,19 +359,12 @@ class LocalRunRegistry:
     async def interrupt(self, identity: RunIdentity) -> None:
         key = (identity.conversation_id, identity.run_id)
         async with self._lock:
-            self._purge(monotonic())
             stored = self._records.get(key)
-            if stored is None:
-                return
-            _, record = stored
-            if record.status == "completed":
+            if stored is None or stored[1].status == "completed":
                 return
             self._store(
                 key,
-                _RunRecord(
-                    request_hash=identity.request_hash,
-                    status="interrupted",
-                ),
+                _RunRecord(request_hash=identity.request_hash, status="interrupted"),
             )
 
     def _store(self, key: tuple[str, str], record: _RunRecord) -> None:
@@ -407,18 +383,13 @@ class LocalRunRegistry:
                 break
             self._records.pop(removable, None)
 
-    def _touch(self, key: tuple[str, str], record: _RunRecord) -> None:
-        self._records[key] = (monotonic(), record)
-        self._records.move_to_end(key)
-
     def _purge(self, now: float) -> None:
         cutoff = now - self._ttl_seconds
-        expired = [
+        for key in [
             key
             for key, (timestamp, record) in self._records.items()
             if timestamp < cutoff and record.status != "running"
-        ]
-        for key in expired:
+        ]:
             self._records.pop(key, None)
 
     @staticmethod
@@ -427,4 +398,3 @@ class LocalRunRegistry:
             raise RunConflictError(
                 "The supplied run_id is already bound to a different request payload"
             )
-

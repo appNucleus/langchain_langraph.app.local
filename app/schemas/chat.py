@@ -7,7 +7,6 @@ from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-
 _DEFAULT_CHAT_REQUEST_EXAMPLE: dict[str, Any] = {
     "message": "Continue the analysis",
     "thread_id": None,
@@ -21,13 +20,6 @@ _DEFAULT_CHAT_REQUEST_EXAMPLE: dict[str, Any] = {
 
 
 def _load_chat_request_example() -> dict[str, Any]:
-    """Load the Swagger request example from the repository docs directory.
-
-    The built-in fallback keeps imports and packaged deployments safe when the
-    optional documentation tree is unavailable. The Docker image copies the docs
-    directory, so the normal runtime source is the stored JSON file.
-    """
-
     example_path = (
         Path(__file__).resolve().parents[2]
         / "docs"
@@ -58,7 +50,7 @@ CHAT_REQUEST_OPENAPI_EXAMPLES = {
 
 
 class ChatRequest(BaseModel):
-    """Public chat request with backward-compatible Phase 5 run identity fields."""
+    """Public chat request with backward-compatible identity fields."""
 
     model_config = ConfigDict(json_schema_extra={"examples": [CHAT_REQUEST_EXAMPLE]})
 
@@ -112,8 +104,6 @@ class ChatRequest(BaseModel):
     )
     @classmethod
     def normalize_optional_text(cls, value: Any) -> Any:
-        """Treat omitted, null, and whitespace-only optional strings equivalently."""
-
         if value is None:
             return None
         if isinstance(value, str):

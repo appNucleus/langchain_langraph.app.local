@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from copy import deepcopy
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from copy import deepcopy
 from typing import Annotated, Any
 
 from fastapi import Body, Depends, FastAPI, Header, HTTPException, Request, status
@@ -15,8 +15,8 @@ from app import __version__
 from app.graph import ChatAgent, encode_sse
 from app.logging_config import configure_logging, log_kv
 from app.observability.metrics import metrics
-from app.orchestration.phase5_agent import Phase5ChatAgent
-from app.orchestration.run_identity import Phase5RequestError
+from app.orchestration.chat_runtime import ChatRuntimeAgent
+from app.orchestration.run_identity import RequestIdentityError
 from app.schemas.chat import (
     CHAT_REQUEST_OPENAPI_EXAMPLES,
     ChatRequest,
@@ -26,7 +26,6 @@ from app.services.inventory import InventoryService, build_inventory_payload
 from app.settings import Settings, get_settings
 
 logger = logging.getLogger(__name__)
-
 
 ChatRequestBody = Annotated[
     ChatRequest,
@@ -41,10 +40,7 @@ def create_app(
 ) -> FastAPI:
     app_settings = settings or get_settings()
     configure_logging(app_settings.log_level)
-    # Explicitly injected agents remain supported for deterministic tests and
-    # compatibility. Production/default construction uses the Phase 5 identity
-    # runtime while preserving the existing ChatAgent graph implementation.
-    agent = chat_agent or Phase5ChatAgent(app_settings)
+    agent = chat_agent or ChatRuntimeAgent(app_settings)
     inventory_service = getattr(agent, "inventory_service", None)
     if inventory_service is None:
         inventory_service = InventoryService(app_settings, agent.ollama, agent.mcp)
@@ -66,22 +62,6 @@ def create_app(
             start = getattr(agent, "start", None)
             if callable(start):
                 await start()
-        except Exception as exc:
-            metrics.inc("app.startup_dependency_error")
-            log_kv(
-                logger,
-                logging.ERROR,
-                "app_dependency_start_error",
-                error=_safe_error(
-                    exc,
-                    expose=app_settings.expose_internal_health_details,
-                ),
-            )
-            # ChatAgent handles optional dependencies by entering explicit
-            # degraded mode. Any exception that reaches the lifespan is therefore
-            # a required-dependency failure and must abort startup.
-            raise
-        try:
             yield
         finally:
             close = getattr(agent, "aclose", None)
@@ -93,7 +73,7 @@ def create_app(
         title=app_settings.app_name,
         version=__version__,
         description=(
-            "FastAPI + LangGraph local assistant with bounded agent execution, "
+            "FastAPI + LangGraph local assistant with bounded execution, "
             "durable checkpoints, Ollama model routing, and MCP tools."
         ),
         lifespan=lifespan,
@@ -116,8 +96,6 @@ def create_app(
         exc: Exception,
     ) -> JSONResponse:
         metrics.inc("api.unhandled_error")
-        # Keep the client response generic, but retain the complete traceback in
-        # container logs so deployment failures can be diagnosed from Actions.
         logger.error(
             "api_unhandled_error error=%r",
             exc,
@@ -162,90 +140,6 @@ def create_app(
             "version": __version__,
         }
 
-    @app.get("/health/ready")
-    async def ready_health(request: Request) -> JSONResponse:
-        current_agent: ChatAgent = request.app.state.chat_agent
-        current_settings: Settings = request.app.state.settings
-        current_inventory_service: InventoryService = request.app.state.inventory_service
-        payload: dict[str, Any] = {
-            "status": "ready",
-            "service": current_settings.app_name,
-            "version": __version__,
-            "dependencies": {},
-        }
-        ready = True
-
-        # Reuse the single-flight TTL inventory rather than forcing /api/tags and
-        # MCP health tool calls on every orchestrator probe. The first probe still
-        # validates both dependencies; later probes are cheap until the TTL expires.
-        live_inventory = await current_inventory_service.load()
-        if current_settings.llm_backend == "ollama":
-            ollama_error = live_inventory.errors.get("ollama")
-            ollama_ready = not ollama_error and bool(live_inventory.model_names)
-            payload["dependencies"]["ollama"] = {
-                "status": "available" if ollama_ready else "unavailable",
-                "model_count": len(live_inventory.model_names),
-                "cached": live_inventory.cached,
-                "error": (
-                    ollama_error
-                    if current_settings.expose_internal_health_details
-                    else ("Dependency unavailable." if ollama_error else None)
-                ),
-            }
-            if current_settings.ollama_required:
-                ready = ready and ollama_ready
-
-        if current_settings.mcp_enabled:
-            mcp_error = live_inventory.errors.get("mcp")
-            mcp_ready = not mcp_error
-            payload["dependencies"]["mcp"] = {
-                "status": "available" if mcp_ready else "unavailable",
-                "tool_count": len(live_inventory.tool_names),
-                "cached": live_inventory.cached,
-                "error": (
-                    mcp_error
-                    if current_settings.expose_internal_health_details
-                    else ("Dependency unavailable." if mcp_error else None)
-                ),
-            }
-            if current_settings.mcp_required:
-                ready = ready and mcp_ready
-
-        try:
-            persistence = await current_agent.persistence_health()
-            payload["dependencies"]["persistence"] = persistence
-            conversation_ok = (persistence.get("conversation") or {}).get("status") == "available"
-            checkpoint_ok = (persistence.get("checkpoint") or {}).get("status") == "available"
-            artifacts = persistence.get("artifacts") or {}
-            artifacts_ok = artifacts.get("status") in {"available", "disabled"}
-            if current_settings.persistence_required:
-                ready = ready and conversation_ok and checkpoint_ok
-            if current_settings.artifact_storage_required:
-                ready = ready and artifacts_ok
-        except Exception as exc:
-            if current_settings.persistence_required or current_settings.artifact_storage_required:
-                ready = False
-            payload["dependencies"]["persistence"] = {
-                "status": "unavailable",
-                "error": _safe_error(
-                    exc,
-                    expose=current_settings.expose_internal_health_details,
-                ),
-            }
-
-        startup_status = getattr(current_agent, "dependency_startup_status", None)
-        if callable(startup_status):
-            payload["startup"] = startup_status()
-
-        if not ready:
-            payload["status"] = "not_ready"
-        return JSONResponse(
-            status_code=(
-                status.HTTP_200_OK if ready else status.HTTP_503_SERVICE_UNAVAILABLE
-            ),
-            content=payload,
-        )
-
     @app.get("/health/live")
     async def live_health(request: Request) -> JSONResponse:
         current_settings: Settings = request.app.state.settings
@@ -258,14 +152,101 @@ def create_app(
             },
         )
 
+    @app.get("/health/ready")
+    async def ready_health(request: Request) -> JSONResponse:
+        current_agent: ChatAgent = request.app.state.chat_agent
+        current_settings: Settings = request.app.state.settings
+        service: InventoryService = request.app.state.inventory_service
+        payload: dict[str, Any] = {
+            "status": "ready",
+            "service": current_settings.app_name,
+            "version": __version__,
+            "dependencies": {},
+        }
+        ready = True
+        live_inventory = await service.load()
+
+        if current_settings.llm_backend == "ollama":
+            error = live_inventory.errors.get("ollama")
+            available = not error and bool(live_inventory.model_names)
+            payload["dependencies"]["ollama"] = {
+                "status": "available" if available else "unavailable",
+                "model_count": len(live_inventory.model_names),
+                "cached": live_inventory.cached,
+                "error": (
+                    error
+                    if current_settings.expose_internal_health_details
+                    else ("Dependency unavailable." if error else None)
+                ),
+            }
+            if current_settings.ollama_required:
+                ready = ready and available
+
+        if current_settings.mcp_enabled:
+            error = live_inventory.errors.get("mcp")
+            available = not error
+            payload["dependencies"]["mcp"] = {
+                "status": "available" if available else "unavailable",
+                "tool_count": len(live_inventory.tool_names),
+                "cached": live_inventory.cached,
+                "error": (
+                    error
+                    if current_settings.expose_internal_health_details
+                    else ("Dependency unavailable." if error else None)
+                ),
+            }
+            if current_settings.mcp_required:
+                ready = ready and available
+
+        try:
+            persistence = await current_agent.persistence_health()
+            payload["dependencies"]["persistence"] = persistence
+            conversation_ok = (
+                (persistence.get("conversation") or {}).get("status") == "available"
+            )
+            checkpoint_ok = (
+                (persistence.get("checkpoint") or {}).get("status") == "available"
+            )
+            artifacts_ok = (persistence.get("artifacts") or {}).get("status") in {
+                "available",
+                "disabled",
+            }
+            if current_settings.persistence_required:
+                ready = ready and conversation_ok and checkpoint_ok
+            if current_settings.artifact_storage_required:
+                ready = ready and artifacts_ok
+        except Exception as exc:
+            if (
+                current_settings.persistence_required
+                or current_settings.artifact_storage_required
+            ):
+                ready = False
+            payload["dependencies"]["persistence"] = {
+                "status": "unavailable",
+                "error": _safe_error(
+                    exc,
+                    expose=current_settings.expose_internal_health_details,
+                ),
+            }
+
+        startup_status = getattr(current_agent, "dependency_startup_status", None)
+        if callable(startup_status):
+            payload["startup"] = startup_status()
+        if not ready:
+            payload["status"] = "not_ready"
+        return JSONResponse(
+            status_code=(
+                status.HTTP_200_OK if ready else status.HTTP_503_SERVICE_UNAVAILABLE
+            ),
+            content=payload,
+        )
+
     @app.get("/api/inventory", dependencies=[Depends(require_api_key)])
     async def inventory(request: Request) -> dict[str, object]:
         current_agent: ChatAgent = request.app.state.chat_agent
         current_settings: Settings = request.app.state.settings
-        current_inventory_service: InventoryService = (
-            request.app.state.inventory_service
-        )
-        live_inventory = await current_inventory_service.load()
+        service: InventoryService = request.app.state.inventory_service
+        live_inventory = await service.load()
         return build_inventory_payload(
             current_settings,
             live_inventory,
@@ -290,9 +271,9 @@ def create_app(
         metrics.inc("api.chat.requests")
         try:
             return await current_agent.ainvoke(chat_request)
-        except Phase5RequestError as exc:
+        except RequestIdentityError as exc:
             metrics.inc(f"api.chat.{exc.error_code}")
-            raise _phase5_http_exception(exc) from exc
+            raise _request_error_to_http_exception(exc) from exc
         except asyncio.CancelledError:
             metrics.inc("api.chat.cancelled")
             raise
@@ -312,7 +293,7 @@ def create_app(
                         metrics.inc("api.chat_stream.disconnected")
                         break
                     yield encode_sse(str(item["event"]), item["data"])
-            except Phase5RequestError as exc:
+            except RequestIdentityError as exc:
                 metrics.inc(f"api.chat_stream.{exc.error_code}")
                 yield encode_sse(
                     "error",
@@ -327,14 +308,10 @@ def create_app(
                 raise
             except Exception as exc:
                 metrics.inc("api.chat_stream.error")
+                logger.exception("chat_stream_error")
                 yield encode_sse(
                     "error",
-                    {
-                        "message": _safe_error(
-                            exc,
-                            expose=app_settings.expose_internal_health_details,
-                        )
-                    },
+                    {"message": _safe_error(exc, expose=False)},
                 )
 
         return StreamingResponse(
@@ -347,10 +324,6 @@ def create_app(
             },
         )
 
-    # FastAPI's normal OpenAPI encoder may omit example keys whose values are
-    # null. Re-inject the source-controlled example after schema generation so
-    # Swagger's Edit Value panel shows every supported request field exactly as
-    # stored in docs/example_request/chat.json.
     generated_openapi = app.openapi
 
     def openapi_with_complete_chat_examples() -> dict[str, Any]:
@@ -367,7 +340,7 @@ def create_app(
     return app
 
 
-def _phase5_http_exception(exc: Phase5RequestError) -> HTTPException:
+def _request_error_to_http_exception(exc: RequestIdentityError) -> HTTPException:
     return HTTPException(
         status_code=exc.status_code,
         detail={"code": exc.error_code, "message": str(exc)},

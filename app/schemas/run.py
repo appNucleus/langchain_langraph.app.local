@@ -6,7 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class RunIdentity(BaseModel):
-    """Normalized server-authoritative identity for one graph execution."""
+    """Server-authoritative identity for one graph execution."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -21,18 +21,7 @@ class RunIdentity(BaseModel):
     client_supplied_run_id: bool = False
 
     def langgraph_config(self) -> dict[str, Any]:
-        """Return a PostgreSQL-safe root-graph configuration.
-
-        LangGraph reserves ``checkpoint_ns`` for nested graph namespaces and
-        normalizes a non-empty namespace back to the root namespace for a
-        top-level invocation. The unique execution thread already isolates one
-        run from every other run, so the root namespace must remain empty.
-
-        ``run_id`` is intentionally stored as JSON-safe string metadata rather
-        than as a top-level UUID object. PostgreSQL checkpointers persist
-        checkpoint metadata as JSONB, and keeping every value primitive avoids
-        serialization failures after a model node completes.
-        """
+        """Return a JSON-safe root-graph configuration."""
 
         return {
             "configurable": {

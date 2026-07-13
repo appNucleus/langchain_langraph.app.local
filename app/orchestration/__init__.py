@@ -1,1 +1,1 @@
-"""Phase 5 orchestration services."""
+"""Application orchestration services."""
