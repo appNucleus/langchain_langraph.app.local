@@ -10,6 +10,7 @@ from uuid import uuid4
 from langgraph.graph import END, START, StateGraph
 
 from app.agents.base import StructuredOutputError
+from app.agents.final_verifier import FinalVerifierAgent
 from app.agents.planner import PlannerAgent
 from app.agents.prompts import PLANNER_PROMPT
 from app.agents.synthesizer import SynthesizerAgent
@@ -25,13 +26,14 @@ from app.observability.metrics import metrics
 from app.observability.tracing import span
 from app.schemas.chat import ChatRequest, ChatResponse
 from app.schemas.evidence import EvidenceItem
+from app.schemas.finalization import FinalVerificationReport
 from app.schemas.execution import BudgetExceeded, ExecutionBudget
 from app.schemas.planning import ExecutionPlan, PlanTask
 from app.schemas.verification import VerificationIssue, VerificationReport
 from app.schemas.worker import WorkerResult
 from app.services.answer_quality import deterministic_output_issues
 from app.services.context_builder import build_context, context_character_count
-from app.services.evidence import evidence_from_metadata
+from app.services.evidence import evidence_from_metadata, retrieved_evidence
 from app.services.inventory import InventoryService, RuntimeInventory, normalize_inventory
 from app.services.routing import (
     RuntimeRouter,
@@ -40,7 +42,11 @@ from app.services.routing import (
 )
 from app.settings import Settings
 from app.state import StateRuntime
-from app.tools.executor import ToolApprovalRequired, ToolExecutor
+from app.tools.executor import (
+    ToolApprovalRequired,
+    ToolExecutionDenied,
+    ToolExecutor,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -67,15 +73,62 @@ class ChatAgent:
         self.state_runtime = StateRuntime(settings)
         self.memory = self.state_runtime.conversations
         self.graph = self._build_graph(self.state_runtime.checkpointer)
+        self.startup_dependencies: dict[str, dict[str, object]] = {}
 
     async def start(self) -> None:
-        await self.state_runtime.start()
+        self.startup_dependencies = {}
+        try:
+            await self.state_runtime.start()
+            self.startup_dependencies["persistence"] = {"status": "available"}
+        except Exception as exc:
+            required = bool(
+                self.settings.persistence_required
+                or (
+                    self.settings.artifact_backend == "minio"
+                    and self.settings.artifact_storage_required
+                )
+            )
+            self.startup_dependencies["persistence"] = {
+                "status": "unavailable",
+                "required": required,
+                "error": f"{type(exc).__name__}: {str(exc).strip()}",
+            }
+            if required:
+                raise
+            await self.state_runtime.use_memory_fallback(str(exc))
+            self.startup_dependencies["persistence"]["status"] = "degraded"
+
         self.memory = self.state_runtime.conversations
         self.graph = self._build_graph(self.state_runtime.checkpointer)
+
         if self.settings.llm_backend == "ollama":
-            await self.ollama.start()
+            try:
+                await self.ollama.start()
+                self.startup_dependencies["ollama"] = {"status": "available"}
+            except Exception as exc:
+                self.startup_dependencies["ollama"] = {
+                    "status": "unavailable",
+                    "required": self.settings.ollama_required,
+                    "error": f"{type(exc).__name__}: {str(exc).strip()}",
+                }
+                if self.settings.ollama_required:
+                    raise
+
         if self.settings.mcp_enabled:
-            await self.mcp.start()
+            try:
+                await self.mcp.start()
+                self.startup_dependencies["mcp"] = {"status": "available"}
+            except Exception as exc:
+                self.startup_dependencies["mcp"] = {
+                    "status": "unavailable",
+                    "required": self.settings.mcp_required,
+                    "error": f"{type(exc).__name__}: {str(exc).strip()}",
+                }
+                if self.settings.mcp_required:
+                    raise
+
+    def dependency_startup_status(self) -> dict[str, dict[str, object]]:
+        return {key: dict(value) for key, value in self.startup_dependencies.items()}
 
     async def aclose(self) -> None:
         await asyncio.gather(
@@ -101,6 +154,8 @@ class ChatAgent:
         builder.add_node("replan", self._replan)
         builder.add_node("advance", self._advance)
         builder.add_node("finalize", self._finalize)
+        builder.add_node("verify_final", self._verify_final)
+        builder.add_node("revise_final", self._revise_final)
         builder.add_node("terminate", self._terminate)
 
         builder.add_edge(START, "plan")
@@ -145,7 +200,17 @@ class ChatAgent:
             after_advance,
             {"worker": "worker", "research": "research", "finalize": "finalize"},
         )
-        builder.add_edge("finalize", END)
+        builder.add_conditional_edges(
+            "finalize",
+            self._after_finalize,
+            {"complete": END, "verify_final": "verify_final", "terminate": "terminate"},
+        )
+        builder.add_conditional_edges(
+            "verify_final",
+            self._after_final_verification,
+            {"complete": END, "revise_final": "revise_final", "terminate": "terminate"},
+        )
+        builder.add_edge("revise_final", "verify_final")
         builder.add_edge("terminate", END)
         return builder.compile(checkpointer=checkpointer)
 
@@ -387,6 +452,15 @@ class ChatAgent:
         return raw[:max_chars] + "…[tool result truncated]", True, original_chars
 
     @staticmethod
+    def _evidence_provenance(state: AgentGraphState) -> list[dict[str, object]]:
+        records: list[dict[str, object]] = []
+        for item in ChatAgent._state_evidence(state):
+            record = item.prompt_record(content="")
+            record.pop("content", None)
+            records.append(record)
+        return records
+
+    @staticmethod
     def _partial_response(state: AgentGraphState) -> str:
         reason = str(state.get("termination_reason") or "execution stopped")
         sections: list[str] = []
@@ -398,6 +472,12 @@ class ChatAgent:
             answer = str(worker_result.get("answer") or "").strip()
             if answer:
                 sections.append(f"Completed task {index}:\n{answer}")
+
+        candidate_final = str(state.get("response") or "").strip()
+        if candidate_final:
+            sections.append(
+                "Candidate final answer (not fully verified):\n" + candidate_final
+            )
 
         current = state.get("worker_result") or {}
         current_answer = str(current.get("answer") or "").strip()
@@ -887,7 +967,7 @@ class ChatAgent:
                         budget=self._budget(state),
                         metadata=metadata,
                     )
-                except ToolApprovalRequired as exc:
+                except (ToolApprovalRequired, ToolExecutionDenied) as exc:
                     failures.append(
                         {
                             "query_fingerprint": query_fingerprint,
@@ -939,10 +1019,15 @@ class ChatAgent:
                 )
                 evidence_id = f"research-{task_id}-{rounds}-{query_index}"
                 evidence.append(
-                    EvidenceItem(
-                        id=evidence_id,
-                        source=candidate.name,
+                    retrieved_evidence(
+                        evidence_id=evidence_id,
+                        tool_name=candidate.name,
+                        raw_value=result.data,
+                        run_id=str((state.get("metadata") or {}).get("run_id") or state.get("request_id") or ""),
+                        task_id=task_id,
+                        query_id=query_fingerprint,
                         content=content,
+                        truncated=truncated,
                         metadata={
                             "task_id": task_id,
                             "retrieved_at": retrieved_at,
@@ -1134,6 +1219,7 @@ class ChatAgent:
                 "verification": state["verification"],
                 "model": (state.get("selected_models") or {}).get("worker"),
                 "tool": state.get("selected_tool"),
+                "evidence_provenance": self._evidence_provenance(state),
             }
         )
         updated: AgentGraphState = {
@@ -1160,6 +1246,22 @@ class ChatAgent:
         )
         return updated
 
+    @staticmethod
+    def _after_finalize(state: AgentGraphState) -> str:
+        if state.get("termination_reason"):
+            return "terminate"
+        return "verify_final" if state.get("final_verification_required") else "complete"
+
+    def _after_final_verification(self, state: AgentGraphState) -> str:
+        if state.get("termination_reason"):
+            return "terminate"
+        report = state.get("final_verification") or {}
+        if report.get("verdict") == "pass" and report.get("answer_complete") is True:
+            return "complete"
+        if int(state.get("final_revision_rounds", 0)) < self.settings.final_max_revision_rounds:
+            return "revise_final"
+        return "terminate"
+
     async def _finalize(self, state: AgentGraphState) -> AgentGraphState:
         self._log_node(logging.INFO, "graph_node_start", node="finalize", state=state)
         results = state.get("task_results", [])
@@ -1167,28 +1269,29 @@ class ChatAgent:
             return await self._terminate(state)
 
         final_model = str(state.get("model") or self.settings.model_general)
+        verification_required = False
         if self.settings.llm_backend == "ollama" and len(results) > 1:
             budget = self._budget(state)
             final_model = self._select_model(
-                state,
-                node="finalize",
-                role="synthesis",
-                reason="multi-task synthesis",
+                state, node="finalize", role="synthesis", reason="multi-task synthesis"
             )
             budget.model_calls += 1
             _, terminated = self._check_budget(state, node="finalize:model_call")
             if terminated:
                 return await self._terminate(terminated)
-            response = await SynthesizerAgent(
-                self.settings, final_model
-            ).synthesize(
-                {
-                    "user_request": state["message"],
-                    "system_instruction": state.get("system_prompt"),
-                    "execution_context": self.router.execution_context(),
-                    "verified_results": results,
-                }
-            )
+            try:
+                response = await SynthesizerAgent(self.settings, final_model).synthesize(
+                    {
+                        "user_request": state["message"],
+                        "system_instruction": state.get("system_prompt"),
+                        "execution_context": self.router.execution_context(),
+                        "verified_results": results,
+                    }
+                )
+            except Exception as exc:
+                updated = {**state, "termination_reason": f"final synthesis failed: {type(exc).__name__}"}
+                return await self._terminate(updated)
+            verification_required = bool(self.settings.final_verification_enabled)
         else:
             response = (
                 results[-1]["worker_result"]["answer"]
@@ -1201,6 +1304,9 @@ class ChatAgent:
             "response": response,
             "backend": self.settings.llm_backend,
             "model": final_model,
+            "final_verification_required": verification_required,
+            "final_verification": {},
+            "final_revision_rounds": 0,
             "selected_models": self._with_selected_model(
                 state, node="finalize", model=final_model
             ),
@@ -1212,6 +1318,123 @@ class ChatAgent:
             state=updated,
             response_chars=len(response),
             completed_tasks=len(results),
+            final_verification_required=verification_required,
+        )
+        return updated
+
+    async def _verify_final(self, state: AgentGraphState) -> AgentGraphState:
+        self._log_node(logging.INFO, "graph_node_start", node="verify_final", state=state)
+        budget, terminated = self._check_budget(state, node="verify_final:precheck")
+        if terminated:
+            return terminated
+
+        verifier_model = self._select_model(
+            state,
+            node="verify_final",
+            role="reasoning",
+            reason="independent verification of synthesized final answer",
+        )
+        budget.model_calls += 1
+        _, terminated = self._check_budget(state, node="verify_final:model_call")
+        if terminated:
+            return terminated
+
+        try:
+            report = await FinalVerifierAgent(self.settings, verifier_model).verify_final(
+                {
+                    "user_request": state["message"],
+                    "system_instruction": state.get("system_prompt"),
+                    "verified_results": state.get("task_results", []),
+                    "candidate_final_answer": state.get("response", ""),
+                    "verification_rules": [
+                        "Do not allow new facts absent from verified task results.",
+                        "Preserve evidence references, uncertainty, and unresolved limitations.",
+                        "Require every requested part to be represented.",
+                    ],
+                }
+            )
+        except StructuredOutputError as exc:
+            return self._model_output_termination(state, node="verify_final", exc=exc)
+
+        updated: AgentGraphState = {
+            **state,
+            "final_verification": report.model_dump(),
+            "selected_models": self._with_selected_model(
+                state, node="verify_final", model=verifier_model
+            ),
+        }
+        if (
+            report.verdict != "pass"
+            and int(state.get("final_revision_rounds", 0)) >= self.settings.final_max_revision_rounds
+        ):
+            updated["termination_reason"] = "final answer could not be independently verified"
+        self._log_node(
+            logging.INFO,
+            "graph_final_verification_result",
+            node="verify_final",
+            state=updated,
+            verdict=report.verdict,
+            answer_complete=report.answer_complete,
+            issue_count=len(report.issues),
+            required_action_count=len(report.required_actions),
+            confidence=report.confidence,
+        )
+        return updated
+
+    async def _revise_final(self, state: AgentGraphState) -> AgentGraphState:
+        rounds = int(state.get("final_revision_rounds", 0)) + 1
+        self._log_node(
+            logging.INFO,
+            "graph_node_start",
+            node="revise_final",
+            state=state,
+            final_revision_round=rounds,
+        )
+        budget, terminated = self._check_budget(state, node="revise_final:precheck")
+        if terminated:
+            return terminated
+
+        model = self._select_model(
+            state, node="revise_final", role="synthesis", reason="final answer revision"
+        )
+        budget.model_calls += 1
+        _, terminated = self._check_budget(state, node="revise_final:model_call")
+        if terminated:
+            return terminated
+        try:
+            response = await SynthesizerAgent(self.settings, model).synthesize(
+                {
+                    "user_request": state["message"],
+                    "system_instruction": state.get("system_prompt"),
+                    "verified_results": state.get("task_results", []),
+                    "previous_answer": state.get("response", ""),
+                    "final_verification": state.get("final_verification", {}),
+                    "instruction": "Revise only as required; do not introduce new facts.",
+                }
+            )
+        except Exception as exc:
+            return {
+                **state,
+                "termination_reason": f"final answer revision failed: {type(exc).__name__}",
+                "final_revision_rounds": rounds,
+            }
+
+        updated: AgentGraphState = {
+            **state,
+            "response": response,
+            "final_revision_rounds": rounds,
+            "final_verification": {},
+            "selected_models": self._with_selected_model(
+                state, node="revise_final", model=model
+            ),
+        }
+        self._log_node(
+            logging.INFO,
+            "graph_node_complete",
+            node="revise_final",
+            state=updated,
+            response_chars=len(response),
+            final_revision_round=rounds,
         )
         return updated
 
@@ -1412,6 +1635,8 @@ class ChatAgent:
                 },
                 "plan": result.get("plan"),
                 "verification": result.get("task_results"),
+                "final_verification": result.get("final_verification"),
+                "final_revision_rounds": result.get("final_revision_rounds", 0),
                 "iterations": result.get("iterations"),
                 "termination_reason": result.get("termination_reason"),
                 "routing": result.get("routing"),

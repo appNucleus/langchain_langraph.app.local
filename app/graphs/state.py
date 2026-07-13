@@ -37,3 +37,6 @@ class AgentGraphState(TypedDict, total=False):
     backend: str
     model: str | None
     termination_reason: str | None
+    final_verification_required: bool
+    final_verification: dict[str, Any]
+    final_revision_rounds: int
