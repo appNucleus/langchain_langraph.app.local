@@ -28,6 +28,15 @@ class Settings(BaseSettings):
         "Be honest about uncertainty and missing tools."
     )
 
+    # Phase 5 run identity. A configured token secret makes resume tokens valid
+    # across process restarts. When empty, API_KEY is used; when both are empty,
+    # a process-local random secret keeps default local operation safe.
+    resume_token_secret: str = ""
+    resume_token_ttl_seconds: int = Field(default=3600, ge=60, le=604800)
+    run_checkpoint_namespace: str = Field(default="phase5-v1", min_length=1, max_length=100)
+    run_state_schema_version: int = Field(default=1, ge=1, le=1000)
+    same_conversation_policy: Literal["reject"] = "reject"
+
     # LLM / Ollama
     llm_backend: Literal["echo", "ollama"] = "echo"
     ollama_base_url: str = "http://host.docker.internal:11434"

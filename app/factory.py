@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from copy import deepcopy
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Annotated, Any
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
+from fastapi import Body, Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -14,11 +15,23 @@ from app import __version__
 from app.graph import ChatAgent, encode_sse
 from app.logging_config import configure_logging, log_kv
 from app.observability.metrics import metrics
-from app.schemas.chat import ChatRequest, ChatResponse
+from app.orchestration.phase5_agent import Phase5ChatAgent
+from app.orchestration.run_identity import Phase5RequestError
+from app.schemas.chat import (
+    CHAT_REQUEST_OPENAPI_EXAMPLES,
+    ChatRequest,
+    ChatResponse,
+)
 from app.services.inventory import InventoryService, build_inventory_payload
 from app.settings import Settings, get_settings
 
 logger = logging.getLogger(__name__)
+
+
+ChatRequestBody = Annotated[
+    ChatRequest,
+    Body(openapi_examples=CHAT_REQUEST_OPENAPI_EXAMPLES),
+]
 
 
 def create_app(
@@ -28,7 +41,10 @@ def create_app(
 ) -> FastAPI:
     app_settings = settings or get_settings()
     configure_logging(app_settings.log_level)
-    agent = chat_agent or ChatAgent(app_settings)
+    # Explicitly injected agents remain supported for deterministic tests and
+    # compatibility. Production/default construction uses the Phase 5 identity
+    # runtime while preserving the existing ChatAgent graph implementation.
+    agent = chat_agent or Phase5ChatAgent(app_settings)
     inventory_service = getattr(agent, "inventory_service", None)
     if inventory_service is None:
         inventory_service = InventoryService(app_settings, agent.ollama, agent.mcp)
@@ -263,11 +279,14 @@ def create_app(
         response_model=ChatResponse,
         dependencies=[Depends(require_api_key)],
     )
-    async def chat(request: Request, chat_request: ChatRequest) -> ChatResponse:
+    async def chat(request: Request, chat_request: ChatRequestBody) -> ChatResponse:
         current_agent: ChatAgent = request.app.state.chat_agent
         metrics.inc("api.chat.requests")
         try:
             return await current_agent.ainvoke(chat_request)
+        except Phase5RequestError as exc:
+            metrics.inc(f"api.chat.{exc.error_code}")
+            raise _phase5_http_exception(exc) from exc
         except asyncio.CancelledError:
             metrics.inc("api.chat.cancelled")
             raise
@@ -275,7 +294,7 @@ def create_app(
     @app.post("/api/chat/stream", dependencies=[Depends(require_api_key)])
     async def chat_stream(
         request: Request,
-        chat_request: ChatRequest,
+        chat_request: ChatRequestBody,
     ) -> StreamingResponse:
         current_agent: ChatAgent = request.app.state.chat_agent
         metrics.inc("api.chat_stream.requests")
@@ -287,6 +306,16 @@ def create_app(
                         metrics.inc("api.chat_stream.disconnected")
                         break
                     yield encode_sse(str(item["event"]), item["data"])
+            except Phase5RequestError as exc:
+                metrics.inc(f"api.chat_stream.{exc.error_code}")
+                yield encode_sse(
+                    "error",
+                    {
+                        "code": exc.error_code,
+                        "status_code": exc.status_code,
+                        "message": str(exc),
+                    },
+                )
             except asyncio.CancelledError:
                 metrics.inc("api.chat_stream.cancelled")
                 raise
@@ -312,7 +341,31 @@ def create_app(
             },
         )
 
+    # FastAPI's normal OpenAPI encoder may omit example keys whose values are
+    # null. Re-inject the source-controlled example after schema generation so
+    # Swagger's Edit Value panel shows every supported request field exactly as
+    # stored in docs/example_request/chat.json.
+    generated_openapi = app.openapi
+
+    def openapi_with_complete_chat_examples() -> dict[str, Any]:
+        schema = generated_openapi()
+        for path in ("/api/chat", "/api/chat/stream"):
+            operation = (schema.get("paths") or {}).get(path, {}).get("post", {})
+            content = (operation.get("requestBody") or {}).get("content", {})
+            json_body = content.get("application/json")
+            if isinstance(json_body, dict):
+                json_body["examples"] = deepcopy(CHAT_REQUEST_OPENAPI_EXAMPLES)
+        return schema
+
+    app.openapi = openapi_with_complete_chat_examples  # type: ignore[method-assign]
     return app
+
+
+def _phase5_http_exception(exc: Phase5RequestError) -> HTTPException:
+    return HTTPException(
+        status_code=exc.status_code,
+        detail={"code": exc.error_code, "message": str(exc)},
+    )
 
 
 def _safe_error(exc: BaseException, *, expose: bool) -> str:

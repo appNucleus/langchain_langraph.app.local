@@ -15,6 +15,14 @@ class AgentGraphState(TypedDict, total=False):
     execution_budget: ExecutionBudget
     request_id: str
 
+    # Phase 5: conversation continuity is separate from checkpointed execution.
+    conversation_id: str
+    run_id: str
+    execution_thread_id: str
+    state_schema_version: int
+    resume_requested: bool
+    resumed: bool
+
     inventory: dict[str, Any]
     routing: dict[str, Any]
     selected_models: dict[str, str]
