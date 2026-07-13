@@ -9,7 +9,6 @@ from app.settings import Settings
 
 def test_phase3_runtime_settings_are_available() -> None:
     settings = Settings(_env_file=None)
-
     required = {
         "ollama_max_concurrency",
         "ollama_heavy_max_concurrency",
@@ -29,7 +28,6 @@ def test_phase3_runtime_settings_are_available() -> None:
 
 def test_model_role_contract() -> None:
     settings = Settings(_env_file=None)
-
     assert settings.model_for_key("planner") == settings.model_planner
     assert settings.model_for_key("embedding") == settings.embedding_model
     assert settings.model_for_key("unknown") == settings.model_general
@@ -37,15 +35,27 @@ def test_model_role_contract() -> None:
 
 
 def test_version_has_one_runtime_source() -> None:
-    settings = Settings(_env_file=None)
-
     assert __version__
     assert "app_version" not in Settings.model_fields
     assert "mcp_client_version" not in Settings.model_fields
 
 
-def test_all_direct_settings_attributes_exist() -> None:
-    """Catch phase-to-phase Settings contract drift before image deployment."""
+def _is_self_settings(value: ast.expr) -> bool:
+    return (
+        isinstance(value, ast.Attribute)
+        and value.attr == "settings"
+        and isinstance(value.value, ast.Name)
+        and value.value.id == "self"
+    )
+
+
+def test_direct_self_settings_attributes_exist() -> None:
+    """Check unambiguous ``self.settings.<field>`` references only.
+
+    The former scanner treated generic local variables named ``current`` or
+    ``settings`` as the application Settings model, producing false positives
+    for dictionary ``.get`` calls and unrelated decomposition dataclasses.
+    """
 
     settings = Settings(_env_file=None)
     missing: set[str] = set()
@@ -55,18 +65,10 @@ def test_all_direct_settings_attributes_exist() -> None:
         for node in ast.walk(tree):
             if not isinstance(node, ast.Attribute):
                 continue
-            if isinstance(node.value, ast.Name) and node.value.id in {
-                "settings",
-                "app_settings",
-                "current",
-                "current_settings",
-                "self.settings",
-            }:
-                # self.settings is represented as a nested Attribute, so the
-                # direct Name cases are checked here; explicit high-risk
-                # contracts are covered by the first test.
-                if not hasattr(settings, node.attr):
-                    missing.add(f"{path}:{node.attr}")
+            if not _is_self_settings(node.value):
+                continue
+            if not hasattr(settings, node.attr):
+                missing.add(f"{path}:{node.attr}")
 
     assert not missing, "Unknown Settings attributes found:\n" + "\n".join(
         sorted(missing)
