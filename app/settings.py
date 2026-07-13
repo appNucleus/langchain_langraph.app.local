@@ -84,6 +84,11 @@ class Settings(BaseSettings):
     mcp_protocol_version: str = "2025-06-18"
     mcp_client_name: str = "langchain-langraph-app"
 
+    # Dependency startup policy. Optional dependencies start in degraded mode;
+    # required dependencies fail application startup.
+    ollama_required: bool = True
+    mcp_required: bool = False
+
     # Shared capability inventory cache
     inventory_cache_ttl_seconds: int = Field(default=60, ge=1, le=3600)
     inventory_stale_if_error_seconds: int = Field(default=300, ge=0, le=86400)
@@ -127,6 +132,12 @@ class Settings(BaseSettings):
     minio_bucket: str = "langchain-langraph-app"
     minio_secure: bool = False
     persistence_required: bool = False
+    artifact_storage_required: bool = False
+    persistence_health_timeout_seconds: float = Field(default=5.0, gt=0, le=60)
+
+    # Final-answer verification after multi-task synthesis.
+    final_verification_enabled: bool = True
+    final_max_revision_rounds: int = Field(default=1, ge=0, le=3)
 
     @property
     def cors_origins(self) -> list[str]:

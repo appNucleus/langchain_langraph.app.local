@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 from contextlib import AbstractAsyncContextManager
 from typing import Any
 
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 
+from app.logging_config import log_kv
 from app.settings import Settings
 from app.state.base import ConversationStore
 from app.state.in_memory import BoundedInMemoryStore
@@ -13,77 +16,87 @@ from app.state.minio import MinioArtifactStore
 from app.state.postgres import PostgresConversationStore
 from app.state.redis import RedisConversationStore
 
+logger = logging.getLogger(__name__)
+
 
 def _checkpoint_serializer() -> JsonPlusSerializer:
-    """Create the checkpoint serializer used by every state backend.
-
-    The Docker image enables ``LANGGRAPH_STRICT_MSGPACK=true``. The graph state
-    intentionally contains one application-defined dataclass,
-    ``ExecutionBudget``. Strict MsgPack deserialization blocks custom classes
-    unless they are explicitly allowlisted, so keep the allowlist narrow and
-    identical for memory and PostgreSQL checkpointers.
-    """
+    """Create the strict serializer used by every checkpoint backend."""
 
     return JsonPlusSerializer(
-        allowed_msgpack_modules=(
-            ("app.schemas.execution", "ExecutionBudget"),
-        )
+        allowed_msgpack_modules=(("app.schemas.execution", "ExecutionBudget"),)
     )
 
 
 class StateRuntime:
-    """Owns Phase 4 state backends and LangGraph checkpointer lifecycle."""
+    """Own conversation, checkpoint, and artifact backend lifecycles."""
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        self.conversations: ConversationStore | BoundedInMemoryStore = (
-            self._memory_store()
-        )
+        self.conversations: ConversationStore | BoundedInMemoryStore = self._memory_store()
         self.checkpointer: Any = InMemorySaver(serde=_checkpoint_serializer())
         self.artifacts: MinioArtifactStore | None = None
         self._checkpoint_context: AbstractAsyncContextManager[Any] | None = None
         self._started = False
+        self.degraded_reason: str | None = None
 
     async def start(self) -> None:
         if self._started:
             return
+        try:
+            self.conversations = self._build_conversation_store()
+            start = getattr(self.conversations, "start", None)
+            if callable(start):
+                await start()
 
-        self.conversations = self._build_conversation_store()
+            if self.settings.checkpoint_backend == "postgres":
+                if not self.settings.database_url:
+                    raise RuntimeError("DATABASE_URL is required for PostgreSQL checkpoints")
+                from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+
+                self._checkpoint_context = AsyncPostgresSaver.from_conn_string(
+                    self.settings.database_url,
+                    serde=_checkpoint_serializer(),
+                )
+                self.checkpointer = await self._checkpoint_context.__aenter__()
+                if self.settings.postgres_auto_setup:
+                    await self.checkpointer.setup()
+
+            if self.settings.artifact_backend == "minio":
+                self.artifacts = MinioArtifactStore(
+                    self.settings.minio_endpoint,
+                    self.settings.minio_access_key,
+                    self.settings.minio_secret_key,
+                    bucket=self.settings.minio_bucket,
+                    secure=self.settings.minio_secure,
+                )
+                await self.artifacts.start()
+
+            self._started = True
+            self.degraded_reason = None
+        except Exception:
+            await self.aclose()
+            raise
+
+    async def use_memory_fallback(self, reason: str) -> None:
+        """Switch optional persistence failures to a clean in-memory runtime."""
+
+        await self.aclose()
+        self.conversations = self._memory_store()
         start = getattr(self.conversations, "start", None)
         if callable(start):
             await start()
-
-        if self.settings.checkpoint_backend == "postgres":
-            if not self.settings.database_url:
-                raise RuntimeError(
-                    "DATABASE_URL is required for PostgreSQL checkpoints"
-                )
-
-            from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
-
-            self._checkpoint_context = AsyncPostgresSaver.from_conn_string(
-                self.settings.database_url,
-                serde=_checkpoint_serializer(),
-            )
-            self.checkpointer = await self._checkpoint_context.__aenter__()
-            if self.settings.postgres_auto_setup:
-                await self.checkpointer.setup()
-
-        if self.settings.artifact_backend == "minio":
-            self.artifacts = MinioArtifactStore(
-                self.settings.minio_endpoint,
-                self.settings.minio_access_key,
-                self.settings.minio_secret_key,
-                bucket=self.settings.minio_bucket,
-                secure=self.settings.minio_secure,
-            )
-            await self.artifacts.start()
-
+        self.checkpointer = InMemorySaver(serde=_checkpoint_serializer())
+        self.artifacts = None
+        self._checkpoint_context = None
         self._started = True
+        self.degraded_reason = reason
 
     async def aclose(self) -> None:
         if self.artifacts is not None:
-            await self.artifacts.aclose()
+            try:
+                await self.artifacts.aclose()
+            finally:
+                self.artifacts = None
 
         close = getattr(self.conversations, "aclose", None)
         if callable(close):
@@ -95,35 +108,92 @@ class StateRuntime:
         self._checkpoint_context = None
         self._started = False
 
+    async def _checkpoint_health(self) -> dict[str, Any]:
+        config = {
+            "configurable": {
+                "thread_id": "__health_check__",
+                "checkpoint_ns": "",
+            }
+        }
+        timeout = self.settings.persistence_health_timeout_seconds
+        try:
+            async_get = getattr(self.checkpointer, "aget_tuple", None)
+            if callable(async_get):
+                await asyncio.wait_for(async_get(config), timeout=timeout)
+            else:
+                get = getattr(self.checkpointer, "get_tuple", None)
+                if callable(get):
+                    await asyncio.wait_for(asyncio.to_thread(get, config), timeout=timeout)
+                else:
+                    raise RuntimeError("checkpointer does not expose a health-readable API")
+        except Exception as exc:
+            log_kv(
+                logger,
+                logging.ERROR,
+                "checkpoint_health_failed",
+                backend=self.settings.checkpoint_backend,
+                error_type=type(exc).__name__,
+                error=str(exc).strip() or "health check failed",
+            )
+            return {
+                "status": "unavailable",
+                "backend": self.settings.checkpoint_backend,
+                "error": (
+                    f"{type(exc).__name__}: {str(exc).strip() or 'health check failed'}"
+                    if self.settings.expose_internal_health_details
+                    else "Dependency unavailable."
+                ),
+            }
+        return {
+            "status": "available",
+            "backend": self.settings.checkpoint_backend,
+        }
+
     async def health(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
+            "status": "degraded" if self.degraded_reason else "available",
             "conversation_backend": self.settings.state_backend,
             "checkpoint_backend": self.settings.checkpoint_backend,
             "artifact_backend": self.settings.artifact_backend,
         }
+        if self.degraded_reason:
+            payload["degraded_reason"] = (
+                self.degraded_reason
+                if self.settings.expose_internal_health_details
+                else "Optional persistence dependency unavailable; using memory fallback."
+            )
+            payload["effective_conversation_backend"] = "memory"
+            payload["effective_checkpoint_backend"] = "memory"
 
         health = getattr(self.conversations, "health", None)
-        if callable(health):
-            payload["conversation"] = await health()
-        else:
-            payload["conversation"] = {
-                "status": "available",
-                "backend": "memory",
-            }
+        payload["conversation"] = (
+            await health()
+            if callable(health)
+            else {"status": "available", "backend": "memory"}
+        )
+        payload["checkpoint"] = await self._checkpoint_health()
 
         if self.artifacts is not None:
             payload["artifacts"] = await self.artifacts.health()
+        elif self.settings.artifact_backend == "minio":
+            payload["artifacts"] = {
+                "status": "unavailable",
+                "backend": "minio",
+                "error": (
+                    self.degraded_reason or "artifact backend not started"
+                    if self.settings.expose_internal_health_details
+                    else "Dependency unavailable."
+                ),
+            }
+        else:
+            payload["artifacts"] = {"status": "disabled", "backend": "disabled"}
 
         return payload
 
-    def _build_conversation_store(
-        self,
-    ) -> ConversationStore | BoundedInMemoryStore:
+    def _build_conversation_store(self) -> ConversationStore | BoundedInMemoryStore:
         if self.settings.state_backend == "postgres":
             if not self.settings.database_url:
-                raise RuntimeError(
-                    "DATABASE_URL is required for STATE_BACKEND=postgres"
-                )
+                raise RuntimeError("DATABASE_URL is required for STATE_BACKEND=postgres")
             return PostgresConversationStore(
                 self.settings.database_url,
                 min_pool_size=self.settings.postgres_pool_min_size,
@@ -131,7 +201,6 @@ class StateRuntime:
                 max_messages=self.settings.state_max_history_messages,
                 command_timeout=self.settings.postgres_command_timeout_seconds,
             )
-
         if self.settings.state_backend == "redis":
             if not self.settings.redis_url:
                 raise RuntimeError("REDIS_URL is required for STATE_BACKEND=redis")
@@ -141,7 +210,6 @@ class StateRuntime:
                 ttl_seconds=self.settings.state_ttl_seconds,
                 max_messages=self.settings.state_max_history_messages,
             )
-
         return self._memory_store()
 
     def _memory_store(self) -> BoundedInMemoryStore:
