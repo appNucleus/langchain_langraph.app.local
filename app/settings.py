@@ -89,9 +89,20 @@ class Settings(BaseSettings):
     ollama_required: bool = True
     mcp_required: bool = False
 
-    # Backward-compatible deterministic query-rewriter defaults.
+    # Backward-compatible deterministic query and prompt-service settings.
+    # These services remain importable and their configuration contract is
+    # validated by the CI Settings scanner, even when the Phase 4 graph is the
+    # primary runtime orchestration path.
     default_forecast_days: int = Field(default=7, ge=1, le=14)
     default_news_lookback_days: int = Field(default=7, ge=1, le=90)
+    enable_llm_query_planning: bool = False
+    max_subqueries: int = Field(default=6, ge=1, le=20)
+    max_tool_chars: int = Field(default=12000, ge=1000, le=200000)
+    session_history_messages: int = Field(default=12, ge=2, le=200)
+    max_conversation_sessions: int = Field(default=1000, ge=1, le=100000)
+    conversation_session_ttl_seconds: int = Field(default=3600, ge=60, le=2_592_000)
+    conversation_cleanup_interval_seconds: int = Field(default=60, ge=1, le=3600)
+    max_history_message_chars: int = Field(default=4000, ge=100, le=100000)
 
     # Shared capability inventory cache
     inventory_cache_ttl_seconds: int = Field(default=60, ge=1, le=3600)
