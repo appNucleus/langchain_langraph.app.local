@@ -8,12 +8,16 @@ from redis.asyncio import Redis
 from app.state.base import ConversationStore
 
 _APPEND_TURN_SCRIPT = """
-if redis.call('EXISTS', KEYS[2]) == 1 then
+if redis.call('SISMEMBER', KEYS[2], ARGV[2]) == 1
+   or redis.call('EXISTS', KEYS[3]) == 1 then
+    redis.call('SADD', KEYS[2], ARGV[2])
+    redis.call('EXPIRE', KEYS[2], ARGV[1])
     return 0
 end
-redis.call('SET', KEYS[2], '1', 'EX', ARGV[1])
-redis.call('RPUSH', KEYS[1], ARGV[2], ARGV[3])
-redis.call('LTRIM', KEYS[1], -tonumber(ARGV[4]), -1)
+redis.call('SADD', KEYS[2], ARGV[2])
+redis.call('EXPIRE', KEYS[2], ARGV[1])
+redis.call('RPUSH', KEYS[1], ARGV[3], ARGV[4])
+redis.call('LTRIM', KEYS[1], -tonumber(ARGV[5]), -1)
 redis.call('EXPIRE', KEYS[1], ARGV[1])
 return 1
 """
@@ -88,10 +92,12 @@ class RedisConversationStore(ConversationStore):
     ) -> bool:
         result = await self._require_client().eval(
             _APPEND_TURN_SCRIPT,
-            2,
+            3,
             self._key(thread_id),
+            self._turns_key(thread_id),
             self._turn_key(thread_id, run_id),
             self.ttl_seconds,
+            run_id,
             json.dumps(dict(user_message), ensure_ascii=False),
             json.dumps(dict(assistant_message), ensure_ascii=False),
             self.max_messages,
@@ -102,12 +108,21 @@ class RedisConversationStore(ConversationStore):
         client = self._require_client()
         marker_pattern = self._turn_key(thread_id, "*")
         marker_keys = [key async for key in client.scan_iter(match=marker_pattern)]
-        await client.delete(self._key(thread_id), *marker_keys)
+        await client.delete(
+            self._key(thread_id),
+            self._turns_key(thread_id),
+            *marker_keys,
+        )
 
     def _key(self, thread_id: str) -> str:
         return f"{self.key_prefix}:{thread_id}"
 
+    def _turns_key(self, thread_id: str) -> str:
+        return f"{self.key_prefix}:turns:{thread_id}"
+
     def _turn_key(self, thread_id: str, run_id: str) -> str:
+        """Legacy per-run marker key retained for rolling upgrades."""
+
         return f"{self.key_prefix}:turn:{thread_id}:{run_id}"
 
     def _require_client(self) -> Redis:

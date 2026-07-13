@@ -8,6 +8,22 @@ import asyncpg
 from app.state.base import ConversationStore
 
 
+def _decode_json_object(value: Any) -> dict[str, Any]:
+    """Decode asyncpg JSON/JSONB values without requiring a custom codec."""
+
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, (str, bytes, bytearray)):
+        parsed = json.loads(value)
+        return dict(parsed) if isinstance(parsed, dict) else {}
+    try:
+        return dict(value)
+    except (TypeError, ValueError):
+        return {}
+
+
 class PostgresConversationStore(ConversationStore):
     """Durable conversation history backed by PostgreSQL."""
 
@@ -30,60 +46,76 @@ class PostgresConversationStore(ConversationStore):
     async def start(self) -> None:
         if self._pool is not None:
             return
-        self._pool = await asyncpg.create_pool(
+        pool = await asyncpg.create_pool(
             dsn=self.database_url,
             min_size=self.min_pool_size,
             max_size=self.max_pool_size,
             command_timeout=self.command_timeout,
         )
-        async with self._pool.acquire() as connection:
-            lock_name = "langchain-langraph-conversation-migrations"
-            await connection.execute(
-                "SELECT pg_advisory_lock(hashtext($1))", lock_name
-            )
-            try:
+        self._pool = pool
+        try:
+            async with pool.acquire() as connection:
+                lock_name = "langchain-langraph-state-migrations"
                 await connection.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS app_conversation_messages (
-                        id BIGSERIAL PRIMARY KEY,
-                        thread_id TEXT NOT NULL,
-                        sequence_no BIGINT NOT NULL,
-                        role TEXT NOT NULL,
-                        content TEXT NOT NULL,
-                        metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
-                        run_id UUID,
-                        message_kind TEXT,
-                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                        UNIQUE (thread_id, sequence_no)
+                    "SELECT pg_advisory_lock(hashtext($1))", lock_name
+                )
+                try:
+                    await connection.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS app_conversation_messages (
+                            id BIGSERIAL PRIMARY KEY,
+                            thread_id TEXT NOT NULL,
+                            sequence_no BIGINT NOT NULL,
+                            role TEXT NOT NULL,
+                            content TEXT NOT NULL,
+                            metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+                            run_id UUID,
+                            message_kind TEXT,
+                            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                            UNIQUE (thread_id, sequence_no)
+                        )
+                        """
                     )
-                    """
-                )
-                await connection.execute(
-                    "ALTER TABLE app_conversation_messages "
-                    "ADD COLUMN IF NOT EXISTS run_id UUID"
-                )
-                await connection.execute(
-                    "ALTER TABLE app_conversation_messages "
-                    "ADD COLUMN IF NOT EXISTS message_kind TEXT"
-                )
-                await connection.execute(
-                    """
-                    CREATE INDEX IF NOT EXISTS idx_app_conversation_messages_thread
-                    ON app_conversation_messages (thread_id, sequence_no)
-                    """
-                )
-                await connection.execute(
-                    """
-                    CREATE UNIQUE INDEX IF NOT EXISTS
-                        uq_app_conversation_messages_run_kind
-                    ON app_conversation_messages (thread_id, run_id, message_kind)
-                    WHERE run_id IS NOT NULL AND message_kind IS NOT NULL
-                    """
-                )
-            finally:
-                await connection.execute(
-                    "SELECT pg_advisory_unlock(hashtext($1))", lock_name
-                )
+                    await connection.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS app_conversation_turn_commits (
+                            thread_id TEXT NOT NULL,
+                            run_id UUID NOT NULL,
+                            committed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                            PRIMARY KEY (thread_id, run_id)
+                        )
+                        """
+                    )
+                    await connection.execute(
+                        "ALTER TABLE app_conversation_messages "
+                        "ADD COLUMN IF NOT EXISTS run_id UUID"
+                    )
+                    await connection.execute(
+                        "ALTER TABLE app_conversation_messages "
+                        "ADD COLUMN IF NOT EXISTS message_kind TEXT"
+                    )
+                    await connection.execute(
+                        """
+                        CREATE INDEX IF NOT EXISTS idx_app_conversation_messages_thread
+                        ON app_conversation_messages (thread_id, sequence_no)
+                        """
+                    )
+                    await connection.execute(
+                        """
+                        CREATE UNIQUE INDEX IF NOT EXISTS
+                            uq_app_conversation_messages_run_kind
+                        ON app_conversation_messages (thread_id, run_id, message_kind)
+                        WHERE run_id IS NOT NULL AND message_kind IS NOT NULL
+                        """
+                    )
+                finally:
+                    await connection.execute(
+                        "SELECT pg_advisory_unlock(hashtext($1))", lock_name
+                    )
+        except BaseException:
+            await pool.close()
+            self._pool = None
+            raise
 
     async def aclose(self) -> None:
         if self._pool is not None:
@@ -114,7 +146,11 @@ class PostgresConversationStore(ConversationStore):
             {
                 "role": row["role"],
                 "content": row["content"],
-                **({"metadata": dict(row["metadata"])} if row["metadata"] else {}),
+                **(
+                    {"metadata": _decode_json_object(row["metadata"])}
+                    if row["metadata"]
+                    else {}
+                ),
             }
             for row in reversed(rows)
         ]
@@ -164,17 +200,17 @@ class PostgresConversationStore(ConversationStore):
                 await connection.execute(
                     "SELECT pg_advisory_xact_lock(hashtext($1))", thread_id
                 )
-                exists = await connection.fetchval(
+                committed = await connection.fetchval(
                     """
-                    SELECT EXISTS (
-                        SELECT 1 FROM app_conversation_messages
-                        WHERE thread_id = $1 AND run_id = $2::uuid
-                    )
+                    INSERT INTO app_conversation_turn_commits (thread_id, run_id)
+                    VALUES ($1, $2::uuid)
+                    ON CONFLICT (thread_id, run_id) DO NOTHING
+                    RETURNING run_id
                     """,
                     thread_id,
                     run_id,
                 )
-                if exists:
+                if committed is None:
                     return False
                 next_sequence = int(await self._next_sequence(connection, thread_id))
                 records = []
@@ -209,10 +245,18 @@ class PostgresConversationStore(ConversationStore):
     async def clear(self, thread_id: str) -> None:
         pool = self._require_pool()
         async with pool.acquire() as connection:
-            await connection.execute(
-                "DELETE FROM app_conversation_messages WHERE thread_id = $1",
-                thread_id,
-            )
+            async with connection.transaction():
+                await connection.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext($1))", thread_id
+                )
+                await connection.execute(
+                    "DELETE FROM app_conversation_messages WHERE thread_id = $1",
+                    thread_id,
+                )
+                await connection.execute(
+                    "DELETE FROM app_conversation_turn_commits WHERE thread_id = $1",
+                    thread_id,
+                )
 
     @staticmethod
     async def _next_sequence(connection: Any, thread_id: str) -> int:

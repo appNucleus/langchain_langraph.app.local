@@ -50,6 +50,26 @@ def test_runtime_default_request_example_is_minimal_and_valid() -> None:
     assert ChatRequest.model_validate(example).message == "Continue the analysis"
 
 
+def test_complete_request_example_is_separate_full_and_valid() -> None:
+    complete_path = CHAT_REQUEST_EXAMPLE_PATH.with_name("chat-complete." + "json")
+    complete = load_chat_request_example(complete_path)
+
+    assert set(complete) == {
+        "message",
+        "thread_id",
+        "conversation_id",
+        "run_id",
+        "resume",
+        "resume_token",
+        "system_prompt",
+        "metadata",
+    }
+    assert complete != load_chat_request_example(CHAT_REQUEST_EXAMPLE_PATH)
+    assert complete["system_prompt"]
+    assert complete["metadata"]
+    assert ChatRequest.model_validate(complete).message == complete["message"]
+
+
 def test_openapi_uses_the_runtime_request_example(
     monkeypatch: Any,
 ) -> None:

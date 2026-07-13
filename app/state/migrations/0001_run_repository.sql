@@ -43,6 +43,26 @@ CREATE TABLE IF NOT EXISTS app_conversation_leases (
 CREATE INDEX IF NOT EXISTS idx_app_conversation_leases_expiry
     ON app_conversation_leases (lease_expires_at);
 
+CREATE TABLE IF NOT EXISTS app_conversation_messages (
+    id BIGSERIAL PRIMARY KEY,
+    thread_id TEXT NOT NULL,
+    sequence_no BIGINT NOT NULL,
+    role TEXT NOT NULL,
+    content TEXT NOT NULL,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    run_id UUID,
+    message_kind TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (thread_id, sequence_no)
+);
+
+CREATE TABLE IF NOT EXISTS app_conversation_turn_commits (
+    thread_id TEXT NOT NULL,
+    run_id UUID NOT NULL,
+    committed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (thread_id, run_id)
+);
+
 ALTER TABLE IF EXISTS app_conversation_messages
     ADD COLUMN IF NOT EXISTS run_id UUID;
 ALTER TABLE IF EXISTS app_conversation_messages

@@ -6,7 +6,11 @@ from uuid import uuid4
 
 import pytest
 
-from app.orchestration.run_identity import ConversationBusyError, RunIdentityService, StaleLeaseError
+from app.orchestration.run_identity import (
+    ConversationBusyError,
+    RunIdentityService,
+    StaleLeaseError,
+)
 from app.schemas.chat import ChatRequest
 from app.settings import Settings
 from app.state.postgres import PostgresConversationStore
@@ -159,3 +163,60 @@ async def test_postgres_history_append_is_idempotent_by_run_id() -> None:
     finally:
         await store.clear(conversation_id)
         await store.aclose()
+
+
+@pytest.mark.asyncio
+async def test_postgres_history_idempotency_survives_visible_trimming() -> None:
+    database_url = _database_url()
+    store = PostgresConversationStore(
+        database_url,
+        min_pool_size=1,
+        max_pool_size=2,
+        max_messages=2,
+        command_timeout=10,
+    )
+    await store.start()
+    conversation_id = f"history-trim-{uuid4()}"
+    first_run = str(uuid4())
+    second_run = str(uuid4())
+
+    def turn(run_id: str, content: str) -> tuple[dict[str, object], dict[str, object]]:
+        return (
+            {"role": "user", "content": content, "metadata": {"run_id": run_id}},
+            {
+                "role": "assistant",
+                "content": f"answer-{content}",
+                "metadata": {"run_id": run_id},
+            },
+        )
+
+    first_user, first_assistant = turn(first_run, "first")
+    second_user, second_assistant = turn(second_run, "second")
+    try:
+        assert await store.append_turn(
+            conversation_id,
+            run_id=first_run,
+            user_message=first_user,
+            assistant_message=first_assistant,
+        )
+        assert await store.append_turn(
+            conversation_id,
+            run_id=second_run,
+            user_message=second_user,
+            assistant_message=second_assistant,
+        )
+        assert not await store.append_turn(
+            conversation_id,
+            run_id=first_run,
+            user_message=first_user,
+            assistant_message=first_assistant,
+        )
+        history = await store.get(conversation_id)
+        assert [item["content"] for item in history] == [
+            "second",
+            "answer-second",
+        ]
+    finally:
+        await store.clear(conversation_id)
+        await store.aclose()
+

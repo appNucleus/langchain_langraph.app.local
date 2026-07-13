@@ -376,25 +376,31 @@ class PostgresRunRepository(RunRepository):
     async def start(self) -> None:
         if self._pool is not None:
             return
-        self._pool = await asyncpg.create_pool(
+        pool = await asyncpg.create_pool(
             dsn=self.database_url,
             min_size=self.min_pool_size,
             max_size=self.max_pool_size,
             command_timeout=self.command_timeout,
         )
-        if self.auto_setup:
-            migration = _MIGRATION_PATH.read_text(encoding="utf-8")
-            async with self._pool.acquire() as connection:
-                lock_name = "langchain-langraph-run-migrations"
-                await connection.execute(
-                    "SELECT pg_advisory_lock(hashtext($1))", lock_name
-                )
-                try:
-                    await connection.execute(migration)
-                finally:
+        self._pool = pool
+        try:
+            if self.auto_setup:
+                migration = _MIGRATION_PATH.read_text(encoding="utf-8")
+                async with pool.acquire() as connection:
+                    lock_name = "langchain-langraph-state-migrations"
                     await connection.execute(
-                        "SELECT pg_advisory_unlock(hashtext($1))", lock_name
+                        "SELECT pg_advisory_lock(hashtext($1))", lock_name
                     )
+                    try:
+                        await connection.execute(migration)
+                    finally:
+                        await connection.execute(
+                            "SELECT pg_advisory_unlock(hashtext($1))", lock_name
+                        )
+        except BaseException:
+            await pool.close()
+            self._pool = None
+            raise
 
     async def aclose(self) -> None:
         if self._pool is not None:
