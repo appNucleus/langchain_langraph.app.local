@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from typing import Any
-from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -22,10 +21,28 @@ class RunIdentity(BaseModel):
     client_supplied_run_id: bool = False
 
     def langgraph_config(self) -> dict[str, Any]:
+        """Return a PostgreSQL-safe root-graph configuration.
+
+        LangGraph reserves ``checkpoint_ns`` for nested graph namespaces and
+        normalizes a non-empty namespace back to the root namespace for a
+        top-level invocation. The unique execution thread already isolates one
+        run from every other run, so the root namespace must remain empty.
+
+        ``run_id`` is intentionally stored as JSON-safe string metadata rather
+        than as a top-level UUID object. PostgreSQL checkpointers persist
+        checkpoint metadata as JSONB, and keeping every value primitive avoids
+        serialization failures after a model node completes.
+        """
+
         return {
             "configurable": {
                 "thread_id": self.execution_thread_id,
-                "checkpoint_ns": self.checkpoint_namespace,
             },
-            "run_id": UUID(self.run_id),
+            "metadata": {
+                "conversation_id": self.conversation_id,
+                "run_id": self.run_id,
+                "execution_thread_id": self.execution_thread_id,
+                "checkpoint_namespace": self.checkpoint_namespace,
+                "state_schema_version": self.state_schema_version,
+            },
         }

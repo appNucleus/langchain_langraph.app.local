@@ -378,7 +378,16 @@ class Phase5ChatAgent(ChatAgent):
         assistant_message: str,
     ) -> None:
         if any(
-            str(item.get("run_id") or "") == identity.run_id
+            str(
+                item.get("run_id")
+                or (
+                    item.get("metadata", {}).get("run_id")
+                    if isinstance(item.get("metadata"), dict)
+                    else ""
+                )
+                or ""
+            )
+            == identity.run_id
             for item in existing_history
             if isinstance(item, dict)
         ):
@@ -389,14 +398,18 @@ class Phase5ChatAgent(ChatAgent):
             {
                 "role": "user",
                 "content": user_message,
-                "conversation_id": identity.conversation_id,
-                "run_id": identity.run_id,
+                "metadata": {
+                    "conversation_id": identity.conversation_id,
+                    "run_id": identity.run_id,
+                },
             },
             {
                 "role": "assistant",
                 "content": assistant_message,
-                "conversation_id": identity.conversation_id,
-                "run_id": identity.run_id,
+                "metadata": {
+                    "conversation_id": identity.conversation_id,
+                    "run_id": identity.run_id,
+                },
             },
         )
 

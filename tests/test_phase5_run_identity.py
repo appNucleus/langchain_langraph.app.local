@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from uuid import uuid4
 
 import pytest
@@ -35,6 +36,29 @@ def test_message_only_request_generates_new_conversation_and_run_ids() -> None:
     assert first.run_id != second.run_id
     assert first.execution_thread_id == f"{first.conversation_id}:{first.run_id}"
     assert first.resume_requested is False
+
+
+def test_langgraph_config_is_json_safe_and_uses_root_checkpoint_namespace() -> None:
+    service = RunIdentityService(_settings())
+    identity = service.normalize(
+        ChatRequest(
+            message="hello",
+            conversation_id="conversation-postgres",
+        )
+    )
+
+    config = identity.langgraph_config()
+
+    assert config["configurable"] == {
+        "thread_id": identity.execution_thread_id,
+    }
+    assert "run_id" not in config
+    assert config["metadata"]["run_id"] == identity.run_id
+    assert (
+        config["metadata"]["checkpoint_namespace"]
+        == identity.checkpoint_namespace
+    )
+    assert json.loads(json.dumps(config)) == config
 
 
 def test_legacy_thread_id_is_normalized_as_conversation_id() -> None:

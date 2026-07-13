@@ -116,7 +116,13 @@ def create_app(
         exc: Exception,
     ) -> JSONResponse:
         metrics.inc("api.unhandled_error")
-        log_kv(logger, logging.ERROR, "api_unhandled_error", error=repr(exc))
+        # Keep the client response generic, but retain the complete traceback in
+        # container logs so deployment failures can be diagnosed from Actions.
+        logger.error(
+            "api_unhandled_error error=%r",
+            exc,
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
         return JSONResponse(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             content={"detail": "Internal server error."},

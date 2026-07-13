@@ -19,7 +19,7 @@ env:
 
 jobs:
   quality-gate:
-    name: Unit, integration, and lint gate
+    name: "Pre-deployment: compile, lint, and test"
     runs-on: ubuntu-latest
     timeout-minutes: 20
     defaults:
@@ -70,7 +70,7 @@ jobs:
           retention-days: 14
 
   deploy:
-    name: Build, deploy, verify, and roll back on failure
+    name: "Deployment: build, release, smoke, and API checks"
     needs: quality-gate
     runs-on:
       - self-hosted
@@ -207,4 +207,44 @@ jobs:
             else
               echo "- Candidate failed after deployment; automatic rollback was attempted when a rollback point existed."
             fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  post-deployment:
+    name: "Post-deployment: publish pipeline outcome"
+    needs:
+      - quality-gate
+      - deploy
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish three-stage deployment outcome
+        env:
+          PRE_DEPLOYMENT_RESULT: ${{ needs.quality-gate.result }}
+          DEPLOYMENT_RESULT: ${{ needs.deploy.result }}
+        run: |
+          set -euo pipefail
+          echo "Pre-deployment result: ${PRE_DEPLOYMENT_RESULT}"
+          echo "Deployment result: ${DEPLOYMENT_RESULT}"
+          echo "Post-deployment reporting: completed"
+          {
+            echo "## Three-stage deployment pipeline"
+            echo
+            echo "### 1. Pre-deployment"
+            echo "- Install and validate dependencies"
+            echo "- Compile Python sources"
+            echo "- Run Ruff correctness checks"
+            echo "- Run unit and deterministic integration tests"
+            echo "- Result: **${PRE_DEPLOYMENT_RESULT}**"
+            echo
+            echo "### 2. Deployment"
+            echo "- Validate server and Compose prerequisites"
+            echo "- Prepare rollback point"
+            echo "- Build and deploy the candidate image"
+            echo "- Run smoke and API integration checks"
+            echo "- Preserve the successful backup or roll back on failure"
+            echo "- Result: **${DEPLOYMENT_RESULT}**"
+            echo
+            echo "### 3. Post-deployment"
+            echo "- Publish the final pipeline outcome"
+            echo "- Preserve the existing deployment and rollback behavior unchanged"
           } >> "$GITHUB_STEP_SUMMARY"

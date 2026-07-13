@@ -78,6 +78,8 @@ def test_explicit_run_id_is_idempotent_within_process() -> None:
     assert second.status_code == 200
     assert second.json() == first.json()
     assert len(stored) == 2
+    assert stored[0]["metadata"]["run_id"] == run_id
+    assert stored[1]["metadata"]["run_id"] == run_id
 
 
 def test_reusing_run_id_for_different_payload_returns_conflict() -> None:
