@@ -68,23 +68,25 @@ The process-local conversation gate remains a fast-path optimization only. Postg
 
 ## Request examples
 
-The runnable Swagger/OpenAPI default is loaded from:
+The Swagger/OpenAPI request body is documentation input loaded from:
 
 ```text
 docs/example_request/chat.json
 ```
 
-It intentionally contains only:
+This file is loaded lazily only when OpenAPI is generated, such as for
+`/openapi.json`, `/docs`, or `/redoc`. Its contents do not define
+`ChatRequest` model defaults, are not supplied to chat execution, and are not
+used as pytest fixture data. Tests inject code-defined request examples so
+documentation can evolve without changing runtime or test semantics.
 
-```json
-{"message": "Continue the analysis"}
-```
-
-The complete optional-field contract is stored separately at:
+An additional documentation example may be maintained at:
 
 ```text
 docs/example_request/chat-complete.json
 ```
+
+Neither documentation file is a runtime request template.
 
 ## Streaming status
 

@@ -1,10 +1,10 @@
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from app.factory import create_app
 from app.schemas.chat import (
-    CHAT_REQUEST_EXAMPLE_PATH,
     ChatRequest,
     build_chat_request_openapi_examples,
     load_chat_request_example,
@@ -44,47 +44,55 @@ def test_chat_request_defaults_are_defined_by_the_model() -> None:
     }
 
 
-def test_runtime_default_request_example_is_minimal_and_valid() -> None:
-    example = load_chat_request_example(CHAT_REQUEST_EXAMPLE_PATH)
-    assert example == {"message": "Continue the analysis"}
-    assert ChatRequest.model_validate(example).message == "Continue the analysis"
-
-
-def test_complete_request_example_is_separate_full_and_valid() -> None:
-    complete_path = CHAT_REQUEST_EXAMPLE_PATH.with_name("chat-complete." + "json")
-    complete = load_chat_request_example(complete_path)
-
-    assert set(complete) == {
-        "message",
-        "thread_id",
-        "conversation_id",
-        "run_id",
-        "resume",
-        "resume_token",
-        "system_prompt",
-        "metadata",
-    }
-    assert complete != load_chat_request_example(CHAT_REQUEST_EXAMPLE_PATH)
-    assert complete["system_prompt"]
-    assert complete["metadata"]
-    assert ChatRequest.model_validate(complete).message == complete["message"]
-
-
-def test_openapi_uses_the_runtime_request_example(
+def test_documentation_loader_validates_code_supplied_content(
     monkeypatch: Any,
 ) -> None:
+    source = {
+        "message": "Documentation-only request example",
+        "metadata": {"source": "code-defined-test-data"},
+    }
+    monkeypatch.setattr(
+        "app.schemas.chat.Path.read_text",
+        lambda _path, *, encoding: json.dumps(source),
+    )
+
+    assert load_chat_request_example() == source
+
+
+def test_create_app_loads_documentation_example_only_for_openapi(
+    monkeypatch: Any,
+) -> None:
+    calls = 0
+
+    def load_documentation_example() -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
+        return {"message": "Documentation-only request example"}
+
     monkeypatch.setattr(
         "app.factory.load_chat_request_example",
-        lambda: load_chat_request_example(CHAT_REQUEST_EXAMPLE_PATH),
+        load_documentation_example,
     )
+
+    app = create_app(settings=_settings())
+    assert calls == 0
+
+    app.openapi()
+    assert calls == 1
+
+    app.openapi()
+    assert calls == 1
+
+
+def test_openapi_uses_code_injected_documentation_example(
+    in_memory_chat_request_example: dict[str, Any],
+) -> None:
     schema = create_app(settings=_settings()).openapi()
     for path in ("/api/chat", "/api/chat/stream"):
         examples = schema["paths"][path]["post"]["requestBody"]["content"][
             "application/json"
         ]["examples"]
-        assert examples["default"]["value"] == {
-            "message": "Continue the analysis"
-        }
+        assert examples["default"]["value"] == in_memory_chat_request_example
 
 
 def test_openapi_example_builder_returns_a_defensive_copy() -> None:

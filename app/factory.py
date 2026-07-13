@@ -35,9 +35,6 @@ def create_app(
     chat_agent: ChatAgent | None = None,
 ) -> FastAPI:
     app_settings = settings or get_settings()
-    chat_request_openapi_examples = build_chat_request_openapi_examples(
-        load_chat_request_example()
-    )
     configure_logging(app_settings.log_level)
     agent = chat_agent or ChatRuntimeAgent(app_settings)
     inventory_service = getattr(agent, "inventory_service", None)
@@ -326,9 +323,15 @@ def create_app(
         )
 
     generated_openapi = app.openapi
+    chat_request_openapi_examples: dict[str, dict[str, Any]] | None = None
 
     def openapi_with_chat_request_example() -> dict[str, Any]:
+        nonlocal chat_request_openapi_examples
         schema = generated_openapi()
+        if chat_request_openapi_examples is None:
+            chat_request_openapi_examples = build_chat_request_openapi_examples(
+                load_chat_request_example()
+            )
         for path in ("/api/chat", "/api/chat/stream"):
             operation = (schema.get("paths") or {}).get(path, {}).get("post", {})
             content = (operation.get("requestBody") or {}).get("content", {})

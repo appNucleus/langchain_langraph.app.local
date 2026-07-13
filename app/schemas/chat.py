@@ -125,7 +125,11 @@ def _validated_chat_request_example(raw: object) -> dict[str, Any]:
 
 
 def load_chat_request_example(path: Path | None = None) -> dict[str, Any]:
-    """Load the minimal runnable Swagger example from ``chat.json``."""
+    """Load the documentation-only OpenAPI request example from ``chat.json``.
+
+    This mapping decorates the generated OpenAPI schema only. It does not define
+    ``ChatRequest`` defaults and is never used as chat execution input.
+    """
 
     example_path = path or CHAT_REQUEST_EXAMPLE_PATH
     try:
@@ -142,11 +146,11 @@ def build_chat_request_openapi_examples(
 
     return {
         "default": {
-            "summary": "Minimal new-conversation request",
+            "summary": "Configured chat request example",
             "description": (
-                "Loaded when the application starts from "
-                "docs/example_request/chat.json. The complete optional-field example "
-                "is stored separately in docs/example_request/chat-complete.json."
+                "Documentation-only request body loaded lazily from "
+                "docs/example_request/chat.json when OpenAPI is generated. "
+                "It does not define request-model defaults or runtime execution."
             ),
             "value": deepcopy(dict(example)),
         }
