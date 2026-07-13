@@ -1,8 +1,8 @@
 # LangChain LangGraph FastAPI App
 
-FastAPI + LangGraph application server for your local assistant stack. It is designed to sit beside your existing MCP server and Ollama server, then choose the best available local model and MCP tools per request.
+FastAPI + LangGraph application server for a local Ollama and MCP stack. The service performs bounded planning, evidence retrieval, work, verification, revision, synthesis, and final verification while keeping conversation identity separate from one graph execution.
 
-The Docker image name is intentionally set to:
+The Docker image name is:
 
 ```text
 langchain_langraph.app:release
@@ -14,22 +14,82 @@ The app exposes container port `8000` and maps it to host port `8001` by default
 127.0.0.1:8001 -> container:8000
 ```
 
-## What this includes
+## Current API
 
-- FastAPI endpoints: `/health`, `/health/live`, `/api/inventory`, `/api/chat`, and `/api/chat/stream`.
-- LangGraph workflow: `prepare -> live inventory -> query planning -> query rewrite -> MCP tools -> final answer`.
-- Live inventory loading from:
-  - Ollama `GET /api/tags` for local model list.
-  - MCP `tools/list` for tool list.
-- Dynamic model role selection with fallback if a configured model is not currently available.
-- Compound-query decomposition into simple subqueries, with per-subquery model/tool routing.
-- Web/news/search-style MCP fallback for fresh or unknown topics when those tools are available.
-- Final synthesis for multi-part questions.
-- Clean answer prompt that prefers broad, useful, easy-to-read answers and separate references.
-- Safe email-send guard: natural language alone cannot send a draft.
-- Docker Compose deployment with host bind controlled by `HOST_BIND` and `APP_PORT`.
-- GitHub Actions release deployment using the same rollback/backup style as your `mcp.local` repo.
-- Local deployment script: `./scripts/deploy-local.sh`.
+```text
+GET  /
+GET  /health
+GET  /health/live
+GET  /health/ready
+GET  /api/inventory
+GET  /api/metrics
+POST /api/chat
+POST /api/chat/stream
+```
+
+Inventory, metrics, chat, and streaming routes are protected when `API_KEY` is configured. Liveness is process-only. Readiness evaluates required Ollama, MCP, persistence, and artifact dependencies.
+
+## Current graph
+
+The compiled graph uses these stable node names:
+
+```text
+START -> plan
+plan -> research | worker | terminate
+research -> worker | terminate
+worker -> verify | terminate
+verify -> advance | revise | research | replan | terminate
+revise -> verify | terminate
+replan -> worker | terminate
+advance -> research | worker | finalize
+finalize -> END | verify_final | terminate
+verify_final -> END | revise_final | terminate
+revise_final -> verify_final
+terminate -> END
+```
+
+The planner decomposes the request, the runtime router selects only live models and schema-compatible read-only tools, the verifier controls revision/research/replanning, and multi-task synthesis can be checked by a separate final verifier.
+
+See [`docs/architecture.md`](docs/architecture.md) for the request, model, tool, evidence, persistence, and deployment lifecycles.
+
+## Request identity and compatibility
+
+The public request supports:
+
+```text
+message
+thread_id              # deprecated compatibility alias for conversation_id
+conversation_id
+run_id
+resume
+resume_token
+system_prompt
+metadata
+```
+
+The server generates conversation and run IDs when omitted. Resume tokens are signed and request-bound. Reserved identity metadata is controlled by the server.
+
+Current limitation: same-conversation exclusion and completed-response caching are process-local. Multi-worker correctness requires a durable lease and run repository and is not claimed by the current release.
+
+## Request examples
+
+Minimal OpenAPI/default request:
+
+```json
+{
+  "message": "Continue the analysis"
+}
+```
+
+The full optional-field contract is stored at:
+
+```text
+docs/example_request/chat-complete.json
+```
+
+## Streaming status
+
+`/api/chat/stream` is cancellation-aware and emits request/planning/working/completed events. The current implementation polls a background graph invocation; it is **not** LangGraph update streaming or Ollama token streaming. Do not describe it as real token streaming until the streaming stage is implemented and tested.
 
 ## Run locally
 
@@ -55,38 +115,34 @@ Test chat:
 ```bash
 curl -X POST http://127.0.0.1:8001/api/chat \
   -H 'Content-Type: application/json' \
-  -d '{"message":"What is the latest OpenAI news? Also what is the weather in Indianapolis tomorrow?"}'
+  -d '{"message":"What is the weather in Indianapolis tomorrow?"}'
 ```
 
-## Ollama configuration
+## Agent-loop configuration
 
-Default local-network Ollama URL:
+Use the canonical domain-oriented settings:
+
+```env
+AGENT_MAX_ITERATIONS=4
+AGENT_MAX_RESEARCH_ROUNDS=2
+AGENT_MAX_REPLANS=1
+AGENT_MAX_CONTEXT_CHARS=16000
+```
+
+The former `PHASE2_*` environment names remain accepted as deprecated aliases. New code and deployment configuration must use `AGENT_*` names.
+
+`RUN_CHECKPOINT_NAMESPACE=phase5-v1` is deliberately retained for existing checkpoint compatibility. Changing it requires an explicit checkpoint migration or a fail-closed version transition.
+
+## Ollama configuration
 
 ```env
 LLM_BACKEND=ollama
 OLLAMA_BASE_URL=http://ollama.home.arpa:11434
 ```
 
-Model roles are configured separately so the app can balance quality and speed:
-
-```env
-MODEL_PLANNER=qwen3.5:4b
-MODEL_SIMPLE=qwen3.5:2b
-MODEL_GENERAL=qwen3.5:4b
-MODEL_SEARCH=qwen3.5:9b
-MODEL_REASONING=phi4-mini-reasoning:latest
-MODEL_HEAVY=gemma4:26b-a4b-it-qat
-MODEL_SYNTHESIS=gemma4:26b-a4b-it-qat
-MODEL_VISION=qwen3-vl:4b
-MODEL_FALLBACK=qwen3.5:4b
-EMBEDDING_MODEL=qwen3-embedding:0.6b
-```
-
-The `/api/inventory` endpoint shows both configured roles and the resolved live model chosen from Ollama.
+Model roles are configured independently. `/api/inventory` reports configured roles and their live resolution against Ollama inventory.
 
 ## MCP configuration
-
-Default local-network MCP URL:
 
 ```env
 MCP_ENABLED=true
@@ -95,87 +151,56 @@ MCP_VERIFY_TLS=false
 MCP_FOLLOW_REDIRECTS=true
 ```
 
-The app calls `tools/list` first, then only plans against tools that the MCP server reports as live. If a preferred tool is unavailable, it tries a safe fallback such as `web_search_and_scrape -> web_search -> news_search`.
+The runtime loads `tools/list` and ranks only compatible tools reported by that live inventory. Read-only tools are allowed by policy; write-capable, ambiguous, and unknown tools fail closed unless a later server-side authorization protocol explicitly enables them.
 
-## Deployment using rollback flow
+## Persistence
+
+Supported combinations:
+
+```text
+Conversation history: memory, Redis, or PostgreSQL
+LangGraph checkpoints: memory or PostgreSQL
+Artifacts: disabled or MinIO
+```
+
+Optional dependency startup failures enter explicit degraded memory mode. Required dependency failures stop startup. MinIO availability does not by itself prove normal evidence-flow integration.
+
+## Deployment and rollback
+
+Local deployment:
 
 ```bash
 ./scripts/deploy-local.sh
 ```
 
-This enforces:
-
-```env
-HOST_BIND=127.0.0.1
-APP_PORT=8001
-```
-
-and stores the persistent runtime env at:
-
-```text
-~/.config/langchain-langraph-app/runtime.env
-```
-
-## GitHub Actions deployment
-
-The workflow deploys when you push to the `release` branch:
+GitHub Actions deployment:
 
 ```text
 .github/workflows/deploy-release.yml
 ```
 
-It expects a self-hosted runner with labels:
-
-```text
-self-hosted, Linux, X64, app-prod
-```
-
-Change the runner label in the workflow if your runner uses a different label.
-
-## Caddy example
-
-For a local/private domain:
-
-```caddyfile
-langchain.home.arpa {
-    tls internal
-    reverse_proxy 127.0.0.1:8001
-}
-```
-
-For a public HTTPS domain, keep the app bound to `127.0.0.1:8001` and expose only Caddy on ports `80` and `443`.
+The workflow compiles, lints, tests, builds, deploys, performs smoke/API checks, creates a known-good backup, and rolls back failures. Current limitation: the production runner rebuilds the candidate image after source tests, so the workflow does not yet prove that one immutable image digest was built once, tested, and deployed unchanged.
 
 ## API key protection
 
-By default, `API_KEY=` is empty, so `/api/chat` and `/api/inventory` are reachable by anyone who can reach the service.
-
-For public use, set:
-
-```env
-API_KEY=change-me-long-random-value
-```
-
-Then call:
-
-```bash
-curl -X POST http://127.0.0.1:8001/api/chat \
-  -H 'Content-Type: application/json' \
-  -H 'X-API-Key: change-me-long-random-value' \
-  -d '{"message":"hello"}'
-```
+By default, `API_KEY=` is empty. For any network exposure, set a long random value and pass it as `X-API-Key`.
 
 ## Tests
 
-```bash
-python -m pytest -q
-```
-
-Live integration tests are skipped by default. To run them against your local network services:
+Deterministic quality gates:
 
 ```bash
-LIVE_INTEGRATION=1 \
-OLLAMA_BASE_URL=http://ollama.home.arpa:11434 \
-MCP_SERVER_URL=https://mcp.home.arpa/mcp \
-MCP_VERIFY_TLS=false \
-python -m pytest -q tests/test_live_integration.py
+python -m pip check
+python -m compileall -q app tests
+python -m ruff check app tests
+python -m pytest -v -ra --tb=long -W default -m "not live_integration"
+docker compose --env-file .env.example config
 ```
+
+Convenience verification:
+
+```bash
+bash ./scripts/verify-runtime.sh
+```
+
+Live integration tests remain separately tagged and require reachable Ollama and MCP services.

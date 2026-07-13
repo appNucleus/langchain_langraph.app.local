@@ -1,0 +1,10 @@
+{
+  "message": "Continue the analysis",
+  "thread_id": null,
+  "conversation_id": null,
+  "run_id": null,
+  "resume": false,
+  "resume_token": null,
+  "system_prompt": null,
+  "metadata": {}
+}

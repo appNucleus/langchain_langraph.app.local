@@ -3,7 +3,7 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -15,6 +15,7 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
         case_sensitive=False,
+        populate_by_name=True,
     )
 
     # Application
@@ -28,12 +29,15 @@ class Settings(BaseSettings):
         "Be honest about uncertainty and missing tools."
     )
 
-    # Phase 5 run identity. A configured token secret makes resume tokens valid
-    # across process restarts. When empty, API_KEY is used; when both are empty,
-    # a process-local random secret keeps default local operation safe.
+    # Run identity. The existing namespace value is intentionally retained for
+    # checkpoint compatibility. Change it only with an explicit state migration.
     resume_token_secret: str = ""
     resume_token_ttl_seconds: int = Field(default=3600, ge=60, le=604800)
-    run_checkpoint_namespace: str = Field(default="phase5-v1", min_length=1, max_length=100)
+    run_checkpoint_namespace: str = Field(
+        default="phase5-v1",
+        min_length=1,
+        max_length=100,
+    )
     run_state_schema_version: int = Field(default=1, ge=1, le=1000)
     same_conversation_policy: Literal["reject"] = "reject"
 
@@ -100,8 +104,8 @@ class Settings(BaseSettings):
 
     # Backward-compatible deterministic query and prompt-service settings.
     # These services remain importable and their configuration contract is
-    # validated by the CI Settings scanner, even when the Phase 4 graph is the
-    # primary runtime orchestration path.
+    # validated by the CI Settings scanner even when the checkpointed graph is
+    # the primary runtime orchestration path.
     default_forecast_days: int = Field(default=7, ge=1, le=14)
     default_news_lookback_days: int = Field(default=7, ge=1, le=90)
     enable_llm_query_planning: bool = False
@@ -117,15 +121,56 @@ class Settings(BaseSettings):
     inventory_cache_ttl_seconds: int = Field(default=60, ge=1, le=3600)
     inventory_stale_if_error_seconds: int = Field(default=300, ge=0, le=86400)
 
-    # Phase 2 agent loop
-    phase2_max_iterations: int = Field(default=4, ge=1, le=10)
-    phase2_max_research_rounds: int = Field(default=2, ge=0, le=5)
-    phase2_max_replans: int = Field(default=1, ge=0, le=3)
-    phase2_max_context_chars: int = Field(default=16000, ge=2000, le=100000)
+    # Worker, research, verification, and replanning loop. The former numbered
+    # environment names remain accepted through validation aliases.
+    agent_max_iterations: int = Field(
+        default=4,
+        ge=1,
+        le=10,
+        validation_alias=AliasChoices(
+            "AGENT_MAX_ITERATIONS",
+            "PHASE2_MAX_ITERATIONS",
+            "agent_max_iterations",
+            "phase2_max_iterations",
+        ),
+    )
+    agent_max_research_rounds: int = Field(
+        default=2,
+        ge=0,
+        le=5,
+        validation_alias=AliasChoices(
+            "AGENT_MAX_RESEARCH_ROUNDS",
+            "PHASE2_MAX_RESEARCH_ROUNDS",
+            "agent_max_research_rounds",
+            "phase2_max_research_rounds",
+        ),
+    )
+    agent_max_replans: int = Field(
+        default=1,
+        ge=0,
+        le=3,
+        validation_alias=AliasChoices(
+            "AGENT_MAX_REPLANS",
+            "PHASE2_MAX_REPLANS",
+            "agent_max_replans",
+            "phase2_max_replans",
+        ),
+    )
+    agent_max_context_chars: int = Field(
+        default=16000,
+        ge=2000,
+        le=100000,
+        validation_alias=AliasChoices(
+            "AGENT_MAX_CONTEXT_CHARS",
+            "PHASE2_MAX_CONTEXT_CHARS",
+            "agent_max_context_chars",
+            "phase2_max_context_chars",
+        ),
+    )
     research_max_queries_per_task: int = Field(default=3, ge=1, le=8)
     research_max_evidence_chars_per_query: int = Field(default=6000, ge=500, le=50000)
 
-    # Phase 3 global execution budgets
+    # Global execution budgets
     execution_max_duration_seconds: float = Field(default=180.0, ge=5, le=1800)
     execution_max_model_calls: int = Field(default=8, ge=1, le=50)
     execution_max_tool_calls: int = Field(default=10, ge=0, le=100)
@@ -138,8 +183,8 @@ class Settings(BaseSettings):
     detailed_tracing_enabled: bool = True
     expose_internal_health_details: bool = False
 
-    # Phase 4 persistence backends. These remain independent so deployments can
-    # use PostgreSQL checkpoints with Redis history, or PostgreSQL for both.
+    # Persistence backends. These remain independent so deployments can use
+    # PostgreSQL checkpoints with Redis history, or PostgreSQL for both.
     state_backend: Literal["memory", "redis", "postgres"] = "memory"
     checkpoint_backend: Literal["memory", "postgres"] = "memory"
     artifact_backend: Literal["disabled", "minio"] = "disabled"
@@ -172,15 +217,33 @@ class Settings(BaseSettings):
 
     @property
     def ollama_max_concurrent_requests(self) -> int:
-        """Backward-compatible Phase 1 name used by older resource managers."""
+        """Deprecated compatibility name for ``ollama_max_concurrency``."""
 
         return self.ollama_max_concurrency
 
     @property
     def ollama_max_concurrent_heavy_requests(self) -> int:
-        """Backward-compatible Phase 1 name used by older resource managers."""
+        """Deprecated compatibility name for ``ollama_heavy_max_concurrency``."""
 
         return self.ollama_heavy_max_concurrency
+
+    # Compatibility properties for callers that still read the former numbered
+    # setting attributes. New code must use the agent_* names above.
+    @property
+    def phase2_max_iterations(self) -> int:
+        return self.agent_max_iterations
+
+    @property
+    def phase2_max_research_rounds(self) -> int:
+        return self.agent_max_research_rounds
+
+    @property
+    def phase2_max_replans(self) -> int:
+        return self.agent_max_replans
+
+    @property
+    def phase2_max_context_chars(self) -> int:
+        return self.agent_max_context_chars
 
     def model_for_key(self, key: str | None) -> str:
         role = (key or "general").strip().lower()

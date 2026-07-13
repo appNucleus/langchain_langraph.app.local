@@ -9,13 +9,6 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 _DEFAULT_CHAT_REQUEST_EXAMPLE: dict[str, Any] = {
     "message": "Continue the analysis",
-    "thread_id": None,
-    "conversation_id": None,
-    "run_id": None,
-    "resume": False,
-    "resume_token": None,
-    "system_prompt": None,
-    "metadata": {},
 }
 
 
@@ -32,17 +25,20 @@ def _load_chat_request_example() -> dict[str, Any]:
         return dict(_DEFAULT_CHAT_REQUEST_EXAMPLE)
     if not isinstance(raw, dict):
         return dict(_DEFAULT_CHAT_REQUEST_EXAMPLE)
-    return {**_DEFAULT_CHAT_REQUEST_EXAMPLE, **raw}
+    message = raw.get("message")
+    if not isinstance(message, str) or not message.strip():
+        return dict(_DEFAULT_CHAT_REQUEST_EXAMPLE)
+    return raw
 
 
 CHAT_REQUEST_EXAMPLE = _load_chat_request_example()
 CHAT_REQUEST_OPENAPI_EXAMPLES = {
     "default": {
-        "summary": "Complete request with every optional field at its default",
+        "summary": "Minimal new-conversation request",
         "description": (
-            "Send only message to start a new conversation, or replace any null/default "
-            "value with an explicit value. The server generates conversation and run IDs "
-            "when they are omitted."
+            "Send only message to start a new conversation. The server generates "
+            "conversation and run IDs when they are omitted. A complete contract "
+            "example is stored separately in docs/example_request/chat-complete.json."
         ),
         "value": CHAT_REQUEST_EXAMPLE,
     }

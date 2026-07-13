@@ -1,18 +1,17 @@
 from __future__ import annotations
 
 import pytest
-from langgraph.graph import END, START, StateGraph
 
 from app.graph import ChatAgent
-from app.graphs.state import AgentGraphState
 from app.schemas.chat import ChatRequest
 from app.schemas.execution import ExecutionBudget
 from app.settings import Settings
-from app.state.runtime import StateRuntime
 
 
 @pytest.mark.asyncio
-async def test_echo_graph_completes_with_execution_budget_metadata() -> None:
+async def test_echo_graph_preserves_execution_budget_and_completes() -> None:
+    """Regression test for the plan-node missing execution-budget failure."""
+
     settings = Settings(
         llm_backend="echo",
         mcp_enabled=False,
@@ -33,6 +32,8 @@ async def test_echo_graph_completes_with_execution_budget_metadata() -> None:
         await agent.aclose()
 
     assert response.backend == "echo"
+    # Compatibility-only metadata from the base ChatAgent remains stable.
+    assert response.metadata["phase"] == "4"
     assert "Message received" in response.response
     assert response.metadata["usage"]["model_calls"] == 0
     assert response.metadata["usage"]["tool_calls"] == 0
@@ -41,6 +42,13 @@ async def test_echo_graph_completes_with_execution_budget_metadata() -> None:
 
 @pytest.mark.asyncio
 async def test_checkpoint_round_trip_restores_execution_budget_type() -> None:
+    """Ensure strict checkpoint serialization can restore ExecutionBudget."""
+
+    from langgraph.graph import END, START, StateGraph
+
+    from app.graphs.state import AgentGraphState
+    from app.state.runtime import StateRuntime
+
     settings = Settings(
         llm_backend="echo",
         mcp_enabled=False,
