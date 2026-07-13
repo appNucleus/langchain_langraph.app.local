@@ -56,7 +56,8 @@ jobs:
       - name: Run unit and deterministic integration tests
         run: |
           set -euo pipefail
-          python -m pytest -q -m "not live_integration" \
+          python -m pytest -v -ra --tb=long -W default \
+            -m "not live_integration" \
             --junitxml=test-results/pytest.xml
 
       - name: Upload test report
