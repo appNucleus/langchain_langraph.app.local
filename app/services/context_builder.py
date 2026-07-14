@@ -12,11 +12,10 @@ def build_context(
     *,
     max_item_chars: int | None = None,
 ) -> list[dict[str, object]]:
-    """Build a bounded, deduplicated context with canonical provenance.
+    """Build bounded, deduplicated context with canonical provenance.
 
-    The returned dictionaries retain the established ``id``, ``source``,
-    ``content`` and ``metadata`` keys while exposing the newer Stage 4 fields.
-    Retrieved text remains explicitly delimited as untrusted data.
+    Retrieved text remains explicitly delimited as untrusted data, and wrapper
+    characters are included in both per-item and aggregate limits.
     """
 
     remaining = max(0, int(max_chars))
@@ -32,19 +31,22 @@ def build_context(
             continue
         seen.add(key)
 
+        prefix = f'<untrusted_evidence evidence_id="{item.evidence_id}">'
+        suffix = "</untrusted_evidence>"
         allowed = min(remaining, per_item)
+        wrapper_chars = len(prefix) + len(suffix)
+        if allowed <= wrapper_chars:
+            break
+
         original = item.normalized_text
-        body = original[:allowed]
+        body = original[: allowed - wrapper_chars]
+        wrapped = f"{prefix}{body}{suffix}"
         context_truncated = item.truncated or len(original) > len(body)
         metadata = dict(item.metadata)
         metadata.setdefault("original_content_chars", len(original))
-        metadata["context_content_chars"] = len(body)
+        metadata["context_content_chars"] = len(wrapped)
+        metadata["context_body_chars"] = len(body)
         metadata["context_truncated"] = context_truncated
-        wrapped = (
-            f'<untrusted_evidence evidence_id="{item.evidence_id}">'
-            f"{body}"
-            "</untrusted_evidence>"
-        )
         output.append(
             {
                 "id": item.evidence_id,
@@ -62,12 +64,12 @@ def build_context(
                 "metadata": metadata,
             }
         )
-        remaining -= len(body)
+        remaining -= len(wrapped)
     return output
 
 
 def context_character_count(items: Iterable[dict[str, Any]]) -> int:
-    """Return evidence-body characters without counting wrapper markup."""
+    """Return the exact bounded character count placed into model context."""
 
     total = 0
     for item in items:
@@ -77,10 +79,5 @@ def context_character_count(items: Iterable[dict[str, Any]]) -> int:
             if isinstance(measured, int) and measured >= 0:
                 total += measured
                 continue
-        content = str(item.get("content") or "")
-        opening_end = content.find(">")
-        closing_start = content.rfind("</untrusted_evidence>")
-        if content.startswith("<untrusted_evidence ") and 0 <= opening_end < closing_start:
-            content = content[opening_end + 1 : closing_start]
-        total += len(content)
+        total += len(str(item.get("content") or ""))
     return total

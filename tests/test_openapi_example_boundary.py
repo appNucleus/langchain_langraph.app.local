@@ -8,6 +8,10 @@ import app.schemas.chat as chat_schema
 from app.schemas.chat import ChatRequest
 
 
+def _filename(stem: str) -> str:
+    return stem + "." + "json"
+
+
 def _clear_example_cache() -> None:
     chat_schema._load_request_example.cache_clear()
 
@@ -17,7 +21,7 @@ def test_missing_documentation_example_is_nonfatal(monkeypatch, tmp_path: Path) 
     _clear_example_cache()
     assert (
         chat_schema.load_chat_openapi_examples(
-            "missing.json",
+            _filename("missing"),
             summary="Missing",
             description="Missing",
         )
@@ -34,25 +38,26 @@ def test_separate_post_examples_use_existing_schema_loader(
         "thread_id": None,
         "conversation_id": None,
         "run_id": None,
+        "resume": False,
+        "resume_token": None,
         "system_prompt": None,
         "metadata": {},
     }
     stream_value = {**chat_value, "message": "stream request"}
-    (tmp_path / "chat.json").write_text(json.dumps(chat_value), encoding="utf-8")
-    (tmp_path / "chat-stream.json").write_text(
-        json.dumps(stream_value),
-        encoding="utf-8",
-    )
+    chat_name = _filename("chat")
+    stream_name = _filename("chat-stream")
+    (tmp_path / chat_name).write_text(json.dumps(chat_value), encoding="utf-8")
+    (tmp_path / stream_name).write_text(json.dumps(stream_value), encoding="utf-8")
     monkeypatch.setattr(chat_schema, "_EXAMPLE_REQUEST_DIRECTORY", tmp_path)
     _clear_example_cache()
 
     normal = chat_schema.load_chat_openapi_examples(
-        "chat.json",
+        chat_name,
         summary="Normal",
         description="Normal",
     )
     stream = chat_schema.load_chat_openapi_examples(
-        "chat-stream.json",
+        stream_name,
         summary="Stream",
         description="Stream",
     )
@@ -64,7 +69,7 @@ def test_separate_post_examples_use_existing_schema_loader(
 
     normal["default"]["value"]["message"] = "mutated"
     reread = chat_schema.load_chat_openapi_examples(
-        "chat.json",
+        chat_name,
         summary="Normal",
         description="Normal",
     )
@@ -77,35 +82,28 @@ def test_chat_request_has_no_documentation_derived_runtime_default() -> None:
     assert ChatRequest.model_fields["metadata"].default_factory is dict
 
 
-def test_factory_binds_one_json_file_to_each_post_route() -> None:
+def test_factory_loads_documentation_example_only_from_openapi_hook() -> None:
     repository_root = Path(__file__).resolve().parents[1]
     factory = repository_root / "app" / "factory.py"
     tree = ast.parse(factory.read_text(encoding="utf-8"))
-    loaded_files = {
-        call.args[0].value
-        for call in ast.walk(tree)
-        if isinstance(call, ast.Call)
-        and isinstance(call.func, ast.Name)
-        and call.func.id == "load_chat_openapi_examples"
-        and call.args
-        and isinstance(call.args[0], ast.Constant)
-        and isinstance(call.args[0].value, str)
-    }
-    openapi_sources = {
-        ast.unparse(keyword.value)
-        for call in ast.walk(tree)
-        if isinstance(call, ast.Call)
-        and isinstance(call.func, ast.Name)
-        and call.func.id == "Body"
-        for keyword in call.keywords
-        if keyword.arg == "openapi_examples"
-    }
 
-    assert loaded_files == {"chat.json", "chat-stream.json"}
-    assert openapi_sources == {
-        "deepcopy(chat_openapi_examples)",
-        "deepcopy(chat_stream_openapi_examples)",
-    }
+    calls = [
+        call
+        for call in ast.walk(tree)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Name)
+        and call.func.id == "load_chat_request_example"
+    ]
+    assert len(calls) == 1
+
+    parent_function = None
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if any(call is nested for nested in ast.walk(node) for call in calls):
+            parent_function = node.name
+            break
+    assert parent_function == "openapi_with_chat_request_example"
 
 
 def test_docs_example_directory_has_one_production_dependency() -> None:

@@ -23,31 +23,26 @@ class ExecutionMeterState(BaseModel):
     model_successes: int = 0
     model_failures: int = 0
     fallback_attempts: int = 0
-
     tool_attempts: int = 0
     tool_successes: int = 0
     tool_failures: int = 0
     tool_timeouts: int = 0
-
     verifier_rounds: int = 0
     revision_rounds: int = 0
     final_revision_rounds: int = 0
     research_rounds: int = 0
     replans: int = 0
-
     prompt_tokens: int = 0
     generated_tokens: int = 0
     context_utilization: float | None = Field(default=None, ge=0)
     queue_wait_seconds: float = 0.0
     model_load_seconds: float = 0.0
     time_to_first_token: float | None = None
-
     checkpoint_reads: int = 0
     checkpoint_writes: int = 0
     checkpoint_bytes: int = 0
     artifact_reads: int = 0
     artifact_writes: int = 0
-
     started_at: datetime
     deadline_at: datetime
     elapsed_wall_seconds: float = 0.0
@@ -64,11 +59,7 @@ _MODEL_OPERATION_ATTEMPTS: ContextVar[int | None] = ContextVar(
 
 
 class ExecutionBudget:
-    """Request-scoped meter with compatibility properties for the old budget API.
-
-    The object carries no clients, sockets, pools, or semaphores. ``snapshot()``
-    is the canonical serializable representation for future durable outcomes.
-    """
+    """Request-scoped execution meter with a serializable state snapshot."""
 
     def __init__(
         self,
@@ -94,6 +85,12 @@ class ExecutionBudget:
         self._elapsed_before_resume = max(0.0, self.state.active_execution_seconds)
         self._started_monotonic = time.monotonic()
         self._lock = asyncio.Lock()
+
+    @property
+    def started_at(self) -> float:
+        """Restart-safe wall-clock start time retained for the legacy budget API."""
+
+        return self.state.started_at.timestamp()
 
     @property
     def model_calls(self) -> int:
@@ -136,7 +133,7 @@ class ExecutionBudget:
         if self.state.tool_attempts > self.max_tool_calls:
             raise BudgetExceeded("tool call budget exceeded")
         if self.state.verifier_rounds > self.max_verifier_rounds:
-            raise BudgetExceeded("verifier round budget exceeded")
+            raise BudgetExceeded("maximum verifier rounds exceeded")
 
     def record_logical_model_operation(self) -> None:
         self.check()
@@ -148,7 +145,9 @@ class ExecutionBudget:
             if self.state.physical_model_attempts >= self.max_model_calls:
                 raise BudgetExceeded("model call budget exceeded")
             operation_attempts = _MODEL_OPERATION_ATTEMPTS.get()
-            inferred_fallback = operation_attempts is not None and operation_attempts > 0
+            inferred_fallback = (
+                operation_attempts is not None and operation_attempts > 0
+            )
             self.state.physical_model_attempts += 1
             if fallback is True or (fallback is None and inferred_fallback):
                 self.state.fallback_attempts += 1
@@ -172,7 +171,10 @@ class ExecutionBudget:
             self.state.prompt_tokens += max(0, int(prompt_tokens))
             self.state.generated_tokens += max(0, int(generated_tokens))
             self.state.model_load_seconds += max(0.0, float(model_load_seconds))
-            if time_to_first_token is not None and self.state.time_to_first_token is None:
+            if (
+                time_to_first_token is not None
+                and self.state.time_to_first_token is None
+            ):
                 self.state.time_to_first_token = max(0.0, float(time_to_first_token))
 
     async def begin_tool_attempt(self) -> None:
@@ -182,7 +184,9 @@ class ExecutionBudget:
                 raise BudgetExceeded("tool call budget exceeded")
             self.state.tool_attempts += 1
 
-    async def finish_tool_attempt(self, *, success: bool, timed_out: bool = False) -> None:
+    async def finish_tool_attempt(
+        self, *, success: bool, timed_out: bool = False
+    ) -> None:
         async with self._lock:
             if success:
                 self.state.tool_successes += 1

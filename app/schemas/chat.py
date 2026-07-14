@@ -7,9 +7,9 @@ from copy import deepcopy
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
-from pydantic import BaseModel, Field, ValidationError, model_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 logger = logging.getLogger(__name__)
 
@@ -22,18 +22,75 @@ _EXAMPLE_REQUEST_DIRECTORY = (
 
 
 class ChatRequest(BaseModel):
+    """Public chat request with server-owned execution identity generation."""
+
     message: str = Field(..., min_length=1, max_length=20000)
     thread_id: str | None = Field(
         default=None,
+        max_length=200,
         description="Deprecated compatibility alias for conversation_id.",
     )
-    conversation_id: str | None = None
-    run_id: str | None = None
+    conversation_id: str | None = Field(
+        default=None,
+        max_length=200,
+        description="Stable user-visible conversation identifier.",
+    )
+    run_id: str | None = Field(
+        default=None,
+        description=(
+            "Optional UUID for an idempotent retry. Omit it for a new "
+            "server-generated run."
+        ),
+    )
+    resume: bool = Field(
+        default=False,
+        description="Resume an interrupted run using a server-issued resume_token.",
+    )
+    resume_token: str | None = Field(
+        default=None,
+        max_length=4096,
+        description="Signed token returned by the server for explicit run resumption.",
+    )
     system_prompt: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
+    @field_validator("message")
+    @classmethod
+    def normalize_message(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("message must not be blank")
+        return value
+
+    @field_validator(
+        "thread_id",
+        "conversation_id",
+        "run_id",
+        "resume_token",
+        "system_prompt",
+        mode="before",
+    )
+    @classmethod
+    def normalize_optional_text(cls, value: Any) -> Any:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            stripped = value.strip()
+            return stripped or None
+        return value
+
+    @field_validator("run_id")
+    @classmethod
+    def validate_run_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        try:
+            return str(UUID(value))
+        except ValueError as exc:
+            raise ValueError("run_id must be a valid UUID") from exc
+
     @model_validator(mode="after")
-    def normalize_legacy_identity(self) -> "ChatRequest":
+    def validate_identity_contract(self) -> "ChatRequest":
         if (
             self.thread_id
             and self.conversation_id
@@ -42,14 +99,10 @@ class ChatRequest(BaseModel):
             raise ValueError(
                 "thread_id and conversation_id must match when both are provided"
             )
-        if self.conversation_id is None and self.thread_id is not None:
-            self.conversation_id = self.thread_id
-        if self.conversation_id is None:
-            self.conversation_id = str(uuid4())
-        if self.thread_id is None:
-            self.thread_id = self.conversation_id
-        if self.run_id is None:
-            self.run_id = str(uuid4())
+        if self.resume and not self.resume_token:
+            raise ValueError("resume_token is required when resume=true")
+        if self.resume_token and not self.resume:
+            raise ValueError("resume must be true when resume_token is provided")
         return self
 
 
@@ -103,22 +156,14 @@ class ChatResponse(BaseModel):
 
 
 def _validate_request_example(value: Mapping[str, Any]) -> dict[str, Any]:
-    """Validate code-supplied OpenAPI data without turning it into defaults."""
+    """Validate documentation data without turning it into request defaults."""
 
     raw = deepcopy(dict(value))
     ChatRequest.model_validate(raw)
     return raw
 
 
-@lru_cache(maxsize=None)
-def _load_request_example(filename: str) -> dict[str, Any] | None:
-    """Load one documentation-only Swagger request from the established folder.
-
-    The file is used only while FastAPI constructs OpenAPI metadata. It never
-    supplies Pydantic defaults, runtime request values, graph state, or tests.
-    Missing or malformed documentation is non-fatal to the API runtime.
-    """
-
+def _read_request_example(filename: str) -> dict[str, Any] | None:
     safe_name = Path(filename).name
     if safe_name != filename or not safe_name.endswith(".json"):
         logger.warning("openapi_request_example_invalid_filename: %s", filename)
@@ -137,6 +182,13 @@ def _load_request_example(filename: str) -> dict[str, Any] | None:
             exc,
         )
         return None
+
+
+@lru_cache(maxsize=None)
+def _load_request_example(filename: str) -> dict[str, Any] | None:
+    """Cache documentation examples used by generated OpenAPI metadata."""
+
+    return _read_request_example(filename)
 
 
 def _build_openapi_examples(
@@ -176,16 +228,16 @@ def load_chat_openapi_examples(
 def load_chat_request_example(
     filename: str = CHAT_REQUEST_EXAMPLE_FILENAME,
 ) -> dict[str, Any] | None:
-    """Return a defensive copy of one documentation-only request example."""
+    """Read one documentation-only request example without sharing cache state."""
 
-    value = _load_request_example(filename)
+    value = _read_request_example(filename)
     return deepcopy(value) if value is not None else None
 
 
 def load_request_example(
     filename: str = CHAT_REQUEST_EXAMPLE_FILENAME,
 ) -> dict[str, Any] | None:
-    """Compatibility alias for the repository's established JSON loader."""
+    """Compatibility alias for the established documentation loader."""
 
     return load_chat_request_example(filename)
 
@@ -196,13 +248,6 @@ def build_chat_request_openapi_examples(
     summary: str = "Complete chat request",
     description: str = "Default values for the chat request.",
 ) -> dict[str, dict[str, Any]] | None:
-    """Build a request example from injected data or the established JSON file.
-
-    A mapping is the dependency-injection path used by application tests. A
-    string remains the compatibility path for selecting a stored JSON filename.
-    Neither path changes Pydantic defaults or runtime request normalization.
-    """
-
     if isinstance(example, Mapping):
         return _build_openapi_examples(
             example,
@@ -223,8 +268,6 @@ def build_chat_stream_request_openapi_examples(
     summary: str = "Complete streaming chat request",
     description: str = "Default values for the streaming chat request.",
 ) -> dict[str, dict[str, Any]] | None:
-    """Build the streaming POST example through the same JSON mechanism."""
-
     if isinstance(example, Mapping):
         return _build_openapi_examples(
             example,

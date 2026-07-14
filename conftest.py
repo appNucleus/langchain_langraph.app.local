@@ -54,10 +54,7 @@ def _file_sha256(path: Path) -> str:
 
 def _repository_snapshot() -> dict[str, Any]:
     files = {
-        name: {
-            "exists": Path(name).is_file(),
-            "sha256": _file_sha256(Path(name)),
-        }
+        name: {"exists": Path(name).is_file(), "sha256": _file_sha256(Path(name))}
         for name in _CRITICAL_PATHS
     }
     return {
@@ -75,9 +72,8 @@ def pytest_configure(config: Any) -> None:
     _PYTEST_CONFIG = config
     _FAILURE_RECORDS.clear()
     _RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    snapshot = _repository_snapshot()
     (_RESULTS_DIR / "repository-snapshot.json").write_text(
-        json.dumps(snapshot, indent=2, sort_keys=True),
+        json.dumps(_repository_snapshot(), indent=2, sort_keys=True),
         encoding="utf-8",
     )
 
@@ -99,13 +95,6 @@ def pytest_report_header(config: Any) -> list[str]:
     ]
 
 
-def _escape_workflow_command(value: object, *, property_value: bool = False) -> str:
-    text = str(value).replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
-    if property_value:
-        text = text.replace(":", "%3A").replace(",", "%2C")
-    return text
-
-
 def _terminal() -> Any | None:
     if _PYTEST_CONFIG is None:
         return None
@@ -120,16 +109,22 @@ def _captured_sections(report: Any) -> str:
     return "".join(sections)
 
 
+def _escape_workflow_command(value: object, *, property_value: bool = False) -> str:
+    text = str(value).replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+    if property_value:
+        text = text.replace(":", "%3A").replace(",", "%2C")
+    return text
+
+
 def pytest_runtest_logreport(report: Any) -> None:
-    """Persist every failed setup/call/teardown report with full captured output."""
+    """Persist every failed setup/call/teardown report with captured output."""
 
     if not getattr(report, "failed", False):
         return
-
     longrepr = getattr(report, "longreprtext", None) or str(report.longrepr)
     details = (
         f"NODEID: {report.nodeid}\n"
-        f"PHASE: {report.when}\n"
+        f"WHEN: {report.when}\n"
         f"DURATION_SECONDS: {getattr(report, 'duration', 0.0):.6f}\n\n"
         f"{longrepr.rstrip()}\n"
         f"{_captured_sections(report)}"
@@ -142,8 +137,6 @@ def pytest_runtest_logreport(report: Any) -> None:
     }
     _FAILURE_RECORDS.append(record)
 
-    # Print immediately so a cancelled or interrupted run still contains the
-    # traceback in the Actions console, not only in a final summary or JUnit.
     terminal = _terminal()
     if terminal is not None:
         terminal.write_line(f"::group::pytest failure: {report.nodeid} [{report.when}]")
@@ -152,11 +145,13 @@ def pytest_runtest_logreport(report: Any) -> None:
         terminal.write_line("::endgroup::")
 
     if os.getenv("GITHUB_ACTIONS", "").lower() == "true":
-        first_line = longrepr.strip().splitlines()[-1] if longrepr.strip() else "test failed"
+        first_line = (
+            longrepr.strip().splitlines()[-1] if longrepr.strip() else "test failed"
+        )
         annotation = (
             "::error "
             f"title={_escape_workflow_command('pytest failure', property_value=True)}::"
-            f"{_escape_workflow_command(f'{report.nodeid} [{report.when}] - {first_line}') }"
+            f"{_escape_workflow_command(f'{report.nodeid} [{report.when}] - {first_line}')}"
         )
         if terminal is not None:
             terminal.write_line(annotation)
@@ -168,7 +163,6 @@ def pytest_sessionfinish(session: Any, exitstatus: int) -> None:
     del session
     _RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     snapshot = _repository_snapshot()
-
     text_parts = [
         "PYTEST FAILURE DIAGNOSTICS",
         f"exit_status: {exitstatus}",
@@ -216,22 +210,23 @@ def pytest_warning_recorded(
     nodeid: str,
     location: tuple[str, int, str] | None,
 ) -> None:
-    """Mirror warnings as yellow GitHub Actions annotations."""
+    """Mirror warnings as GitHub Actions annotations."""
 
     del nodeid
     if os.getenv("GITHUB_ACTIONS", "").lower() != "true":
         return
-
     filename = getattr(warning_message, "filename", "") or ""
     lineno = int(getattr(warning_message, "lineno", 0) or 0)
     if location:
         filename = location[0] or filename
         lineno = int(location[1] or lineno)
-
-    category = getattr(getattr(warning_message, "category", None), "__name__", "Warning")
+    category = getattr(
+        getattr(warning_message, "category", None), "__name__", "Warning"
+    )
     message = getattr(warning_message, "message", warning_message)
-    title = f"pytest {category} ({when})"
-    properties = [f"title={_escape_workflow_command(title, property_value=True)}"]
+    properties = [
+        f"title={_escape_workflow_command(f'pytest {category} ({when})', property_value=True)}"
+    ]
     if filename:
         properties.append(
             f"file={_escape_workflow_command(filename, property_value=True)}"
@@ -239,8 +234,7 @@ def pytest_warning_recorded(
     if lineno > 0:
         properties.append(f"line={lineno}")
     annotation = (
-        f"::warning {','.join(properties)}::"
-        f"{_escape_workflow_command(message)}"
+        f"::warning {','.join(properties)}::{_escape_workflow_command(message)}"
     )
 
     terminal = _terminal()

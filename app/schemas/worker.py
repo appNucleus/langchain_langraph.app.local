@@ -7,13 +7,7 @@ from pydantic import BaseModel, Field, field_validator
 
 
 def _normalize_string_list(value: Any, *, field_name: str) -> list[str]:
-    """Normalize a scalar string or a concrete string sequence.
-
-    Local structured-output models occasionally return one string instead of a
-    one-item list. Accept that deterministic shape, but reject mappings,
-    nested containers, booleans, and other ambiguous values instead of silently
-    stringifying them.
-    """
+    """Normalize a scalar string or a concrete string sequence."""
 
     if value is None:
         return []
@@ -53,10 +47,9 @@ def _normalize_evidence_ids(value: Any) -> list[str]:
 
 
 class Claim(BaseModel):
-    # These fields support Stage 4 grounding. They remain absent from the
-    # established public serialization when they carry only their defaults.
-    # Stable fallback IDs are derived by the grounding service, not injected
-    # into every WorkerResult returned to existing callers.
+    # Grounding fields remain absent from established public serialization when
+    # they carry only their defaults. Stable fallback IDs are derived by the
+    # grounding service rather than injected into every legacy response.
     claim_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
     text: str
     evidence_ids: list[str] = Field(default_factory=list)

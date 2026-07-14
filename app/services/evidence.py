@@ -42,7 +42,10 @@ def canonicalize_uri(uri: str | None) -> str | None:
         return uri.strip() or None
     host = parsed.hostname.lower() if parsed.hostname else ""
     port = parsed.port
-    if port and not ((parsed.scheme == "http" and port == 80) or (parsed.scheme == "https" and port == 443)):
+    if port and not (
+        (parsed.scheme == "http" and port == 80)
+        or (parsed.scheme == "https" and port == 443)
+    ):
         host = f"{host}:{port}"
     query = urlencode(
         sorted(
@@ -53,7 +56,6 @@ def canonicalize_uri(uri: str | None) -> str | None:
     )
     path = parsed.path or "/"
     return urlunsplit((parsed.scheme.lower(), host, path, query, ""))
-
 
 
 def source_quality_for_uri(uri: str | None) -> str:
@@ -71,14 +73,26 @@ def source_quality_for_uri(uri: str | None) -> str:
 
 
 def freshness_for_result(
-    *, published_at: datetime | None, query: str, retrieved_at: datetime
+    *,
+    published_at: datetime | None,
+    query: str,
+    retrieved_at: datetime,
 ) -> str:
     lowered = query.lower()
     time_sensitive = any(
         token in lowered
         for token in (
-            "current", "latest", "today", "tomorrow", "weather", "news",
-            "score", "schedule", "price", "president", "ceo",
+            "current",
+            "latest",
+            "today",
+            "tomorrow",
+            "weather",
+            "news",
+            "score",
+            "schedule",
+            "price",
+            "president",
+            "ceo",
         )
     )
     if not time_sensitive:
@@ -101,6 +115,7 @@ def _parse_datetime(value: object) -> datetime | None:
         parsed = parsed.replace(tzinfo=UTC)
     return parsed.astimezone(UTC)
 
+
 def normalize_text(value: object, *, max_chars: int = 12000) -> tuple[str, bool]:
     if isinstance(value, str):
         text = value
@@ -116,7 +131,11 @@ def content_hash(text: str) -> str:
 
 
 def scan_for_prompt_injection(text: str) -> str:
-    return "suspicious" if any(pattern.search(text) for pattern in _INJECTION_PATTERNS) else "clean"
+    return (
+        "suspicious"
+        if any(pattern.search(text) for pattern in _INJECTION_PATTERNS)
+        else "clean"
+    )
 
 
 def evidence_from_metadata(
@@ -139,7 +158,9 @@ def evidence_from_metadata(
         else:
             payload = {"content": item}
         text, truncated = normalize_text(payload.get("content", payload))
-        evidence_id = str(payload.get("id") or payload.get("evidence_id") or f"user-{index}")
+        evidence_id = str(
+            payload.get("id") or payload.get("evidence_id") or f"user-{index}"
+        )
         result.append(
             EvidenceItem(
                 evidence_id=evidence_id,
@@ -166,7 +187,6 @@ def evidence_from_metadata(
     return result
 
 
-
 def retrieved_evidence(
     *,
     evidence_id: str,
@@ -179,11 +199,10 @@ def retrieved_evidence(
     query_id: str | None = None,
     query: str = "",
 ) -> EvidenceItem:
-    """Build canonical evidence from a successful retrieved value.
+    """Build canonical evidence from one successful retrieved value.
 
-    This is the established public helper used by callers and tests. It now
-    delegates to the canonical Stage 4 fields rather than maintaining a second
-    evidence representation.
+    This established public helper preserves its compatibility signature while
+    delegating to the canonical provenance and grounding fields.
     """
 
     normalized, normalized_truncated = normalize_text(content)
@@ -238,6 +257,7 @@ def retrieved_evidence(
         metadata={"query": query} if query else {},
     )
 
+
 def evidence_from_tool_result(
     *,
     result: object,
@@ -257,11 +277,15 @@ def evidence_from_tool_result(
     canonical_uri = canonicalize_uri(source_uri)
     retrieved_at = datetime.now(UTC)
     published_at = _parse_datetime(
-        _first_named_value(data, ("published_at", "published", "date_published", "date"))
+        _first_named_value(
+            data,
+            ("published_at", "published", "date_published", "date"),
+        )
     )
     source_title = _first_named_value(data, ("title", "source_title", "name"))
     raw_artifact_uri = _first_named_value(
-        data, ("raw_artifact_uri", "artifact_uri", "object_uri")
+        data,
+        ("raw_artifact_uri", "artifact_uri", "object_uri"),
     )
     return EvidenceItem(
         evidence_id=evidence_id,
@@ -281,12 +305,14 @@ def evidence_from_tool_result(
         trust_class="retrieved_external" if ok else "tool_error",
         freshness_status=(
             freshness_for_result(
-                published_at=published_at, query=query, retrieved_at=retrieved_at
+                published_at=published_at,
+                query=query,
+                retrieved_at=retrieved_at,
             )
             if ok
             else "unknown"
         ),
-        source_quality=source_quality_for_uri(source_uri) if ok else "unverifiable",
+        source_quality=(source_quality_for_uri(source_uri) if ok else "unverifiable"),
         injection_scan_status=scan_for_prompt_injection(text),
         truncated=truncated,
         tool_status="success" if ok else "failed",
@@ -305,7 +331,6 @@ def deduplicate_evidence(items: Iterable[EvidenceItem]) -> list[EvidenceItem]:
         seen.add(key)
         output.append(item)
     return output
-
 
 
 def _first_named_value(value: object, keys: tuple[str, ...]) -> object | None:
