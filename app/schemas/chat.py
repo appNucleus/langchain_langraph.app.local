@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Mapping
 from copy import deepcopy
 from functools import lru_cache
 from pathlib import Path
@@ -11,7 +12,6 @@ from uuid import uuid4
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
 logger = logging.getLogger(__name__)
-
 
 CHAT_REQUEST_EXAMPLE_FILENAME = "chat.json"
 CHAT_STREAM_REQUEST_EXAMPLE_FILENAME = "chat-stream.json"
@@ -34,7 +34,11 @@ class ChatRequest(BaseModel):
 
     @model_validator(mode="after")
     def normalize_legacy_identity(self) -> "ChatRequest":
-        if self.thread_id and self.conversation_id and self.thread_id != self.conversation_id:
+        if (
+            self.thread_id
+            and self.conversation_id
+            and self.thread_id != self.conversation_id
+        ):
             raise ValueError(
                 "thread_id and conversation_id must match when both are provided"
             )
@@ -98,6 +102,14 @@ class ChatResponse(BaseModel):
         )
 
 
+def _validate_request_example(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate code-supplied OpenAPI data without turning it into defaults."""
+
+    raw = deepcopy(dict(value))
+    ChatRequest.model_validate(raw)
+    return raw
+
+
 @lru_cache(maxsize=None)
 def _load_request_example(filename: str) -> dict[str, Any] | None:
     """Load one documentation-only Swagger request from the established folder.
@@ -117,11 +129,30 @@ def _load_request_example(filename: str) -> dict[str, Any] | None:
         raw = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(raw, dict):
             raise ValueError("request example must be a JSON object")
-        ChatRequest.model_validate(raw)
+        return _validate_request_example(raw)
     except (OSError, ValueError, json.JSONDecodeError, ValidationError) as exc:
-        logger.warning("openapi_request_example_unavailable file=%s error=%s", path, exc)
+        logger.warning(
+            "openapi_request_example_unavailable file=%s error=%s",
+            path,
+            exc,
+        )
         return None
-    return raw
+
+
+def _build_openapi_examples(
+    value: Mapping[str, Any],
+    *,
+    summary: str,
+    description: str,
+) -> dict[str, dict[str, Any]]:
+    validated = _validate_request_example(value)
+    return {
+        "default": {
+            "summary": summary,
+            "description": description,
+            "value": deepcopy(validated),
+        }
+    }
 
 
 def load_chat_openapi_examples(
@@ -135,14 +166,11 @@ def load_chat_openapi_examples(
     value = _load_request_example(filename)
     if value is None:
         return None
-    return {
-        "default": {
-            "summary": summary,
-            "description": description,
-            "value": deepcopy(value),
-        }
-    }
-
+    return _build_openapi_examples(
+        value,
+        summary=summary,
+        description=description,
+    )
 
 
 def load_chat_request_example(
@@ -163,18 +191,25 @@ def load_request_example(
 
 
 def build_chat_request_openapi_examples(
-    filename: str = CHAT_REQUEST_EXAMPLE_FILENAME,
+    example: Mapping[str, Any] | str | None = None,
     *,
     summary: str = "Complete chat request",
     description: str = "Default values for the chat request.",
 ) -> dict[str, dict[str, Any]] | None:
-    """Build the existing Swagger example mapping from a stored JSON file.
+    """Build a request example from injected data or the established JSON file.
 
-    The function is intentionally a compatibility facade over
-    ``load_chat_openapi_examples``. It does not create runtime defaults and it
-    does not introduce a second way to attach examples to FastAPI routes.
+    A mapping is the dependency-injection path used by application tests. A
+    string remains the compatibility path for selecting a stored JSON filename.
+    Neither path changes Pydantic defaults or runtime request normalization.
     """
 
+    if isinstance(example, Mapping):
+        return _build_openapi_examples(
+            example,
+            summary=summary,
+            description=description,
+        )
+    filename = example or CHAT_REQUEST_EXAMPLE_FILENAME
     return load_chat_openapi_examples(
         filename,
         summary=summary,
@@ -183,13 +218,20 @@ def build_chat_request_openapi_examples(
 
 
 def build_chat_stream_request_openapi_examples(
-    filename: str = CHAT_STREAM_REQUEST_EXAMPLE_FILENAME,
+    example: Mapping[str, Any] | str | None = None,
     *,
     summary: str = "Complete streaming chat request",
     description: str = "Default values for the streaming chat request.",
 ) -> dict[str, dict[str, Any]] | None:
-    """Build the streaming POST example through the same JSON loader."""
+    """Build the streaming POST example through the same JSON mechanism."""
 
+    if isinstance(example, Mapping):
+        return _build_openapi_examples(
+            example,
+            summary=summary,
+            description=description,
+        )
+    filename = example or CHAT_STREAM_REQUEST_EXAMPLE_FILENAME
     return load_chat_openapi_examples(
         filename,
         summary=summary,

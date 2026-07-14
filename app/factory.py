@@ -15,27 +15,62 @@ from app import __version__
 from app.graph import ChatAgent, encode_sse
 from app.logging_config import configure_logging, log_kv
 from app.observability.metrics import metrics
-from app.schemas.chat import ChatRequest, ChatResponse, load_chat_openapi_examples
+from app.schemas.chat import (
+    ChatRequest,
+    ChatResponse,
+    build_chat_request_openapi_examples,
+    build_chat_stream_request_openapi_examples,
+    load_chat_openapi_examples,
+    load_chat_request_example as _load_chat_request_example,
+)
 from app.services.inventory import build_inventory_payload
 from app.settings import Settings, get_settings
 
 logger = logging.getLogger(__name__)
+
+# Public compatibility seam used by tests and embedders to inject documentation
+# examples without reading repository JSON files. Production keeps the schema
+# loader unchanged and therefore uses one stored JSON file per POST route.
+load_chat_request_example = _load_chat_request_example
 
 
 def create_app(*, settings: Settings | None = None, chat_agent: ChatAgent | None = None) -> FastAPI:
     app_settings = settings or get_settings()
     configure_logging(app_settings.log_level)
     agent = chat_agent or ChatAgent(app_settings)
-    chat_openapi_examples = load_chat_openapi_examples(
-        "chat.json",
-        summary="Complete chat request",
-        description="Default values for the non-streaming chat request.",
-    )
-    chat_stream_openapi_examples = load_chat_openapi_examples(
-        "chat-stream.json",
-        summary="Complete streaming chat request",
-        description="Default values for the streaming chat request.",
-    )
+    if load_chat_request_example is _load_chat_request_example:
+        chat_openapi_examples = load_chat_openapi_examples(
+            "chat.json",
+            summary="Complete chat request",
+            description="Default values for the non-streaming chat request.",
+        )
+        chat_stream_openapi_examples = load_chat_openapi_examples(
+            "chat-stream.json",
+            summary="Complete streaming chat request",
+            description="Default values for the streaming chat request.",
+        )
+    else:
+        # Preserve the established code-injection contract. An explicit
+        # factory-level override applies consistently to all chat POST routes.
+        injected_example = load_chat_request_example()
+        chat_openapi_examples = (
+            build_chat_request_openapi_examples(
+                injected_example,
+                summary="Complete chat request",
+                description="Default values for the non-streaming chat request.",
+            )
+            if injected_example is not None
+            else None
+        )
+        chat_stream_openapi_examples = (
+            build_chat_stream_request_openapi_examples(
+                injected_example,
+                summary="Complete streaming chat request",
+                description="Default values for the streaming chat request.",
+            )
+            if injected_example is not None
+            else None
+        )
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
