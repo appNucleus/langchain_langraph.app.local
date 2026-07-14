@@ -64,10 +64,10 @@ jobs:
           python -m pip check
 
       - name: Compile Python sources
-        run: python -m compileall -q app tests
+        run: python -m compileall -q app tests scripts/check_coverage_thresholds.py
 
       - name: Run correctness lint gate
-        run: python -m ruff check app tests
+        run: python -m ruff check app tests scripts/check_coverage_thresholds.py
 
       - name: Run unit and deterministic integration tests
         run: |
@@ -77,14 +77,18 @@ jobs:
             --junitxml=test-results/pytest.xml \
             --cov=app \
             --cov-branch \
+            --cov-config=pyproject.toml \
             --cov-report=
 
-      - name: Generate code coverage reports
+      - name: Generate and enforce code coverage reports
         run: |
           set -euo pipefail
-          python -m coverage report --show-missing
-          python -m coverage xml -o test-results/coverage.xml
-          python -m coverage json -o test-results/coverage.json
+          python -m coverage xml --rcfile=pyproject.toml -o test-results/coverage.xml
+          python -m coverage json --rcfile=pyproject.toml -o test-results/coverage.json
+          python -m coverage report --rcfile=pyproject.toml
+          python scripts/check_coverage_thresholds.py \
+            test-results/coverage.json \
+            --config pyproject.toml
 
       - name: Upload test and coverage reports
         if: always()
