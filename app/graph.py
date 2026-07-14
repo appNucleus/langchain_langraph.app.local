@@ -11,7 +11,7 @@ from app.agents.planner import PlannerAgent
 from app.agents.synthesizer import SynthesizerAgent
 from app.agents.verifier import VerifierAgent
 from app.agents.worker import WorkerAgent
-from app.graphs.routes import after_advance, after_verification
+from app.graphs.routes import after_advance, after_plan, after_verification
 from app.graphs.state import AgentGraphState
 from app.llm.ollama import OllamaClient
 from app.mcp.client import MCPClient
@@ -122,7 +122,15 @@ class ChatAgent:
         builder.add_node("terminate", self._terminate)
 
         builder.add_edge(START, "plan")
-        builder.add_edge("plan", "worker")
+        builder.add_conditional_edges(
+            "plan",
+            after_plan,
+            {
+                "research": "research",
+                "worker": "worker",
+                "terminate": "terminate",
+            },
+        )
         builder.add_edge("worker", "verify")
         builder.add_conditional_edges(
             "verify",
@@ -139,7 +147,14 @@ class ChatAgent:
         builder.add_edge("research", "worker")
         builder.add_edge("replan", "worker")
         builder.add_conditional_edges(
-            "advance", after_advance, {"worker": "worker", "finalize": "finalize"}
+            "advance",
+            after_advance,
+            {
+                "research": "research",
+                "worker": "worker",
+                "finalize": "finalize",
+                "terminate": "terminate",
+            },
         )
         builder.add_edge("finalize", END)
         builder.add_edge("terminate", END)

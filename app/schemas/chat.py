@@ -12,6 +12,10 @@ from pydantic import BaseModel, Field, ValidationError, model_validator
 
 logger = logging.getLogger(__name__)
 
+
+CHAT_REQUEST_EXAMPLE_FILENAME = "chat.json"
+CHAT_STREAM_REQUEST_EXAMPLE_FILENAME = "chat-stream.json"
+
 _EXAMPLE_REQUEST_DIRECTORY = (
     Path(__file__).resolve().parents[2] / "docs" / "example_request"
 )
@@ -138,3 +142,56 @@ def load_chat_openapi_examples(
             "value": deepcopy(value),
         }
     }
+
+
+
+def load_chat_request_example(
+    filename: str = CHAT_REQUEST_EXAMPLE_FILENAME,
+) -> dict[str, Any] | None:
+    """Return a defensive copy of one documentation-only request example."""
+
+    value = _load_request_example(filename)
+    return deepcopy(value) if value is not None else None
+
+
+def load_request_example(
+    filename: str = CHAT_REQUEST_EXAMPLE_FILENAME,
+) -> dict[str, Any] | None:
+    """Compatibility alias for the repository's established JSON loader."""
+
+    return load_chat_request_example(filename)
+
+
+def build_chat_request_openapi_examples(
+    filename: str = CHAT_REQUEST_EXAMPLE_FILENAME,
+    *,
+    summary: str = "Complete chat request",
+    description: str = "Default values for the chat request.",
+) -> dict[str, dict[str, Any]] | None:
+    """Build the existing Swagger example mapping from a stored JSON file.
+
+    The function is intentionally a compatibility facade over
+    ``load_chat_openapi_examples``. It does not create runtime defaults and it
+    does not introduce a second way to attach examples to FastAPI routes.
+    """
+
+    return load_chat_openapi_examples(
+        filename,
+        summary=summary,
+        description=description,
+    )
+
+
+def build_chat_stream_request_openapi_examples(
+    filename: str = CHAT_STREAM_REQUEST_EXAMPLE_FILENAME,
+    *,
+    summary: str = "Complete streaming chat request",
+    description: str = "Default values for the streaming chat request.",
+) -> dict[str, dict[str, Any]] | None:
+    """Build the streaming POST example through the same JSON loader."""
+
+    return load_chat_openapi_examples(
+        filename,
+        summary=summary,
+        description=description,
+    )

@@ -151,7 +151,7 @@ def evidence_from_metadata(
                 content_hash=content_hash(text),
                 trust_class="user_supplied",
                 freshness_status="unknown",
-                source_quality="user_supplied",
+                source_quality="unknown",
                 injection_scan_status=scan_for_prompt_injection(text),
                 truncated=truncated,
                 tool_status="not_applicable",
@@ -165,6 +165,78 @@ def evidence_from_metadata(
         )
     return result
 
+
+
+def retrieved_evidence(
+    *,
+    evidence_id: str,
+    tool_name: str,
+    raw_value: object,
+    content: object,
+    truncated: bool = False,
+    run_id: str = "request",
+    task_id: str = "request",
+    query_id: str | None = None,
+    query: str = "",
+) -> EvidenceItem:
+    """Build canonical evidence from a successful retrieved value.
+
+    This is the established public helper used by callers and tests. It now
+    delegates to the canonical Stage 4 fields rather than maintaining a second
+    evidence representation.
+    """
+
+    normalized, normalized_truncated = normalize_text(content)
+    source_uri = _first_uri(raw_value)
+    canonical_uri = canonicalize_uri(source_uri)
+    retrieved_at = datetime.now(UTC)
+    published_at = _parse_datetime(
+        _first_named_value(
+            raw_value,
+            ("published_at", "published", "date_published", "date"),
+        )
+    )
+    source_title = _first_named_value(
+        raw_value,
+        ("title", "source_title", "name"),
+    )
+    content_type = _first_named_value(
+        raw_value,
+        ("content_type", "mime_type", "media_type"),
+    )
+    raw_artifact_uri = _first_named_value(
+        raw_value,
+        ("raw_artifact_uri", "artifact_uri", "object_uri"),
+    )
+    return EvidenceItem(
+        evidence_id=evidence_id,
+        run_id=run_id,
+        task_id=task_id,
+        query_id=query_id,
+        tool_name=tool_name,
+        source_uri=source_uri,
+        canonical_uri=canonical_uri,
+        source_title=str(source_title or tool_name),
+        retrieved_at=retrieved_at,
+        published_at=published_at,
+        content_type=str(content_type or "text/plain"),
+        raw_artifact_uri=str(raw_artifact_uri) if raw_artifact_uri else None,
+        normalized_text=normalized,
+        summary=normalized,
+        content_hash=content_hash(normalized),
+        trust_class="retrieved_external",
+        freshness_status=freshness_for_result(
+            published_at=published_at,
+            query=query,
+            retrieved_at=retrieved_at,
+        ),
+        source_quality=source_quality_for_uri(source_uri),
+        injection_scan_status=scan_for_prompt_injection(normalized),
+        truncated=bool(truncated or normalized_truncated),
+        tool_status="success",
+        eligible_for_claim_support=True,
+        metadata={"query": query} if query else {},
+    )
 
 def evidence_from_tool_result(
     *,

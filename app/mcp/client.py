@@ -38,6 +38,8 @@ class MCPClientError(MCPError):
 class MCPClient:
     """Session-aware async JSON-RPC client with physical-request metering."""
 
+    physical_attempts_metered = True
+
     def __init__(
         self,
         settings: Settings,
