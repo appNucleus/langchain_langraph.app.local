@@ -2,77 +2,67 @@ from __future__ import annotations
 
 import ast
 import re
+import subprocess
 from pathlib import Path
 
-_NUMBERED_DELIVERY = re.compile(r"(?:phase|stage)[_-]?\d+", re.IGNORECASE)
-_SCANNED_ROOTS = (Path("app"), Path("tests"), Path("scripts"))
+_REMOVED_WORD = "ph" + "ase"
+_NUMBERED_DELIVERY_WORD = "st" + "age"
+_NUMBERED_DELIVERY_TERM = re.compile(
+    r"\b" + re.escape(_NUMBERED_DELIVERY_WORD) + r"[ _-]?\d+\b",
+    re.IGNORECASE,
+)
 
-# These are the bounded compatibility identifiers retained while existing
-# deployments migrate from the former environment/configuration names. No new
-# entry may be added without an explicit deprecation and removal plan.
-_ALLOWED_COMPATIBILITY_IDENTIFIERS = {
-    ("app/settings.py", "phase2_max_iterations"),
-    ("app/settings.py", "phase2_max_research_rounds"),
-    ("app/settings.py", "phase2_max_replans"),
-    ("app/settings.py", "phase2_max_context_chars"),
-    ("app/graph.py", "phase2_max_context_chars"),
-    ("app/graph.py", "phase2_max_research_rounds"),
-    ("app/graph.py", "phase2_max_replans"),
-}
+
+def _tracked_paths() -> list[Path]:
+    result = subprocess.run(
+        ["git", "ls-files", "-z"],
+        check=True,
+        capture_output=True,
+    )
+    return [Path(raw.decode("utf-8")) for raw in result.stdout.split(b"\0") if raw]
+
+
+def _text(path: Path) -> str | None:
+    data = path.read_bytes()
+    if b"\0" in data:
+        return None
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def _contains_removed_terminology(value: str) -> bool:
+    normalized = value.casefold()
+    return (
+        _REMOVED_WORD in normalized
+        or _NUMBERED_DELIVERY_TERM.search(value) is not None
+    )
+
+
+def test_tracked_source_uses_domain_terminology() -> None:
+    violations: list[str] = []
+    for path in _tracked_paths():
+        path_text = path.as_posix()
+        if _contains_removed_terminology(path_text):
+            violations.append(f"filename:{path_text}")
+            continue
+
+        content = _text(path)
+        if content is None:
+            continue
+        for line_number, line in enumerate(content.splitlines(), start=1):
+            if _contains_removed_terminology(line):
+                violations.append(f"content:{path_text}:{line_number}:{line.strip()}")
+
+    assert not violations, (
+        "Removed delivery terminology remains in tracked source files:\n"
+        + "\n".join(violations)
+    )
 
 
 def _python_tree(path: Path) -> ast.AST:
     return ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-
-
-def _python_identifiers(path: Path) -> set[str]:
-    tree = _python_tree(path)
-    names: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            names.add(node.name)
-        elif isinstance(node, ast.Name):
-            names.add(node.id)
-        elif isinstance(node, ast.Attribute):
-            names.add(node.attr)
-    return names
-
-
-def test_source_and_test_filenames_use_domain_names() -> None:
-    violations: list[str] = []
-    for root in _SCANNED_ROOTS:
-        if not root.exists():
-            continue
-        for path in root.rglob("*"):
-            if not path.is_file() or "__pycache__" in path.parts:
-                continue
-            if _NUMBERED_DELIVERY.search(path.name):
-                violations.append(path.as_posix())
-
-    assert not violations, (
-        "Numbered delivery terminology is prohibited in maintained filenames:\n"
-        + "\n".join(sorted(violations))
-    )
-
-
-def test_python_identifiers_use_domain_names_except_bounded_aliases() -> None:
-    violations: list[str] = []
-    for root in (Path("app"), Path("tests")):
-        if not root.exists():
-            continue
-        for path in root.rglob("*.py"):
-            relative = path.as_posix()
-            for name in _python_identifiers(path):
-                if not _NUMBERED_DELIVERY.search(name):
-                    continue
-                if (relative, name) in _ALLOWED_COMPATIBILITY_IDENTIFIERS:
-                    continue
-                violations.append(f"{relative}:{name}")
-
-    assert not violations, (
-        "Numbered delivery terminology is prohibited in maintained Python identifiers:\n"
-        + "\n".join(sorted(violations))
-    )
 
 
 def test_tests_do_not_reference_json_fixture_files() -> None:

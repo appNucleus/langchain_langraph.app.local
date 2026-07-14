@@ -43,44 +43,6 @@ def test_canonical_agent_limit_constructor_names_are_accepted() -> None:
     assert settings.agent_max_context_chars == 20000
 
 
-def test_legacy_agent_limit_constructor_aliases_map_to_canonical_fields() -> None:
-    legacy_values = {
-        "phase2_max_iterations": 7,
-        "phase2_max_research_rounds": 4,
-        "phase2_max_replans": 2,
-        "phase2_max_context_chars": 24000,
-    }
-    settings = Settings(_env_file=None, **legacy_values)
-
-    assert settings.agent_max_iterations == 7
-    assert settings.agent_max_research_rounds == 4
-    assert settings.agent_max_replans == 2
-    assert settings.agent_max_context_chars == 24000
-    for legacy_name, canonical_name in {
-        "phase2_max_iterations": "agent_max_iterations",
-        "phase2_max_research_rounds": "agent_max_research_rounds",
-        "phase2_max_replans": "agent_max_replans",
-        "phase2_max_context_chars": "agent_max_context_chars",
-    }.items():
-        assert getattr(settings, legacy_name) == getattr(settings, canonical_name)
-
-
-def test_canonical_agent_limit_environment_names_take_precedence(
-    monkeypatch,
-) -> None:
-    monkeypatch.setenv("AGENT_MAX_ITERATIONS", "6")
-    monkeypatch.setenv("PHASE2_MAX_ITERATIONS", "3")
-    settings = Settings(_env_file=None)
-    assert settings.agent_max_iterations == 6
-
-
-def test_legacy_agent_limit_environment_names_remain_accepted(monkeypatch) -> None:
-    monkeypatch.delenv("AGENT_MAX_RESEARCH_ROUNDS", raising=False)
-    monkeypatch.setenv("PHASE2_MAX_RESEARCH_ROUNDS", "3")
-    settings = Settings(_env_file=None)
-    assert settings.agent_max_research_rounds == 3
-
-
 def test_model_role_contract() -> None:
     settings = Settings(_env_file=None)
     assert settings.model_for_key("planner") == settings.model_planner

@@ -130,7 +130,7 @@ RUN_LEASE_HEARTBEAT_SECONDS=10
 RUN_REQUEST_HASH_VERSION=1
 ```
 
-Keep `RUN_CHECKPOINT_NAMESPACE=phase5-v1` while existing checkpoints must remain readable. Changing it requires an explicit state migration or fail-closed version transition.
+Use `RUN_CHECKPOINT_NAMESPACE=execution-state-v1` for newly created execution checkpoints.
 
 ## Agent-loop configuration
 
@@ -141,7 +141,7 @@ AGENT_MAX_REPLANS=1
 AGENT_MAX_CONTEXT_CHARS=16000
 ```
 
-The former `PHASE2_*` names remain accepted as deprecated aliases. New deployment configuration must use `AGENT_*` names.
+Only the canonical `AGENT_*` names are supported.
 
 ## Persistence
 

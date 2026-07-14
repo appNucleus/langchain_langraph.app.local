@@ -91,8 +91,8 @@ class ChatRuntimeAgent(ChatAgent):
             if identity.resumed:
                 record = await self.run_repository.get(identity.run_id)
                 if record is None:
-                    # Additive Stage 2 rollout: a valid token plus an existing
-                    # checkpoint may migrate a pre-run-repository execution.
+                    # During an additive durable-run rollout, a valid token plus an
+                    # existing checkpoint may migrate a pre-repository execution.
                     checkpoint_exists = await self._checkpoint_exists_safely(
                         config,
                         required=True,

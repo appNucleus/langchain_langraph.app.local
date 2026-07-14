@@ -1,6 +1,6 @@
 # Runtime Architecture
 
-This document describes the Stage 1 and Stage 2 runtime contract. Source and tests remain authoritative when documentation and runtime behavior disagree.
+This document describes the runtime identity and durable-execution contract. Source and tests remain authoritative when documentation and runtime behavior disagree.
 
 ## API lifecycle
 
@@ -70,7 +70,7 @@ Only an explicitly interrupted run may be resumed. A terminal response is replay
 
 ## Model and MCP paths
 
-Model selection remains role-based and constrained by live Ollama inventory. The current execution budget records logical model operations rather than every physical retry/fallback attempt; authoritative physical metering belongs to Stage 3.
+Model selection remains role-based and constrained by live Ollama inventory. The current execution budget records logical model operations rather than every physical retry/fallback attempt; authoritative physical metering belongs to observability hardening.
 
 The inventory service loads live MCP tools. The runtime router ranks compatible read-only tools and `ToolExecutor` enforces side-effect policy and budget checks. Caller metadata does not authorize write actions.
 
@@ -107,13 +107,11 @@ post-deployment: smoke -> API checks -> backup -> cleanup or rollback -> logs
 
 The image is rebuilt on the production runner and is not yet promoted by immutable digest from the test job.
 
-## Compatibility register
+## Configuration register
 
-| Compatibility item | Current behavior | Removal boundary |
-|---|---|---|
-| `thread_id` | Alias for `conversation_id` | Versioned API migration |
-| `PHASE2_*` variables | Deprecated aliases for canonical `AGENT_*` settings | After deployment migration |
-| `phase2_*` setting properties | Read-only aliases for older internal callers | After all call sites migrate |
-| `phase5-v1` checkpoint namespace | Retained to read existing checkpoints | Explicit checkpoint migration only |
-| `RESUME_TOKEN_SECRET` | Single-key alias when no key-ring JSON is configured | After key-ring rollout |
-| memory run repository | Process-local development compatibility | Keep for local/degraded operation |
+| Configuration item | Current behavior |
+|---|---|
+| `thread_id` | Public request alias for `conversation_id` |
+| `execution-state-v1` checkpoint namespace | Canonical namespace for newly created execution state |
+| `RESUME_TOKEN_SECRET` | Single-key signing configuration when no key-ring JSON is configured |
+| memory run repository | Process-local development and degraded-operation backend |
