@@ -258,6 +258,18 @@ class ChatAgent:
             )
         raise RuntimeError("request-scoped execution meter is missing")
 
+    @staticmethod
+    def _checkpoint_safe_state(
+        state: AgentGraphState, budget: ExecutionBudget
+    ) -> AgentGraphState:
+        """Return graph input containing data-only execution-meter state."""
+
+        clean = {
+            key: value for key, value in state.items() if key != "execution_budget"
+        }
+        clean["execution_meter_state"] = budget.snapshot().model_dump(mode="json")
+        return clean
+
     @classmethod
     def _state_update(
         cls, state: AgentGraphState, **updates: object
@@ -1228,6 +1240,7 @@ class ChatAgent:
                 "execution_thread_id": execution_thread_id,
             }
         )
+        initial_state = self._checkpoint_safe_state(initial_state, budget)
         log_kv(
             logger,
             logging.INFO,

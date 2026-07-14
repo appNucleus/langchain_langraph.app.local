@@ -263,7 +263,9 @@ class MCPClient:
                 headers=headers,
                 allow_empty=allow_empty,
             )
-            if isinstance(messages, dict):
+            if messages is None and allow_empty:
+                normalized = []
+            elif isinstance(messages, dict):
                 normalized = [messages]
             elif isinstance(messages, list) and all(
                 isinstance(item, dict) for item in messages

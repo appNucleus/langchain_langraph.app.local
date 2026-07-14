@@ -83,6 +83,10 @@ class ExecutionBudget:
         else:
             self.state = ExecutionMeterState.model_validate(state)
         self._elapsed_before_resume = max(0.0, self.state.active_execution_seconds)
+        # A restored meter changes clocks from persisted wall time to a new
+        # monotonic origin. Count a tiny conservative handoff guard so elapsed
+        # execution can never move backwards at that boundary.
+        self._resume_clock_guard_seconds = 0.001 if state is not None else 0.0
         self._started_monotonic = time.monotonic()
         self._lock = asyncio.Lock()
 
@@ -118,9 +122,15 @@ class ExecutionBudget:
 
     @property
     def elapsed_seconds(self) -> float:
-        return self._elapsed_before_resume + max(
-            0.0, time.monotonic() - self._started_monotonic
+        active_elapsed = (
+            self._elapsed_before_resume
+            + self._resume_clock_guard_seconds
+            + max(0.0, time.monotonic() - self._started_monotonic)
         )
+        wall_elapsed = max(
+            0.0, (datetime.now(UTC) - self.state.started_at).total_seconds()
+        )
+        return max(active_elapsed, self.state.elapsed_wall_seconds, wall_elapsed)
 
     def remaining_seconds(self) -> float:
         return max(0.0, (self.state.deadline_at - datetime.now(UTC)).total_seconds())
