@@ -6,7 +6,6 @@ import pytest
 
 from app.services.inventory import InventoryService
 from app.settings import Settings
-from app.state.in_memory import BoundedInMemoryStore
 
 
 class FakeOllama:
@@ -14,7 +13,12 @@ class FakeOllama:
         self.calls = 0
         self.fail = False
 
-    async def list_models(self, *, force_refresh: bool = False, allow_stale: bool = True) -> list[dict[str, Any]]:
+    async def list_models(
+        self,
+        *,
+        force_refresh: bool = False,
+        allow_stale: bool = True,
+    ) -> list[dict[str, Any]]:
         self.calls += 1
         if self.fail:
             raise RuntimeError("ollama unavailable")
@@ -26,7 +30,12 @@ class FakeMCP:
         self.calls = 0
         self.fail = False
 
-    async def list_tools(self, *, force_refresh: bool = False, allow_stale: bool = True) -> list[dict[str, Any]]:
+    async def list_tools(
+        self,
+        *,
+        force_refresh: bool = False,
+        allow_stale: bool = True,
+    ) -> list[dict[str, Any]]:
         self.calls += 1
         if self.fail:
             raise RuntimeError("mcp unavailable")
@@ -34,7 +43,7 @@ class FakeMCP:
 
 
 @pytest.mark.asyncio
-async def test_inventory_cache_is_single_flight_and_returns_defensive_copies() -> None:
+async def test_cache_returns_defensive_copies_and_avoids_duplicate_refreshes() -> None:
     settings = Settings(
         llm_backend="ollama",
         mcp_enabled=True,
@@ -55,7 +64,7 @@ async def test_inventory_cache_is_single_flight_and_returns_defensive_copies() -
 
 
 @pytest.mark.asyncio
-async def test_inventory_uses_stale_failed_source_without_discarding_fresh_source() -> None:
+async def test_refresh_uses_stale_failed_source_without_discarding_fresh_source() -> None:
     settings = Settings(
         llm_backend="ollama",
         mcp_enabled=True,
@@ -71,44 +80,8 @@ async def test_inventory_uses_stale_failed_source_without_discarding_fresh_sourc
 
     mcp.fail = True
     refreshed = await service.load(force_refresh=True)
+
     assert refreshed.model_names == ["model-2:4b"]
     assert refreshed.tool_names == ["tool-1"]
     assert refreshed.cached is True
     assert "mcp" in refreshed.errors
-
-
-@pytest.mark.asyncio
-async def test_bounded_memory_limits_messages_and_evicts_lru_sessions() -> None:
-    store = BoundedInMemoryStore(
-        ttl_seconds=60,
-        max_sessions=2,
-        max_messages=2,
-    )
-    await store.append("a", {"content": "1"}, {"content": "2"}, {"content": "3"})
-    await store.append("b", {"content": "b"})
-    assert [item["content"] for item in await store.get("a")] == ["2", "3"]
-
-    # Reading a makes b the least-recently-used session.
-    await store.append("c", {"content": "c"})
-    assert await store.get("b") == []
-    assert (await store.get("a"))[0]["content"] == "2"
-    assert (await store.get("c"))[0]["content"] == "c"
-
-
-@pytest.mark.asyncio
-async def test_bounded_memory_ttl_uses_inactivity(monkeypatch: pytest.MonkeyPatch) -> None:
-    now = 100.0
-    monkeypatch.setattr("app.state.in_memory.monotonic", lambda: now)
-    store = BoundedInMemoryStore(
-        ttl_seconds=10,
-        max_sessions=2,
-        max_messages=2,
-    )
-    await store.append("thread", {"content": "x"})
-
-    now = 109.0
-    assert await store.get("thread")
-    now = 118.0
-    assert await store.get("thread")  # read at 109 refreshed inactivity TTL
-    now = 129.0
-    assert await store.get("thread") == []

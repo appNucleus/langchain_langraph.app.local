@@ -27,6 +27,19 @@ class ConversationStore(ABC):
     async def append(self, thread_id: str, *messages: dict[str, Any]) -> None:
         """Append one or more messages atomically where supported."""
 
+    async def append_turn(
+        self,
+        thread_id: str,
+        *,
+        run_id: str,
+        user_message: dict[str, Any],
+        assistant_message: dict[str, Any],
+    ) -> bool:
+        """Append one turn once; legacy stores fall back to a normal append."""
+
+        await self.append(thread_id, user_message, assistant_message)
+        return True
+
     @abstractmethod
     async def clear(self, thread_id: str) -> None:
         """Delete one conversation thread."""

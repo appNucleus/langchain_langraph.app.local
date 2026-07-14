@@ -19,6 +19,9 @@ RUN python -m pip install --no-cache-dir -r /app/requirements.txt \
     && python -m pip check
 
 COPY app /app/app
+# Swagger request examples are source-controlled under docs/example_request and
+# loaded by the Pydantic request schema at application import time.
+COPY docs /app/docs
 
 RUN useradd --create-home --shell /usr/sbin/nologin appuser \
     && mkdir -p /data \

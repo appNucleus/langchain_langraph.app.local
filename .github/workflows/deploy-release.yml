@@ -18,10 +18,26 @@ env:
   ROLLBACK_IMAGE: langchain_langraph.app:rollback
 
 jobs:
-  quality-gate:
-    name: Unit, integration, and lint gate
+  pre-deployment:
+    name: "Pre-deployment: compile, lint, and test"
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: langgraph_test
+          POSTGRES_PASSWORD: langgraph_test
+          POSTGRES_DB: langgraph_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U langgraph_test -d langgraph_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      TEST_DATABASE_URL: postgresql://langgraph_test:langgraph_test@127.0.0.1:5432/langgraph_test
     defaults:
       run:
         shell: bash
@@ -69,15 +85,15 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-  deploy:
-    name: Build, deploy, verify, and roll back on failure
-    needs: quality-gate
+  deployment:
+    name: "Deployment: build and release"
+    needs: pre-deployment
     runs-on:
       - self-hosted
       - Linux
       - X64
       - app-prod
-    timeout-minutes: 25
+    timeout-minutes: 20
     defaults:
       run:
         shell: bash
@@ -93,15 +109,13 @@ jobs:
           {
             echo "BACKUP_ROOT=$HOME/backup_app.local"
             echo "DEPLOY_ENV_FILE=$HOME/.config/langchain-langraph-app/runtime.env"
-            echo "ROLLBACK_STATE_DIR=$RUNNER_TEMP/langchain-langraph-app-rollback"
+            echo "ROLLBACK_STATE_DIR=$HOME/.cache/langchain-langraph-app/rollback-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           } >> "$GITHUB_ENV"
 
       - name: Verify deployment prerequisites
         run: |
           set -euo pipefail
-          echo "Checking shell-script syntax..."
           for script in scripts/*.sh; do
-            echo "Checking: $script"
             bash -n "$script"
           done
           bash ./scripts/verify-server.sh
@@ -134,13 +148,12 @@ jobs:
         run: docker compose --env-file "$DEPLOY_ENV_FILE" config >/dev/null
 
       - name: Prepare rollback point
-        id: prepare_rollback
         run: bash ./scripts/prepare-rollback.sh
 
       - name: Build candidate image
         run: docker compose --env-file "$DEPLOY_ENV_FILE" build --pull
 
-      - name: Deploy candidate
+      - name: Release candidate
         run: |
           set -euo pipefail
           docker compose --env-file "$DEPLOY_ENV_FILE" up \
@@ -151,17 +164,56 @@ jobs:
             --wait \
             --wait-timeout 120
 
+  post-deployment:
+    name: "Post-deployment: smoke, API checks, backup, and rollback"
+    needs:
+      - pre-deployment
+      - deployment
+    if: ${{ always() && needs.pre-deployment.result == 'success' }}
+    runs-on:
+      - self-hosted
+      - Linux
+      - X64
+      - app-prod
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out tested release commit
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Configure post-deployment paths
+        run: |
+          set -euo pipefail
+          {
+            echo "BACKUP_ROOT=$HOME/backup_app.local"
+            echo "DEPLOY_ENV_FILE=$HOME/.config/langchain-langraph-app/runtime.env"
+            echo "ROLLBACK_STATE_DIR=$HOME/.cache/langchain-langraph-app/rollback-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          } >> "$GITHUB_ENV"
+
+      - name: Stop when deployment did not complete
+        if: ${{ needs.deployment.result != 'success' }}
+        run: |
+          echo "::error::The deployment job did not complete successfully."
+          exit 1
+
       - name: Run candidate smoke test
+        if: ${{ needs.deployment.result == 'success' }}
         run: bash ./scripts/smoke-test.sh candidate
 
       - name: Run post-deployment API integration test
+        if: ${{ needs.deployment.result == 'success' }}
         run: bash ./scripts/post-deploy-integration-test.sh
 
       - name: Replace successful deployment backup
+        if: ${{ success() && needs.deployment.result == 'success' }}
         run: bash ./scripts/create-success-backup.sh
 
       - name: Remove previous deployment image
-        if: ${{ success() }}
+        if: ${{ success() && needs.deployment.result == 'success' }}
         run: |
           set -u
           docker image rm "$ROLLBACK_IMAGE" >/dev/null 2>&1 || true
@@ -169,42 +221,32 @@ jobs:
 
       - name: Roll back failed deployment
         id: rollback
-        if: ${{ failure() && !cancelled() && steps.prepare_rollback.outcome == 'success' }}
+        if: ${{ failure() && !cancelled() }}
         run: bash ./scripts/rollback-release.sh
-
-      - name: Explain why rollback was not attempted
-        if: ${{ failure() && !cancelled() && steps.prepare_rollback.outcome != 'success' }}
-        run: |
-          echo "::notice::Rollback was not attempted because deployment had not modified the running service."
 
       - name: Show final deployment status
         if: ${{ always() }}
         run: |
           set +e
-          deploy_env_file="${DEPLOY_ENV_FILE:-$HOME/.config/langchain-langraph-app/runtime.env}"
-          docker compose --env-file "$deploy_env_file" ps
-          docker compose --env-file "$deploy_env_file" logs --no-color --tail=100
+          docker compose --env-file "$DEPLOY_ENV_FILE" ps
+          docker compose --env-file "$DEPLOY_ENV_FILE" logs --no-color --tail=200
           docker image ls langchain_langraph.app || true
 
       - name: Write deployment summary
         if: ${{ always() }}
         env:
-          FINAL_JOB_STATUS: ${{ job.status }}
-          PREPARE_ROLLBACK_OUTCOME: ${{ steps.prepare_rollback.outcome }}
-          ROLLBACK_STEP_OUTCOME: ${{ steps.rollback.outcome }}
+          PRE_DEPLOYMENT_RESULT: ${{ needs.pre-deployment.result }}
+          DEPLOYMENT_RESULT: ${{ needs.deployment.result }}
+          POST_DEPLOYMENT_RESULT: ${{ job.status }}
+          ROLLBACK_RESULT: ${{ steps.rollback.outcome }}
         run: |
           set -euo pipefail
           {
             echo "## LangChain LangGraph app deployment"
             echo
             echo "- Commit: \`$GITHUB_SHA\`"
-            echo "- Quality gate: **passed**"
-            echo "- Deployment result: **$FINAL_JOB_STATUS**"
-            echo "- Rollback point: **${PREPARE_ROLLBACK_OUTCOME:-not run}**"
-            echo "- Rollback step: **${ROLLBACK_STEP_OUTCOME:-not run}**"
-            if [[ "$FINAL_JOB_STATUS" == "success" ]]; then
-              echo "- Candidate passed smoke and API integration tests."
-            else
-              echo "- Candidate failed after deployment; automatic rollback was attempted when a rollback point existed."
-            fi
+            echo "- Pre-deployment: **$PRE_DEPLOYMENT_RESULT**"
+            echo "- Deployment: **$DEPLOYMENT_RESULT**"
+            echo "- Post-deployment: **$POST_DEPLOYMENT_RESULT**"
+            echo "- Rollback: **${ROLLBACK_RESULT:-not run}**"
           } >> "$GITHUB_STEP_SUMMARY"

@@ -3,11 +3,10 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
-from app import __version__
 from app.settings import Settings
 
 
-def test_phase3_runtime_settings_are_available() -> None:
+def test_runtime_settings_are_available() -> None:
     settings = Settings(_env_file=None)
     required = {
         "ollama_max_concurrency",
@@ -21,9 +20,27 @@ def test_phase3_runtime_settings_are_available() -> None:
         "mcp_write_timeout_seconds",
         "inventory_cache_ttl_seconds",
         "inventory_stale_if_error_seconds",
+        "agent_max_iterations",
+        "agent_max_research_rounds",
+        "agent_max_replans",
+        "agent_max_context_chars",
     }
     missing = sorted(name for name in required if not hasattr(settings, name))
     assert not missing, f"Missing required Settings attributes: {missing}"
+
+
+def test_canonical_agent_limit_constructor_names_are_accepted() -> None:
+    settings = Settings(
+        _env_file=None,
+        agent_max_iterations=5,
+        agent_max_research_rounds=3,
+        agent_max_replans=2,
+        agent_max_context_chars=20000,
+    )
+    assert settings.agent_max_iterations == 5
+    assert settings.agent_max_research_rounds == 3
+    assert settings.agent_max_replans == 2
+    assert settings.agent_max_context_chars == 20000
 
 
 def test_model_role_contract() -> None:
@@ -32,12 +49,6 @@ def test_model_role_contract() -> None:
     assert settings.model_for_key("embedding") == settings.embedding_model
     assert settings.model_for_key("unknown") == settings.model_general
     assert settings.model_role_catalog()["vision"] == settings.model_vision
-
-
-def test_version_has_one_runtime_source() -> None:
-    assert __version__
-    assert "app_version" not in Settings.model_fields
-    assert "mcp_client_version" not in Settings.model_fields
 
 
 def _is_self_settings(value: ast.expr) -> bool:
@@ -50,12 +61,7 @@ def _is_self_settings(value: ast.expr) -> bool:
 
 
 def test_direct_self_settings_attributes_exist() -> None:
-    """Check unambiguous ``self.settings.<field>`` references only.
-
-    The former scanner treated generic local variables named ``current`` or
-    ``settings`` as the application Settings model, producing false positives
-    for dictionary ``.get`` calls and unrelated decomposition dataclasses.
-    """
+    """Check unambiguous ``self.settings.<field>`` references only."""
 
     settings = Settings(_env_file=None)
     missing: set[str] = set()

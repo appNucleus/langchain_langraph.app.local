@@ -3,7 +3,7 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -15,6 +15,7 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
         case_sensitive=False,
+        populate_by_name=True,
     )
 
     # Application
@@ -28,15 +29,29 @@ class Settings(BaseSettings):
         "Be honest about uncertainty and missing tools."
     )
 
+    # Run identity and durable execution configuration.
+    resume_token_secret: str = ""
+    resume_token_ttl_seconds: int = Field(default=3600, ge=60, le=604800)
+    resume_token_active_key_id: str = Field(default="primary", min_length=1, max_length=100)
+    resume_token_keys_json: str = ""
+    run_checkpoint_namespace: str = Field(
+        default="execution-state-v1",
+        min_length=1,
+        max_length=100,
+    )
+    run_state_schema_version: int = Field(default=1, ge=1, le=1000)
+    run_request_hash_version: int = Field(default=1, ge=1, le=1000)
+    same_conversation_policy: Literal["reject"] = "reject"
+    run_repository_backend: Literal["memory", "postgres"] = "memory"
+    run_lease_ttl_seconds: int = Field(default=30, ge=5, le=3600)
+    run_lease_heartbeat_seconds: int = Field(default=10, ge=1, le=1200)
+
     # LLM / Ollama
     llm_backend: Literal["echo", "ollama"] = "echo"
     ollama_base_url: str = "http://host.docker.internal:11434"
     ollama_model: str = "qwen3.5:4b"
     ollama_temperature: float = Field(default=0.2, ge=0.0, le=2.0)
     ollama_num_predict: int = Field(default=2048, ge=-1, le=131072)
-    # Explicit API context window. Ollama commonly defaults to 4096 tokens on
-    # smaller-VRAM systems, which is too small for structured agent prompts that
-    # include retrieved evidence and a JSON schema.
     ollama_num_ctx: int = Field(default=8192, ge=2048, le=262144)
     structured_output_reserve_tokens: int = Field(default=1536, ge=256, le=32768)
     structured_prompt_chars_per_token: float = Field(default=3.0, ge=1.0, le=8.0)
@@ -84,15 +99,11 @@ class Settings(BaseSettings):
     mcp_protocol_version: str = "2025-06-18"
     mcp_client_name: str = "langchain-langraph-app"
 
-    # Dependency startup policy. Optional dependencies start in degraded mode;
-    # required dependencies fail application startup.
+    # Dependency startup policy
     ollama_required: bool = True
     mcp_required: bool = False
 
-    # Backward-compatible deterministic query and prompt-service settings.
-    # These services remain importable and their configuration contract is
-    # validated by the CI Settings scanner, even when the Phase 4 graph is the
-    # primary runtime orchestration path.
+    # Deterministic query and prompt-service settings.
     default_forecast_days: int = Field(default=7, ge=1, le=14)
     default_news_lookback_days: int = Field(default=7, ge=1, le=90)
     enable_llm_query_planning: bool = False
@@ -108,15 +119,15 @@ class Settings(BaseSettings):
     inventory_cache_ttl_seconds: int = Field(default=60, ge=1, le=3600)
     inventory_stale_if_error_seconds: int = Field(default=300, ge=0, le=86400)
 
-    # Phase 2 agent loop
-    phase2_max_iterations: int = Field(default=4, ge=1, le=10)
-    phase2_max_research_rounds: int = Field(default=2, ge=0, le=5)
-    phase2_max_replans: int = Field(default=1, ge=0, le=3)
-    phase2_max_context_chars: int = Field(default=16000, ge=2000, le=100000)
+    # Worker, research, verification, and replanning loop.
+    agent_max_iterations: int = Field(default=4, ge=1, le=10)
+    agent_max_research_rounds: int = Field(default=2, ge=0, le=5)
+    agent_max_replans: int = Field(default=1, ge=0, le=3)
+    agent_max_context_chars: int = Field(default=16000, ge=2000, le=100000)
     research_max_queries_per_task: int = Field(default=3, ge=1, le=8)
     research_max_evidence_chars_per_query: int = Field(default=6000, ge=500, le=50000)
 
-    # Phase 3 global execution budgets
+    # Global execution budgets
     execution_max_duration_seconds: float = Field(default=180.0, ge=5, le=1800)
     execution_max_model_calls: int = Field(default=8, ge=1, le=50)
     execution_max_tool_calls: int = Field(default=10, ge=0, le=100)
@@ -129,8 +140,7 @@ class Settings(BaseSettings):
     detailed_tracing_enabled: bool = True
     expose_internal_health_details: bool = False
 
-    # Phase 4 persistence backends. These remain independent so deployments can
-    # use PostgreSQL checkpoints with Redis history, or PostgreSQL for both.
+    # Persistence backends
     state_backend: Literal["memory", "redis", "postgres"] = "memory"
     checkpoint_backend: Literal["memory", "postgres"] = "memory"
     artifact_backend: Literal["disabled", "minio"] = "disabled"
@@ -154,6 +164,25 @@ class Settings(BaseSettings):
     final_verification_enabled: bool = True
     final_max_revision_rounds: int = Field(default=1, ge=0, le=3)
 
+    @model_validator(mode="after")
+    def validate_run_lease_settings(self) -> "Settings":
+        if self.run_lease_heartbeat_seconds >= self.run_lease_ttl_seconds:
+            raise ValueError(
+                "RUN_LEASE_HEARTBEAT_SECONDS must be less than RUN_LEASE_TTL_SECONDS"
+            )
+        if self.run_repository_backend == "postgres" and not any(
+            (
+                self.resume_token_keys_json.strip(),
+                self.resume_token_secret.strip(),
+                self.api_key.strip(),
+            )
+        ):
+            raise ValueError(
+                "A persistent resume-token signing key is required when "
+                "RUN_REPOSITORY_BACKEND=postgres"
+            )
+        return self
+
     @property
     def cors_origins(self) -> list[str]:
         raw = self.cors_allow_origins.strip()
@@ -163,14 +192,12 @@ class Settings(BaseSettings):
 
     @property
     def ollama_max_concurrent_requests(self) -> int:
-        """Backward-compatible Phase 1 name used by older resource managers."""
-
+        """Deprecated compatibility name for ``ollama_max_concurrency``."""
         return self.ollama_max_concurrency
 
     @property
     def ollama_max_concurrent_heavy_requests(self) -> int:
-        """Backward-compatible Phase 1 name used by older resource managers."""
-
+        """Deprecated compatibility name for ``ollama_heavy_max_concurrency``."""
         return self.ollama_heavy_max_concurrency
 
     def model_for_key(self, key: str | None) -> str:
@@ -179,7 +206,6 @@ class Settings(BaseSettings):
 
     def model_role_catalog(self) -> dict[str, str]:
         """Return each role exactly once, avoiding silent duplicate-key overrides."""
-
         return {
             "planner": self.model_planner,
             "simple": self.model_simple,
@@ -203,6 +229,7 @@ class Settings(BaseSettings):
                 self.state_backend != "memory",
                 self.checkpoint_backend != "memory",
                 self.artifact_backend != "disabled",
+                self.run_repository_backend != "memory",
             )
         )
 

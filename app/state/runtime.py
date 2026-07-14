@@ -15,6 +15,11 @@ from app.state.in_memory import BoundedInMemoryStore
 from app.state.minio import MinioArtifactStore
 from app.state.postgres import PostgresConversationStore
 from app.state.redis import RedisConversationStore
+from app.state.run_repository import (
+    MemoryRunRepository,
+    PostgresRunRepository,
+    RunRepository,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -28,11 +33,12 @@ def _checkpoint_serializer() -> JsonPlusSerializer:
 
 
 class StateRuntime:
-    """Own conversation, checkpoint, and artifact backend lifecycles."""
+    """Own conversation, run, checkpoint, and artifact backend lifecycles."""
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.conversations: ConversationStore | BoundedInMemoryStore = self._memory_store()
+        self.runs: RunRepository = MemoryRunRepository()
         self.checkpointer: Any = InMemorySaver(serde=_checkpoint_serializer())
         self.artifacts: MinioArtifactStore | None = None
         self._checkpoint_context: AbstractAsyncContextManager[Any] | None = None
@@ -47,6 +53,9 @@ class StateRuntime:
             start = getattr(self.conversations, "start", None)
             if callable(start):
                 await start()
+
+            self.runs = self._build_run_repository()
+            await self.runs.start()
 
             if self.settings.checkpoint_backend == "postgres":
                 if not self.settings.database_url:
@@ -85,6 +94,8 @@ class StateRuntime:
         start = getattr(self.conversations, "start", None)
         if callable(start):
             await start()
+        self.runs = MemoryRunRepository()
+        await self.runs.start()
         self.checkpointer = InMemorySaver(serde=_checkpoint_serializer())
         self.artifacts = None
         self._checkpoint_context = None
@@ -97,6 +108,11 @@ class StateRuntime:
                 await self.artifacts.aclose()
             finally:
                 self.artifacts = None
+
+        try:
+            await self.runs.aclose()
+        except Exception:  # noqa: BLE001 - shutdown remains best effort
+            logger.exception("run_repository_close_failed")
 
         close = getattr(self.conversations, "aclose", None)
         if callable(close):
@@ -123,7 +139,9 @@ class StateRuntime:
             else:
                 get = getattr(self.checkpointer, "get_tuple", None)
                 if callable(get):
-                    await asyncio.wait_for(asyncio.to_thread(get, config), timeout=timeout)
+                    await asyncio.wait_for(
+                        asyncio.to_thread(get, config), timeout=timeout
+                    )
                 else:
                     raise RuntimeError("checkpointer does not expose a health-readable API")
         except Exception as exc:
@@ -153,6 +171,7 @@ class StateRuntime:
         payload: dict[str, Any] = {
             "status": "degraded" if self.degraded_reason else "available",
             "conversation_backend": self.settings.state_backend,
+            "run_repository_backend": self.settings.run_repository_backend,
             "checkpoint_backend": self.settings.checkpoint_backend,
             "artifact_backend": self.settings.artifact_backend,
         }
@@ -163,6 +182,7 @@ class StateRuntime:
                 else "Optional persistence dependency unavailable; using memory fallback."
             )
             payload["effective_conversation_backend"] = "memory"
+            payload["effective_run_repository_backend"] = "memory"
             payload["effective_checkpoint_backend"] = "memory"
 
         health = getattr(self.conversations, "health", None)
@@ -171,6 +191,21 @@ class StateRuntime:
             if callable(health)
             else {"status": "available", "backend": "memory"}
         )
+        try:
+            payload["runs"] = await asyncio.wait_for(
+                self.runs.health(),
+                timeout=self.settings.persistence_health_timeout_seconds,
+            )
+        except Exception as exc:
+            payload["runs"] = {
+                "status": "unavailable",
+                "backend": self.settings.run_repository_backend,
+                "error": (
+                    f"{type(exc).__name__}: {str(exc).strip()}"
+                    if self.settings.expose_internal_health_details
+                    else "Dependency unavailable."
+                ),
+            }
         payload["checkpoint"] = await self._checkpoint_health()
 
         if self.artifacts is not None:
@@ -211,6 +246,21 @@ class StateRuntime:
                 max_messages=self.settings.state_max_history_messages,
             )
         return self._memory_store()
+
+    def _build_run_repository(self) -> RunRepository:
+        if self.settings.run_repository_backend == "postgres":
+            if not self.settings.database_url:
+                raise RuntimeError(
+                    "DATABASE_URL is required for RUN_REPOSITORY_BACKEND=postgres"
+                )
+            return PostgresRunRepository(
+                self.settings.database_url,
+                min_pool_size=self.settings.postgres_pool_min_size,
+                max_pool_size=self.settings.postgres_pool_max_size,
+                command_timeout=self.settings.postgres_command_timeout_seconds,
+                auto_setup=self.settings.postgres_auto_setup,
+            )
+        return MemoryRunRepository()
 
     def _memory_store(self) -> BoundedInMemoryStore:
         return BoundedInMemoryStore(

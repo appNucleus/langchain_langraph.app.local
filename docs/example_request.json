@@ -1,10 +1,10 @@
 {
   "message": "Run a controlled end-to-end diagnostic of this agent system. The planner must create exactly two tasks, no more and no fewer.\n\nTask 1: Using current external evidence, identify the latest officially documented agent and tool-calling capabilities of the OpenAI Responses API and the Anthropic Messages API as of the execution date. Cover tool calling, structured outputs, streaming, conversation or state management, evidence handling, and any important limitations. Do not rely on model memory for current factual claims. The verifier must request external research when the supplied evidence is insufficient.\n\nTask 2: Using the researched evidence and findings, compare the two APIs for a self-hosted LangGraph application that uses local Ollama models and MCP tools. Produce a concise decision matrix, identify architectural tradeoffs, operational risks, migration considerations, unresolved unknowns, and provide a justified integration recommendation.\n\nAfter completing and independently verifying both tasks, synthesize one final response. Every current factual claim should be connected to evidence or explicitly identified as uncertain. Include source references when they are available. Do not create an email draft, send email, modify data, or execute any write operation. Do not create more than two tasks.",
-  "thread_id": "phase4-e2e-diagnostic-20260712-001",
+  "thread_id": "agent-graph-e2e-diagnostic-20260712-001",
   "system_prompt": "Operate in diagnostic mode. Prefer evidence-backed conclusions, expose unresolved limitations, and never perform external side effects.",
   "metadata": {
     "diagnostic_mode": true,
-    "run_id": "phase4-e2e-diagnostic-20260712-001",
+    "run_id": "agent-graph-e2e-diagnostic-20260712-001",
     "test_name": "planner-worker-verifier-research-synthesis",
     "research_tool": "web_search_and_scrape",
     "research_query": "Official OpenAI Responses API documentation for tools, structured outputs, streaming and conversation state, and official Anthropic Messages API documentation for tool use, streaming and conversation handling",

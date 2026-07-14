@@ -56,7 +56,7 @@ def encode_sse(event_name: str, data: object) -> str:
 
 
 class ChatAgent:
-    """Phase 4 runtime with durable checkpoints and pluggable state backends."""
+    """Bounded agent runtime with durable checkpoints and pluggable state backends."""
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -354,7 +354,7 @@ class ChatAgent:
         # the WorkerResult schema, and wrapper syntax.
         evidence_tokens = max(700, num_ctx - reserve - 2600)
         derived = int(evidence_tokens * chars_per_token)
-        return max(2000, min(self.settings.phase2_max_context_chars, derived))
+        return max(2000, min(self.settings.agent_max_context_chars, derived))
 
     @staticmethod
     def _inventory(state: AgentGraphState) -> RuntimeInventory:
@@ -871,7 +871,7 @@ class ChatAgent:
                 reason="mcp_disabled",
             )
             return updated
-        if rounds > self.settings.phase2_max_research_rounds:
+        if rounds > self.settings.agent_max_research_rounds:
             return self._budget_termination(
                 state,
                 node="research:round_limit",
@@ -1131,7 +1131,7 @@ class ChatAgent:
             state=state,
             requested_replan=replans,
         )
-        if replans > self.settings.phase2_max_replans:
+        if replans > self.settings.agent_max_replans:
             updated: AgentGraphState = {
                 **state,
                 "replans": replans,
@@ -1627,7 +1627,7 @@ class ChatAgent:
             model=result.get("model"),
             metadata={
                 **request.metadata,
-                "phase": "4",
+                "runtime_contract": "agent-graph-v1",
                 "persistence": {
                     "state_backend": self.settings.state_backend,
                     "checkpoint_backend": self.settings.checkpoint_backend,
