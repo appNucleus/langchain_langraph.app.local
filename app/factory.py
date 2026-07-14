@@ -23,54 +23,73 @@ from app.schemas.chat import (
     load_chat_openapi_examples,
     load_chat_request_example as _load_chat_request_example,
 )
-from app.services.inventory import build_inventory_payload
+from app.services.inventory import InventoryService, build_inventory_payload
 from app.settings import Settings, get_settings
 
 logger = logging.getLogger(__name__)
 
-# Public compatibility seam used by tests and embedders to inject documentation
-# examples without reading repository JSON files. Production keeps the schema
-# loader unchanged and therefore uses one stored JSON file per POST route.
+# Compatibility and dependency-injection seam used by the existing test suite.
+# Production still loads the established JSON files through app.schemas.chat.
 load_chat_request_example = _load_chat_request_example
 
 
-def create_app(*, settings: Settings | None = None, chat_agent: ChatAgent | None = None) -> FastAPI:
+def _openapi_examples() -> tuple[
+    dict[str, dict[str, Any]] | None,
+    dict[str, dict[str, Any]] | None,
+]:
+    """Build documentation-only request examples for both POST routes.
+
+    The normal production path keeps one JSON file per route. Tests and
+    embedders may override ``load_chat_request_example`` at the factory seam so
+    application instances do not depend on repository documentation files.
+    Neither path changes request-model defaults or runtime normalization.
+    """
+
+    if load_chat_request_example is _load_chat_request_example:
+        return (
+            load_chat_openapi_examples(
+                "chat.json",
+                summary="Complete chat request",
+                description="Default values for the non-streaming chat request.",
+            ),
+            load_chat_openapi_examples(
+                "chat-stream.json",
+                summary="Complete streaming chat request",
+                description="Default values for the streaming chat request.",
+            ),
+        )
+
+    injected_example = load_chat_request_example()
+    if injected_example is None:
+        return None, None
+    return (
+        build_chat_request_openapi_examples(
+            injected_example,
+            summary="Complete chat request",
+            description="Default values for the non-streaming chat request.",
+        ),
+        build_chat_stream_request_openapi_examples(
+            injected_example,
+            summary="Complete streaming chat request",
+            description="Default values for the streaming chat request.",
+        ),
+    )
+
+
+def create_app(
+    *,
+    settings: Settings | None = None,
+    chat_agent: ChatAgent | None = None,
+) -> FastAPI:
     app_settings = settings or get_settings()
     configure_logging(app_settings.log_level)
     agent = chat_agent or ChatAgent(app_settings)
-    if load_chat_request_example is _load_chat_request_example:
-        chat_openapi_examples = load_chat_openapi_examples(
-            "chat.json",
-            summary="Complete chat request",
-            description="Default values for the non-streaming chat request.",
-        )
-        chat_stream_openapi_examples = load_chat_openapi_examples(
-            "chat-stream.json",
-            summary="Complete streaming chat request",
-            description="Default values for the streaming chat request.",
-        )
-    else:
-        # Preserve the established code-injection contract. An explicit
-        # factory-level override applies consistently to all chat POST routes.
-        injected_example = load_chat_request_example()
-        chat_openapi_examples = (
-            build_chat_request_openapi_examples(
-                injected_example,
-                summary="Complete chat request",
-                description="Default values for the non-streaming chat request.",
-            )
-            if injected_example is not None
-            else None
-        )
-        chat_stream_openapi_examples = (
-            build_chat_stream_request_openapi_examples(
-                injected_example,
-                summary="Complete streaming chat request",
-                description="Default values for the streaming chat request.",
-            )
-            if injected_example is not None
-            else None
-        )
+
+    inventory_service = getattr(agent, "inventory_service", None)
+    if inventory_service is None:
+        inventory_service = InventoryService(app_settings, agent.ollama, agent.mcp)
+
+    chat_openapi_examples, chat_stream_openapi_examples = _openapi_examples()
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
@@ -81,9 +100,13 @@ def create_app(*, settings: Settings | None = None, chat_agent: ChatAgent | None
             version=__version__,
             environment=app_settings.environment,
             backend=app_settings.llm_backend,
-            ollama=app_settings.ollama_base_url,
-            mcp_enabled=app_settings.mcp_enabled,
-            mcp_url=app_settings.mcp_server_url,
+            state_backend=getattr(app_settings, "state_backend", "memory"),
+            checkpoint_backend=getattr(
+                app_settings,
+                "checkpoint_backend",
+                "memory",
+            ),
+            artifact_backend=getattr(app_settings, "artifact_backend", "disabled"),
         )
         try:
             start = getattr(agent, "start", None)
@@ -95,8 +118,16 @@ def create_app(*, settings: Settings | None = None, chat_agent: ChatAgent | None
                 logger,
                 logging.ERROR,
                 "app_dependency_start_error",
-                error=_safe_error(exc, expose=app_settings.expose_internal_health_details),
+                error=_safe_error(
+                    exc,
+                    expose=app_settings.expose_internal_health_details,
+                ),
             )
+            # Optional dependency failures are converted to explicit degraded
+            # state inside ChatAgent. An exception that reaches the lifespan is
+            # therefore a required-dependency failure and must abort startup.
+            raise
+
         try:
             yield
         finally:
@@ -110,12 +141,13 @@ def create_app(*, settings: Settings | None = None, chat_agent: ChatAgent | None
         version=__version__,
         description=(
             "FastAPI + LangGraph local assistant with bounded agent execution, "
-            "Ollama model routing, and MCP tools."
+            "durable checkpoints, Ollama model routing, and MCP tools."
         ),
         lifespan=lifespan,
     )
     app.state.settings = app_settings
     app.state.chat_agent = agent
+    app.state.inventory_service = inventory_service
     app.add_middleware(
         CORSMiddleware,
         allow_origins=app_settings.cors_origins,
@@ -125,7 +157,10 @@ def create_app(*, settings: Settings | None = None, chat_agent: ChatAgent | None
     )
 
     @app.exception_handler(Exception)
-    async def unhandled_exception_handler(_request: Request, exc: Exception) -> JSONResponse:
+    async def unhandled_exception_handler(
+        _request: Request,
+        exc: Exception,
+    ) -> JSONResponse:
         metrics.inc("api.unhandled_error")
         log_kv(logger, logging.ERROR, "api_unhandled_error", error=repr(exc))
         return JSONResponse(
@@ -151,7 +186,7 @@ def create_app(*, settings: Settings | None = None, chat_agent: ChatAgent | None
             "service": current_settings.app_name,
             "version": __version__,
             "status": "running",
-            "liveness": "/health",
+            "liveness": "/health/live",
             "readiness": "/health/ready",
             "chat": "/api/chat",
             "stream": "/api/chat/stream",
@@ -161,12 +196,18 @@ def create_app(*, settings: Settings | None = None, chat_agent: ChatAgent | None
     @app.get("/health")
     async def health(request: Request) -> dict[str, object]:
         current_settings: Settings = request.app.state.settings
-        return {"status": "ok", "service": current_settings.app_name, "version": __version__}
+        return {
+            "status": "ok",
+            "service": current_settings.app_name,
+            "version": __version__,
+        }
 
     @app.get("/health/ready")
     async def ready_health(request: Request) -> JSONResponse:
         current_agent: ChatAgent = request.app.state.chat_agent
         current_settings: Settings = request.app.state.settings
+        current_inventory_service: InventoryService = request.app.state.inventory_service
+
         payload: dict[str, Any] = {
             "status": "ready",
             "service": current_settings.app_name,
@@ -174,59 +215,133 @@ def create_app(*, settings: Settings | None = None, chat_agent: ChatAgent | None
             "dependencies": {},
         }
         ready = True
+
+        # Reuse the existing single-flight TTL inventory. Readiness and the
+        # inventory endpoint must not independently call Ollama/MCP on every
+        # request.
+        live_inventory = await current_inventory_service.load()
+
         if current_settings.llm_backend == "ollama":
-            try:
-                payload["dependencies"]["ollama"] = await current_agent.ollama.health()
-            except Exception as exc:
-                ready = False
-                payload["dependencies"]["ollama"] = {
-                    "status": "unavailable",
-                    "error": _safe_error(
-                        exc,
-                        expose=current_settings.expose_internal_health_details,
-                    ),
-                }
+            ollama_error = live_inventory.errors.get("ollama")
+            ollama_ready = not ollama_error and bool(live_inventory.model_names)
+            payload["dependencies"]["ollama"] = {
+                "status": "available" if ollama_ready else "unavailable",
+                "model_count": len(live_inventory.model_names),
+                "cached": live_inventory.cached,
+                "error": (
+                    ollama_error
+                    if current_settings.expose_internal_health_details
+                    else ("Dependency unavailable." if ollama_error else None)
+                ),
+            }
+            if bool(getattr(current_settings, "ollama_required", True)):
+                ready = ready and ollama_ready
+
         if current_settings.mcp_enabled:
+            mcp_error = live_inventory.errors.get("mcp")
+            mcp_ready = not mcp_error
+            payload["dependencies"]["mcp"] = {
+                "status": "available" if mcp_ready else "unavailable",
+                "tool_count": len(live_inventory.tool_names),
+                "cached": live_inventory.cached,
+                "error": (
+                    mcp_error
+                    if current_settings.expose_internal_health_details
+                    else ("Dependency unavailable." if mcp_error else None)
+                ),
+            }
+            if bool(getattr(current_settings, "mcp_required", False)):
+                ready = ready and mcp_ready
+
+        persistence_required = bool(
+            getattr(current_settings, "persistence_required", False)
+        )
+        artifact_storage_required = bool(
+            getattr(current_settings, "artifact_storage_required", False)
+        )
+        persistence_health = getattr(current_agent, "persistence_health", None)
+        if callable(persistence_health):
             try:
-                result = await current_agent.mcp.health_check()
-                payload["dependencies"]["mcp"] = {
-                    "status": "available" if result.ok else "unavailable",
-                    "ok": result.ok,
-                    "error": result.error,
-                }
-                ready = ready and result.ok
+                persistence = await persistence_health()
+                payload["dependencies"]["persistence"] = persistence
+                conversation_ok = (
+                    (persistence.get("conversation") or {}).get("status")
+                    == "available"
+                )
+                checkpoint_ok = (
+                    (persistence.get("checkpoint") or {}).get("status")
+                    == "available"
+                )
+                artifacts = persistence.get("artifacts") or {}
+                artifacts_ok = artifacts.get("status") in {"available", "disabled"}
+
+                if persistence_required:
+                    ready = ready and conversation_ok and checkpoint_ok
+                if artifact_storage_required:
+                    ready = ready and artifacts_ok
             except Exception as exc:
-                ready = False
-                payload["dependencies"]["mcp"] = {
+                if persistence_required or artifact_storage_required:
+                    ready = False
+                payload["dependencies"]["persistence"] = {
                     "status": "unavailable",
                     "error": _safe_error(
                         exc,
                         expose=current_settings.expose_internal_health_details,
                     ),
                 }
+
+        startup_status = getattr(current_agent, "dependency_startup_status", None)
+        if callable(startup_status):
+            payload["startup"] = startup_status()
+
         if not ready:
             payload["status"] = "not_ready"
         return JSONResponse(
-            status_code=status.HTTP_200_OK if ready else status.HTTP_503_SERVICE_UNAVAILABLE,
+            status_code=(
+                status.HTTP_200_OK
+                if ready
+                else status.HTTP_503_SERVICE_UNAVAILABLE
+            ),
             content=payload,
         )
 
     @app.get("/health/live")
     async def live_health(request: Request) -> JSONResponse:
-        return await ready_health(request)
+        current_settings: Settings = request.app.state.settings
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content={
+                "status": "alive",
+                "service": current_settings.app_name,
+                "version": __version__,
+            },
+        )
 
     @app.get("/api/inventory", dependencies=[Depends(require_api_key)])
     async def inventory(request: Request) -> dict[str, object]:
         current_agent: ChatAgent = request.app.state.chat_agent
         current_settings: Settings = request.app.state.settings
-        live_inventory = await current_agent.load_inventory()
-        return build_inventory_payload(current_settings, live_inventory, current_agent.selector)
+        current_inventory_service: InventoryService = request.app.state.inventory_service
+        live_inventory = await current_inventory_service.load()
+        return build_inventory_payload(
+            current_settings,
+            live_inventory,
+            current_agent.selector,
+        )
 
     @app.get("/api/metrics", dependencies=[Depends(require_api_key)])
     async def application_metrics() -> dict[str, Any]:
-        return {"service": app_settings.app_name, "version": __version__, **metrics.snapshot()}
+        return {
+            "service": app_settings.app_name,
+            "version": __version__,
+            **metrics.snapshot(),
+        }
 
-    @app.post("/api/chat", response_model=ChatResponse, dependencies=[Depends(require_api_key)])
+    @app.post(
+        "/api/chat",
+        response_model=ChatResponse,
+        dependencies=[Depends(require_api_key)],
+    )
     async def chat(
         request: Request,
         chat_request: ChatRequest = Body(
@@ -265,10 +380,12 @@ def create_app(*, settings: Settings | None = None, chat_agent: ChatAgent | None
                 metrics.inc("api.chat_stream.error")
                 yield encode_sse(
                     "error",
-                    {"message": _safe_error(
-                        exc,
-                        expose=app_settings.expose_internal_health_details,
-                    )},
+                    {
+                        "message": _safe_error(
+                            exc,
+                            expose=app_settings.expose_internal_health_details,
+                        )
+                    },
                 )
 
         return StreamingResponse(
