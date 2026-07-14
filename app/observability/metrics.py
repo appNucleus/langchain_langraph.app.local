@@ -1,8 +1,8 @@
 """Small, dependency-free in-memory metrics registry.
 
-The registry is intentionally process-local for Phase 3. It is thread-safe,
-bounded, and suitable for health diagnostics and lightweight operational
-telemetry. A production metrics backend can replace it behind the same API.
+The registry is intentionally process-local. It is thread-safe, bounded, and
+suitable for health diagnostics and lightweight operational telemetry. A
+production metrics backend can replace it behind the same API.
 """
 
 from __future__ import annotations
@@ -62,7 +62,7 @@ class MetricsRegistry:
             self._timings.clear()
 
 
-# Backward-compatible name used by the original Phase 3 package.
+# Concrete in-memory registry alias.
 InMemoryMetrics = MetricsRegistry
 
 # Shared process-local registry used by graph, tracing, and API endpoints.

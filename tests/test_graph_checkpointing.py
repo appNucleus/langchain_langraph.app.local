@@ -10,7 +10,7 @@ from app.settings import Settings
 
 @pytest.mark.asyncio
 async def test_echo_graph_preserves_execution_budget_and_completes() -> None:
-    """Regression test for the plan-node "execution budget is missing" failure."""
+    """Regression test for the plan-node missing execution-budget failure."""
 
     settings = Settings(
         llm_backend="echo",
@@ -32,7 +32,8 @@ async def test_echo_graph_preserves_execution_budget_and_completes() -> None:
         await agent.aclose()
 
     assert response.backend == "echo"
-    assert response.metadata["phase"] == "4"
+    # Canonical runtime metadata remains stable.
+    assert response.metadata["runtime_contract"] == "agent-graph-v1"
     assert "Message received" in response.response
     assert response.metadata["usage"]["model_calls"] == 0
     assert response.metadata["usage"]["tool_calls"] == 0

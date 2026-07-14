@@ -6,6 +6,7 @@ import pytest
 
 from app.schemas.execution import ExecutionBudget
 from app.tools.executor import ToolExecutionDenied, ToolExecutor
+from app.tools.policies import SideEffectLevel, policy_for
 
 
 class FakeMcp:
@@ -19,6 +20,13 @@ class FakeMcp:
 
 def settings():
     return SimpleNamespace(mcp_max_concurrency=2, side_effect_policy_enabled=True)
+
+
+def test_mail_send_policy_is_external_communication() -> None:
+    policy = policy_for("mail_send_draft")
+
+    assert policy.level == SideEffectLevel.EXTERNAL_COMMUNICATION
+    assert policy.read_only is False
 
 
 @pytest.mark.asyncio

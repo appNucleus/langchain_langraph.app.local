@@ -9,7 +9,7 @@ from app.state.redis import RedisConversationStore
 from app.state.runtime import StateRuntime
 
 
-def test_phase4_defaults_remain_non_persistent() -> None:
+def test_default_backends_remain_non_persistent() -> None:
     settings = Settings(
         _env_file=None,
         state_backend="memory",
