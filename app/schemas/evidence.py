@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from datetime import datetime
-from hashlib import sha256
-from typing import Literal
+import hashlib
+from datetime import UTC, datetime
+from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
 
 TrustClass = Literal[
     "retrieved_external",
@@ -12,70 +12,77 @@ TrustClass = Literal[
     "internal_system",
     "derived_summary",
     "tool_error",
+    "unknown_legacy",
 ]
-FreshnessStatus = Literal["current", "stale", "unknown", "not_applicable"]
-SourceQuality = Literal["official", "high", "medium", "low", "unknown"]
+FreshnessStatus = Literal["current", "stale", "unknown", "not_time_sensitive"]
+SourceQuality = Literal[
+    "primary_authoritative",
+    "primary_non_authoritative",
+    "secondary_reputable",
+    "secondary_unknown",
+    "user_supplied",
+    "unverifiable",
+    "unknown",
+]
+InjectionScanStatus = Literal["not_scanned", "clean", "suspicious", "blocked"]
+ToolStatus = Literal["success", "failed", "timeout", "not_applicable", "unknown"]
 
 
 class EvidenceItem(BaseModel):
-    """Typed evidence record with backward-compatible provenance metadata."""
+    """Canonical evidence record with a conservative legacy reader."""
 
-    id: str
-    source: str
-    content: str
-    run_id: str | None = None
-    task_id: str | None = None
+    model_config = ConfigDict(populate_by_name=True)
+
+    evidence_id: str = Field(validation_alias=AliasChoices("evidence_id", "id"))
+    run_id: str = "legacy"
+    task_id: str = "legacy"
     query_id: str | None = None
     tool_name: str | None = None
-    trust_class: TrustClass = "retrieved_external"
     source_uri: str | None = None
-    source_title: str | None = None
-    retrieved_at: datetime | None = None
+    canonical_uri: str | None = None
+    source_title: str | None = Field(
+        default=None, validation_alias=AliasChoices("source_title", "source")
+    )
+    retrieved_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     published_at: datetime | None = None
     content_type: str = "text/plain"
+    raw_artifact_uri: str | None = None
+    normalized_text: str = Field(
+        default="", validation_alias=AliasChoices("normalized_text", "content")
+    )
+    summary: str = ""
     content_hash: str = ""
+    trust_class: TrustClass = "unknown_legacy"
     freshness_status: FreshnessStatus = "unknown"
     source_quality: SourceQuality = "unknown"
+    injection_scan_status: InjectionScanStatus = "not_scanned"
     truncated: bool = False
-    metadata: dict[str, object] = Field(default_factory=dict)
-
-    @field_validator("source_uri", "source_title", mode="before")
-    @classmethod
-    def normalize_optional_text(cls, value: object) -> object:
-        if value is None:
-            return None
-        text = str(value).strip()
-        return text or None
+    tool_status: ToolStatus = "unknown"
+    eligible_for_claim_support: bool = False
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
-    def normalize_provenance(self) -> "EvidenceItem":
-        if self.source == "request_metadata":
-            self.trust_class = "user_supplied"
-            self.source_quality = "unknown"
+    def enforce_non_supporting_failures(self) -> "EvidenceItem":
+        if not self.summary:
+            self.summary = self.normalized_text
         if not self.content_hash:
-            self.content_hash = sha256(self.content.encode("utf-8")).hexdigest()
+            self.content_hash = hashlib.sha256(
+                self.normalized_text.encode("utf-8")
+            ).hexdigest()
+        if self.trust_class in {"tool_error", "user_supplied", "unknown_legacy"}:
+            self.eligible_for_claim_support = False
+        if self.tool_status in {"failed", "timeout"}:
+            self.eligible_for_claim_support = False
         return self
 
-    def prompt_record(self, *, content: str | None = None) -> dict[str, object]:
-        """Return the bounded record exposed to worker/verifier prompts."""
+    @property
+    def id(self) -> str:
+        return self.evidence_id
 
-        return {
-            "id": self.id,
-            "source": self.source,
-            "run_id": self.run_id,
-            "task_id": self.task_id,
-            "query_id": self.query_id,
-            "tool_name": self.tool_name,
-            "source_uri": self.source_uri,
-            "source_title": self.source_title,
-            "trust_class": self.trust_class,
-            "retrieved_at": self.retrieved_at.isoformat() if self.retrieved_at else None,
-            "published_at": self.published_at.isoformat() if self.published_at else None,
-            "content_type": self.content_type,
-            "content_hash": self.content_hash,
-            "freshness_status": self.freshness_status,
-            "source_quality": self.source_quality,
-            "truncated": self.truncated,
-            "content": self.content if content is None else content,
-            "metadata": dict(self.metadata),
-        }
+    @property
+    def source(self) -> str:
+        return self.source_title or self.tool_name or self.source_uri or "unknown"
+
+    @property
+    def content(self) -> str:
+        return self.normalized_text

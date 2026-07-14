@@ -1,190 +1,140 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+import logging
 from copy import deepcopy
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
-from uuid import UUID, uuid4
+from uuid import uuid4
 
-from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, Field, ValidationError, model_validator
 
-CHAT_REQUEST_EXAMPLE_PATH = (
-    Path(__file__).resolve().parents[2]
-    / "docs"
-    / "example_request"
-    / "chat.json"
+logger = logging.getLogger(__name__)
+
+_EXAMPLE_REQUEST_DIRECTORY = (
+    Path(__file__).resolve().parents[2] / "docs" / "example_request"
 )
-CHAT_REQUEST_COMPLETE_EXAMPLE_PATH = (
-    Path(__file__).resolve().parents[2]
-    / "docs"
-    / "example_request"
-    / "chat-complete.json"
-)
-
-_FALLBACK_CHAT_REQUEST_EXAMPLE: dict[str, Any] = {
-    "message": "Continue the analysis",
-}
 
 
 class ChatRequest(BaseModel):
-    """Public chat request with backward-compatible identity fields."""
-
     message: str = Field(..., min_length=1, max_length=20000)
     thread_id: str | None = Field(
         default=None,
-        max_length=200,
-        description=(
-            "Backward-compatible alias for conversation_id. Omit both IDs to start "
-            "a new conversation and let the server generate a GUID."
-        ),
+        description="Deprecated compatibility alias for conversation_id.",
     )
-    conversation_id: str | None = Field(
-        default=None,
-        max_length=200,
-        description="Stable user-visible conversation identifier.",
-    )
-    run_id: str | None = Field(
-        default=None,
-        description=(
-            "Optional UUID for an idempotent retry. Omit it for a new server-generated run."
-        ),
-    )
-    resume: bool = Field(
-        default=False,
-        description="Resume an interrupted run using a server-issued resume_token.",
-    )
-    resume_token: str | None = Field(
-        default=None,
-        max_length=4096,
-        description="Signed token returned by the server for explicit run resumption.",
-    )
+    conversation_id: str | None = None
+    run_id: str | None = None
     system_prompt: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
-    @field_validator("message")
-    @classmethod
-    def normalize_message(cls, value: str) -> str:
-        value = value.strip()
-        if not value:
-            raise ValueError("message must not be blank")
-        return value
-
-    @field_validator(
-        "thread_id",
-        "conversation_id",
-        "run_id",
-        "resume_token",
-        "system_prompt",
-        mode="before",
-    )
-    @classmethod
-    def normalize_optional_text(cls, value: Any) -> Any:
-        if value is None:
-            return None
-        if isinstance(value, str):
-            stripped = value.strip()
-            return stripped or None
-        return value
-
-    @field_validator("run_id")
-    @classmethod
-    def validate_run_id(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        try:
-            return str(UUID(value))
-        except ValueError as exc:
-            raise ValueError("run_id must be a valid UUID") from exc
-
     @model_validator(mode="after")
-    def validate_identity_contract(self) -> "ChatRequest":
-        if (
-            self.thread_id
-            and self.conversation_id
-            and self.thread_id != self.conversation_id
-        ):
+    def normalize_legacy_identity(self) -> "ChatRequest":
+        if self.thread_id and self.conversation_id and self.thread_id != self.conversation_id:
             raise ValueError(
                 "thread_id and conversation_id must match when both are provided"
             )
-        if self.resume and not self.resume_token:
-            raise ValueError("resume_token is required when resume=true")
-        if self.resume_token and not self.resume:
-            raise ValueError("resume must be true when resume_token is provided")
+        if self.conversation_id is None and self.thread_id is not None:
+            self.conversation_id = self.thread_id
+        if self.conversation_id is None:
+            self.conversation_id = str(uuid4())
+        if self.thread_id is None:
+            self.thread_id = self.conversation_id
+        if self.run_id is None:
+            self.run_id = str(uuid4())
         return self
-
-
-def _validated_chat_request_example(raw: object) -> dict[str, Any]:
-    if not isinstance(raw, dict):
-        return deepcopy(_FALLBACK_CHAT_REQUEST_EXAMPLE)
-    try:
-        request = ChatRequest.model_validate(raw)
-    except ValidationError:
-        return deepcopy(_FALLBACK_CHAT_REQUEST_EXAMPLE)
-    return request.model_dump(mode="json", exclude_unset=True)
-
-
-def load_chat_request_example(path: Path | None = None) -> dict[str, Any]:
-    """Load the documentation-only OpenAPI request example from ``chat.json``.
-
-    This mapping decorates the generated OpenAPI schema only. It does not define
-    ``ChatRequest`` defaults and is never used as chat execution input.
-    """
-
-    example_path = path or CHAT_REQUEST_EXAMPLE_PATH
-    try:
-        raw = json.loads(example_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return deepcopy(_FALLBACK_CHAT_REQUEST_EXAMPLE)
-    return _validated_chat_request_example(raw)
-
-
-def build_chat_request_openapi_examples(
-    example: Mapping[str, Any],
-) -> dict[str, dict[str, Any]]:
-    """Build a defensive OpenAPI example object from one validated request mapping."""
-
-    return {
-        "default": {
-            "summary": "Configured chat request example",
-            "description": (
-                "Documentation-only request body loaded lazily from "
-                "docs/example_request/chat.json when OpenAPI is generated. "
-                "It does not define request-model defaults or runtime execution."
-            ),
-            "value": deepcopy(dict(example)),
-        }
-    }
 
 
 class ChatResponse(BaseModel):
     thread_id: str
-    conversation_id: str
+    conversation_id: str | None = None
     run_id: str | None = None
+    execution_thread_id: str | None = None
     response: str
     backend: str
     model: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
+    @model_validator(mode="after")
+    def fill_compatibility_identity(self) -> "ChatResponse":
+        self.conversation_id = self.conversation_id or self.thread_id
+        self.run_id = self.run_id or str(uuid4())
+        self.execution_thread_id = (
+            self.execution_thread_id or f"{self.conversation_id}:{self.run_id}"
+        )
+        return self
+
     @classmethod
     def from_result(
         cls,
         *,
-        thread_id: str | None,
+        thread_id: str | None = None,
         conversation_id: str | None = None,
         run_id: str | None = None,
+        execution_thread_id: str | None = None,
         response: str,
         backend: str,
         model: str | None,
         metadata: dict[str, Any] | None = None,
     ) -> "ChatResponse":
         resolved_conversation_id = conversation_id or thread_id or str(uuid4())
+        resolved_run_id = run_id or str(uuid4())
+        resolved_execution_thread_id = (
+            execution_thread_id or f"{resolved_conversation_id}:{resolved_run_id}"
+        )
         return cls(
             thread_id=resolved_conversation_id,
             conversation_id=resolved_conversation_id,
-            run_id=run_id,
+            run_id=resolved_run_id,
+            execution_thread_id=resolved_execution_thread_id,
             response=response,
             backend=backend,
             model=model,
             metadata=metadata or {},
         )
+
+
+@lru_cache(maxsize=None)
+def _load_request_example(filename: str) -> dict[str, Any] | None:
+    """Load one documentation-only Swagger request from the established folder.
+
+    The file is used only while FastAPI constructs OpenAPI metadata. It never
+    supplies Pydantic defaults, runtime request values, graph state, or tests.
+    Missing or malformed documentation is non-fatal to the API runtime.
+    """
+
+    safe_name = Path(filename).name
+    if safe_name != filename or not safe_name.endswith(".json"):
+        logger.warning("openapi_request_example_invalid_filename: %s", filename)
+        return None
+
+    path = _EXAMPLE_REQUEST_DIRECTORY / safe_name
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            raise ValueError("request example must be a JSON object")
+        ChatRequest.model_validate(raw)
+    except (OSError, ValueError, json.JSONDecodeError, ValidationError) as exc:
+        logger.warning("openapi_request_example_unavailable file=%s error=%s", path, exc)
+        return None
+    return raw
+
+
+def load_chat_openapi_examples(
+    filename: str,
+    *,
+    summary: str,
+    description: str,
+) -> dict[str, dict[str, Any]] | None:
+    """Return a defensive OpenAPI mapping for one POST request JSON file."""
+
+    value = _load_request_example(filename)
+    if value is None:
+        return None
+    return {
+        "default": {
+            "summary": summary,
+            "description": description,
+            "value": deepcopy(value),
+        }
+    }

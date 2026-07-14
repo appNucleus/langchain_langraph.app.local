@@ -1,23 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Any
 
-from app.logging_config import log_kv
 from app.schemas.execution import ExecutionBudget
 from app.tools.policies import policy_for
 
-import logging
-
-logger = logging.getLogger(__name__)
-
 
 class ToolApprovalRequired(PermissionError):
-    """Backward-compatible error retained for older callers."""
-
-
-class ToolExecutionDenied(PermissionError):
-    """Raised when server policy denies a write-capable or ambiguous tool."""
+    pass
 
 
 class ToolExecutor:
@@ -34,25 +26,18 @@ class ToolExecutor:
         budget: ExecutionBudget,
         metadata: dict[str, Any],
     ) -> Any:
+        del metadata  # Caller metadata is context only, never tool authorization.
         policy = policy_for(name)
-        if not policy.read_only:
-            # Client-controlled metadata such as approved_tools is intentionally
-            # ignored. Write operations stay disabled until server-issued,
-            # argument-bound, replay-safe approval exists.
-            log_kv(
-                logger,
-                logging.WARNING,
-                "tool_execution_denied",
-                tool=name,
-                side_effect_level=policy.level.value,
-                known_policy=policy.known,
-                argument_keys=",".join(sorted(arguments)),
-            )
-            raise ToolExecutionDenied(
-                f"Tool {name!r} is not permitted by the read-only server policy"
+        if self.settings.side_effect_policy_enabled and policy.confirmation_required:
+            raise ToolApprovalRequired(
+                f"{name} is write-capable and server-issued approval is not implemented"
             )
 
-        budget.tool_calls += 1
-        budget.check()
-        async with self._semaphore:
-            return await self.mcp.call_tool(name, arguments)
+        wait_started = time.monotonic()
+        try:
+            async with asyncio.timeout(max(0.001, budget.remaining_seconds())):
+                async with self._semaphore:
+                    budget.add_queue_wait(time.monotonic() - wait_started)
+                    return await self.mcp.call_tool(name, arguments)
+        except TimeoutError:
+            raise
