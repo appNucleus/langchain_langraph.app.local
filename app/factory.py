@@ -5,7 +5,8 @@ import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from copy import deepcopy
-from typing import Annotated, Any
+from functools import partial
+from typing import Annotated, Any, Callable
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,6 +17,7 @@ from app.graph import ChatAgent, encode_sse
 from app.logging_config import configure_logging, log_kv
 from app.observability.metrics import metrics
 from app.orchestration.chat_runtime import ChatRuntimeAgent
+from app.orchestration.execution_meter import execution_meter_scope
 from app.orchestration.run_identity import RequestIdentityError
 from app.schemas.chat import (
     ChatRequest,
@@ -23,10 +25,56 @@ from app.schemas.chat import (
     build_chat_request_openapi_examples,
     load_chat_request_example,
 )
+from app.schemas.execution import ExecutionBudget
 from app.services.inventory import InventoryService, build_inventory_payload
 from app.settings import Settings, get_settings
 
 logger = logging.getLogger(__name__)
+
+
+def openapi_with_chat_request_example(
+    generated_openapi: Callable[[], dict[str, Any]],
+    example_cache: dict[str, Any],
+) -> dict[str, Any]:
+    """Inject the documentation-only chat example lazily and once per app."""
+
+    schema = generated_openapi()
+    if "examples" not in example_cache:
+        example_cache["examples"] = build_chat_request_openapi_examples(
+            load_chat_request_example()
+        )
+    examples = example_cache["examples"]
+    for path in ("/api/chat", "/api/chat/stream"):
+        operation = (schema.get("paths") or {}).get(path, {}).get("post", {})
+        content = (operation.get("requestBody") or {}).get("content", {})
+        json_body = content.get("application/json")
+        if isinstance(json_body, dict):
+            json_body["examples"] = deepcopy(examples)
+    return schema
+
+
+class _MeteredChatRuntimeAgent(ChatRuntimeAgent):
+    """Keep the runtime-only meter out of durable LangGraph state."""
+
+    async def _invoke_graph_safely(
+        self,
+        *,
+        graph_input: Any,
+        config: dict[str, Any],
+        identity: Any,
+        request_id: str,
+        budget: ExecutionBudget,
+    ) -> dict[str, Any]:
+        if isinstance(graph_input, dict):
+            graph_input = self._checkpoint_safe_state(graph_input, budget)
+        with execution_meter_scope(budget):
+            return await super()._invoke_graph_safely(
+                graph_input=graph_input,
+                config=config,
+                identity=identity,
+                request_id=request_id,
+                budget=budget,
+            )
 
 
 def create_app(
@@ -36,7 +84,7 @@ def create_app(
 ) -> FastAPI:
     app_settings = settings or get_settings()
     configure_logging(app_settings.log_level)
-    agent = chat_agent or ChatRuntimeAgent(app_settings)
+    agent = chat_agent or _MeteredChatRuntimeAgent(app_settings)
     inventory_service = getattr(agent, "inventory_service", None)
     if inventory_service is None:
         inventory_service = InventoryService(app_settings, agent.ollama, agent.mcp)
@@ -198,13 +246,13 @@ def create_app(
         try:
             persistence = await current_agent.persistence_health()
             payload["dependencies"]["persistence"] = persistence
-            conversation_ok = (
-                (persistence.get("conversation") or {}).get("status") == "available"
-            )
+            conversation_ok = (persistence.get("conversation") or {}).get(
+                "status"
+            ) == "available"
             runs_ok = (persistence.get("runs") or {}).get("status") == "available"
-            checkpoint_ok = (
-                (persistence.get("checkpoint") or {}).get("status") == "available"
-            )
+            checkpoint_ok = (persistence.get("checkpoint") or {}).get(
+                "status"
+            ) == "available"
             artifacts_ok = (persistence.get("artifacts") or {}).get("status") in {
                 "available",
                 "disabled",
@@ -323,24 +371,12 @@ def create_app(
         )
 
     generated_openapi = app.openapi
-    chat_request_openapi_examples: dict[str, dict[str, Any]] | None = None
-
-    def openapi_with_chat_request_example() -> dict[str, Any]:
-        nonlocal chat_request_openapi_examples
-        schema = generated_openapi()
-        if chat_request_openapi_examples is None:
-            chat_request_openapi_examples = build_chat_request_openapi_examples(
-                load_chat_request_example()
-            )
-        for path in ("/api/chat", "/api/chat/stream"):
-            operation = (schema.get("paths") or {}).get(path, {}).get("post", {})
-            content = (operation.get("requestBody") or {}).get("content", {})
-            json_body = content.get("application/json")
-            if isinstance(json_body, dict):
-                json_body["examples"] = deepcopy(chat_request_openapi_examples)
-        return schema
-
-    app.openapi = openapi_with_chat_request_example  # type: ignore[method-assign]
+    chat_request_openapi_cache: dict[str, Any] = {}
+    app.openapi = partial(  # type: ignore[method-assign]
+        openapi_with_chat_request_example,
+        generated_openapi,
+        chat_request_openapi_cache,
+    )
     return app
 
 

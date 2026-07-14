@@ -1,23 +1,72 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Any
 
-from app.logging_config import log_kv
 from app.schemas.execution import ExecutionBudget
 from app.tools.policies import policy_for
 
-import logging
-
-logger = logging.getLogger(__name__)
-
-
-class ToolApprovalRequired(PermissionError):
-    """Backward-compatible error retained for older callers."""
-
 
 class ToolExecutionDenied(PermissionError):
-    """Raised when server policy denies a write-capable or ambiguous tool."""
+    """Raised when server policy does not classify a tool as safe to execute."""
+
+
+class ToolApprovalRequired(ToolExecutionDenied):
+    """Backward-compatible specialization for known write-capable tools."""
+
+
+_READ_ONLY_MARKERS = {
+    "calculate",
+    "convert",
+    "explain",
+    "extract",
+    "fetch",
+    "get",
+    "health",
+    "list",
+    "lookup",
+    "news",
+    "query",
+    "quote",
+    "read",
+    "scrape",
+    "search",
+    "status",
+    "time",
+    "weather",
+}
+_WRITE_MARKERS = {
+    "approve",
+    "create",
+    "delete",
+    "draft",
+    "execute",
+    "modify",
+    "patch",
+    "post",
+    "publish",
+    "remove",
+    "run",
+    "send",
+    "trigger",
+    "update",
+    "upload",
+    "write",
+}
+
+
+def _tool_name_tokens(name: str) -> set[str]:
+    return {part for part in name.lower().replace("-", "_").split("_") if part}
+
+
+def _is_explicitly_safe_read(name: str, policy: Any) -> bool:
+    if bool(getattr(policy, "confirmation_required", False)):
+        return False
+    tokens = _tool_name_tokens(name)
+    if tokens & _WRITE_MARKERS:
+        return False
+    return bool(tokens & _READ_ONLY_MARKERS)
 
 
 class ToolExecutor:
@@ -34,25 +83,49 @@ class ToolExecutor:
         budget: ExecutionBudget,
         metadata: dict[str, Any],
     ) -> Any:
+        del metadata  # Caller metadata is context only, never authorization.
         policy = policy_for(name)
-        if not policy.read_only:
-            # Client-controlled metadata such as approved_tools is intentionally
-            # ignored. Write operations stay disabled until server-issued,
-            # argument-bound, replay-safe approval exists.
-            log_kv(
-                logger,
-                logging.WARNING,
-                "tool_execution_denied",
-                tool=name,
-                side_effect_level=policy.level.value,
-                known_policy=policy.known,
-                argument_keys=",".join(sorted(arguments)),
+        if bool(getattr(policy, "confirmation_required", False)):
+            raise ToolApprovalRequired(
+                f"{name} is write-capable and server-issued approval is not implemented"
             )
+        if not _is_explicitly_safe_read(name, policy):
             raise ToolExecutionDenied(
-                f"Tool {name!r} is not permitted by the read-only server policy"
+                f"{name} is not classified as an approved read-only tool"
             )
 
-        budget.tool_calls += 1
-        budget.check()
-        async with self._semaphore:
-            return await self.mcp.call_tool(name, arguments)
+        wait_started = time.monotonic()
+        manual_metering = not bool(
+            getattr(self.mcp, "physical_attempts_metered", False)
+        )
+        try:
+            async with asyncio.timeout(max(0.001, budget.remaining_seconds())):
+                async with self._semaphore:
+                    budget.add_queue_wait(time.monotonic() - wait_started)
+                    if manual_metering:
+                        await budget.begin_tool_attempt()
+                    try:
+                        result = await self.mcp.call_tool(name, arguments)
+                    except asyncio.CancelledError:
+                        budget.record_cancellation()
+                        if manual_metering:
+                            await budget.finish_tool_attempt(success=False)
+                        raise
+                    except TimeoutError:
+                        if manual_metering:
+                            await budget.finish_tool_attempt(
+                                success=False,
+                                timed_out=True,
+                            )
+                        raise
+                    except Exception:
+                        if manual_metering:
+                            await budget.finish_tool_attempt(success=False)
+                        raise
+                    if manual_metering:
+                        await budget.finish_tool_attempt(
+                            success=bool(getattr(result, "ok", True))
+                        )
+                    return result
+        except TimeoutError:
+            raise

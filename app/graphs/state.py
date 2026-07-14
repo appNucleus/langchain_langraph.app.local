@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from typing import Any, TypedDict
 
-from app.schemas.execution import ExecutionBudget
-
 
 class AgentGraphState(TypedDict, total=False):
     message: str
@@ -12,16 +10,18 @@ class AgentGraphState(TypedDict, total=False):
     request_domain: str
     metadata: dict[str, Any]
     history: list[dict[str, Any]]
-    execution_budget: ExecutionBudget
     request_id: str
 
-    # Conversation continuity is separate from checkpointed execution.
+    # Conversation continuity is separate from one checkpointed execution.
     conversation_id: str
     run_id: str
     execution_thread_id: str
     state_schema_version: int
     resume_requested: bool
     resumed: bool
+
+    # Only the serialized meter snapshot is durable graph state.
+    execution_meter_state: dict[str, Any]
 
     inventory: dict[str, Any]
     routing: dict[str, Any]
@@ -36,7 +36,9 @@ class AgentGraphState(TypedDict, total=False):
     task_results: list[dict[str, Any]]
     worker_result: dict[str, Any]
     verification: dict[str, Any]
+    grounding: list[dict[str, Any]]
     evidence: list[dict[str, Any]]
+    tool_errors: list[dict[str, Any]]
     iterations: int
     research_rounds: int
     replans: int
@@ -48,3 +50,5 @@ class AgentGraphState(TypedDict, total=False):
     final_verification_required: bool
     final_verification: dict[str, Any]
     final_revision_rounds: int
+    _run_status: str
+    _run_error_code: str | None

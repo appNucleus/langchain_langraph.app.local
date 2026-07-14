@@ -1,64 +1,71 @@
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
 
 
-def _normalize_string_list(
-    value: Any,
-    *,
-    allow_integer_items: bool = False,
-) -> Any:
-    """Normalize common local-model JSON variants before strict validation.
-
-    The canonical schema remains ``list[str]``. This helper only repairs
-    unambiguous representation differences:
-
-    * ``null`` becomes an empty list;
-    * a single string becomes a one-item list;
-    * integer identifiers may be converted to strings when explicitly allowed;
-    * list items otherwise remain subject to normal Pydantic validation.
-
-    It deliberately does not map numeric evidence references to evidence by
-    position. An identifier such as ``0`` is preserved as ``"0"`` so the
-    verifier can reject it when no evidence item actually has that ID.
-    """
+def _normalize_string_list(value: Any, *, field_name: str) -> list[str]:
+    """Normalize a scalar string or a concrete string sequence."""
 
     if value is None:
         return []
-
     if isinstance(value, str):
         return [value]
+    if isinstance(value, Mapping) or not isinstance(value, Sequence):
+        raise ValueError(f"{field_name} must be a string or a list of strings")
 
-    if allow_integer_items and isinstance(value, int) and not isinstance(value, bool):
-        return [str(value)]
-
-    if not isinstance(value, list):
-        return value
-
-    if not allow_integer_items:
-        return value
-
-    normalized: list[Any] = []
+    normalized: list[str] = []
     for item in value:
-        if isinstance(item, int) and not isinstance(item, bool):
-            normalized.append(str(item))
-        else:
-            normalized.append(item)
+        if not isinstance(item, str):
+            raise ValueError(f"{field_name} entries must be strings")
+        normalized.append(item)
+    return normalized
+
+
+def _normalize_evidence_ids(value: Any) -> list[str]:
+    """Normalize deterministic evidence-ID shapes without accepting ambiguity."""
+
+    if value is None:
+        return []
+    if isinstance(value, bool):
+        raise ValueError("evidence_ids cannot contain booleans")
+    if isinstance(value, (str, int)):
+        return [str(value)]
+    if isinstance(value, Mapping) or not isinstance(value, Sequence):
+        raise ValueError("evidence_ids must be an ID or a list of IDs")
+
+    normalized: list[str] = []
+    for item in value:
+        if isinstance(item, bool) or not isinstance(item, (str, int)):
+            raise ValueError(
+                "evidence_ids entries must be non-boolean strings or integers"
+            )
+        normalized.append(str(item))
     return normalized
 
 
 class Claim(BaseModel):
+    # Grounding fields remain absent from established public serialization when
+    # they carry only their defaults. Stable fallback IDs are derived by the
+    # grounding service rather than injected into every legacy response.
+    claim_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
     text: str
     evidence_ids: list[str] = Field(default_factory=list)
+    uncertainty: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    requires_current_evidence: bool = Field(
+        default=False,
+        exclude_if=lambda value: value is False,
+    )
 
     @field_validator("evidence_ids", mode="before")
     @classmethod
-    def normalize_evidence_ids(cls, value: Any) -> Any:
-        """Accept numeric IDs emitted by local models without weakening IDs."""
-
-        return _normalize_string_list(value, allow_integer_items=True)
+    def normalize_evidence_ids(cls, value: Any) -> list[str]:
+        return _normalize_evidence_ids(value)
 
 
 class WorkerResult(BaseModel):
@@ -70,7 +77,5 @@ class WorkerResult(BaseModel):
 
     @field_validator("assumptions", "missing_information", mode="before")
     @classmethod
-    def normalize_text_lists(cls, value: Any) -> Any:
-        """Normalize singleton text emitted instead of a JSON string array."""
-
-        return _normalize_string_list(value)
+    def normalize_string_lists(cls, value: Any, info: Any) -> list[str]:
+        return _normalize_string_list(value, field_name=info.field_name)

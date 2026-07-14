@@ -1,43 +1,34 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Mapping
 from copy import deepcopy
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
-CHAT_REQUEST_EXAMPLE_PATH = (
-    Path(__file__).resolve().parents[2]
-    / "docs"
-    / "example_request"
-    / "chat.json"
-)
-CHAT_REQUEST_COMPLETE_EXAMPLE_PATH = (
-    Path(__file__).resolve().parents[2]
-    / "docs"
-    / "example_request"
-    / "chat-complete.json"
-)
+logger = logging.getLogger(__name__)
 
-_FALLBACK_CHAT_REQUEST_EXAMPLE: dict[str, Any] = {
-    "message": "Continue the analysis",
-}
+CHAT_REQUEST_EXAMPLE_FILENAME = "chat.json"
+CHAT_STREAM_REQUEST_EXAMPLE_FILENAME = "chat-stream.json"
+
+_EXAMPLE_REQUEST_DIRECTORY = (
+    Path(__file__).resolve().parents[2] / "docs" / "example_request"
+)
 
 
 class ChatRequest(BaseModel):
-    """Public chat request with backward-compatible identity fields."""
+    """Public chat request with server-owned execution identity generation."""
 
     message: str = Field(..., min_length=1, max_length=20000)
     thread_id: str | None = Field(
         default=None,
         max_length=200,
-        description=(
-            "Backward-compatible alias for conversation_id. Omit both IDs to start "
-            "a new conversation and let the server generate a GUID."
-        ),
+        description="Deprecated compatibility alias for conversation_id.",
     )
     conversation_id: str | None = Field(
         default=None,
@@ -47,7 +38,8 @@ class ChatRequest(BaseModel):
     run_id: str | None = Field(
         default=None,
         description=(
-            "Optional UUID for an idempotent retry. Omit it for a new server-generated run."
+            "Optional UUID for an idempotent retry. Omit it for a new "
+            "server-generated run."
         ),
     )
     resume: bool = Field(
@@ -114,77 +106,177 @@ class ChatRequest(BaseModel):
         return self
 
 
-def _validated_chat_request_example(raw: object) -> dict[str, Any]:
-    if not isinstance(raw, dict):
-        return deepcopy(_FALLBACK_CHAT_REQUEST_EXAMPLE)
-    try:
-        request = ChatRequest.model_validate(raw)
-    except ValidationError:
-        return deepcopy(_FALLBACK_CHAT_REQUEST_EXAMPLE)
-    return request.model_dump(mode="json", exclude_unset=True)
-
-
-def load_chat_request_example(path: Path | None = None) -> dict[str, Any]:
-    """Load the documentation-only OpenAPI request example from ``chat.json``.
-
-    This mapping decorates the generated OpenAPI schema only. It does not define
-    ``ChatRequest`` defaults and is never used as chat execution input.
-    """
-
-    example_path = path or CHAT_REQUEST_EXAMPLE_PATH
-    try:
-        raw = json.loads(example_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return deepcopy(_FALLBACK_CHAT_REQUEST_EXAMPLE)
-    return _validated_chat_request_example(raw)
-
-
-def build_chat_request_openapi_examples(
-    example: Mapping[str, Any],
-) -> dict[str, dict[str, Any]]:
-    """Build a defensive OpenAPI example object from one validated request mapping."""
-
-    return {
-        "default": {
-            "summary": "Configured chat request example",
-            "description": (
-                "Documentation-only request body loaded lazily from "
-                "docs/example_request/chat.json when OpenAPI is generated. "
-                "It does not define request-model defaults or runtime execution."
-            ),
-            "value": deepcopy(dict(example)),
-        }
-    }
-
-
 class ChatResponse(BaseModel):
     thread_id: str
-    conversation_id: str
+    conversation_id: str | None = None
     run_id: str | None = None
+    execution_thread_id: str | None = None
     response: str
     backend: str
     model: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
+    @model_validator(mode="after")
+    def fill_compatibility_identity(self) -> "ChatResponse":
+        self.conversation_id = self.conversation_id or self.thread_id
+        self.run_id = self.run_id or str(uuid4())
+        self.execution_thread_id = (
+            self.execution_thread_id or f"{self.conversation_id}:{self.run_id}"
+        )
+        return self
+
     @classmethod
     def from_result(
         cls,
         *,
-        thread_id: str | None,
+        thread_id: str | None = None,
         conversation_id: str | None = None,
         run_id: str | None = None,
+        execution_thread_id: str | None = None,
         response: str,
         backend: str,
         model: str | None,
         metadata: dict[str, Any] | None = None,
     ) -> "ChatResponse":
         resolved_conversation_id = conversation_id or thread_id or str(uuid4())
+        resolved_run_id = run_id or str(uuid4())
+        resolved_execution_thread_id = (
+            execution_thread_id or f"{resolved_conversation_id}:{resolved_run_id}"
+        )
         return cls(
             thread_id=resolved_conversation_id,
             conversation_id=resolved_conversation_id,
-            run_id=run_id,
+            run_id=resolved_run_id,
+            execution_thread_id=resolved_execution_thread_id,
             response=response,
             backend=backend,
             model=model,
             metadata=metadata or {},
         )
+
+
+def _validate_request_example(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate documentation data without turning it into request defaults."""
+
+    raw = deepcopy(dict(value))
+    ChatRequest.model_validate(raw)
+    return raw
+
+
+def _read_request_example(filename: str) -> dict[str, Any] | None:
+    safe_name = Path(filename).name
+    if safe_name != filename or not safe_name.endswith(".json"):
+        logger.warning("openapi_request_example_invalid_filename: %s", filename)
+        return None
+
+    path = _EXAMPLE_REQUEST_DIRECTORY / safe_name
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            raise ValueError("request example must be a JSON object")
+        return _validate_request_example(raw)
+    except (OSError, ValueError, json.JSONDecodeError, ValidationError) as exc:
+        logger.warning(
+            "openapi_request_example_unavailable file=%s error=%s",
+            path,
+            exc,
+        )
+        return None
+
+
+@lru_cache(maxsize=None)
+def _load_request_example(filename: str) -> dict[str, Any] | None:
+    """Cache documentation examples used by generated OpenAPI metadata."""
+
+    return _read_request_example(filename)
+
+
+def _build_openapi_examples(
+    value: Mapping[str, Any],
+    *,
+    summary: str,
+    description: str,
+) -> dict[str, dict[str, Any]]:
+    validated = _validate_request_example(value)
+    return {
+        "default": {
+            "summary": summary,
+            "description": description,
+            "value": deepcopy(validated),
+        }
+    }
+
+
+def load_chat_openapi_examples(
+    filename: str,
+    *,
+    summary: str,
+    description: str,
+) -> dict[str, dict[str, Any]] | None:
+    """Return a defensive OpenAPI mapping for one POST request JSON file."""
+
+    value = _load_request_example(filename)
+    if value is None:
+        return None
+    return _build_openapi_examples(
+        value,
+        summary=summary,
+        description=description,
+    )
+
+
+def load_chat_request_example(
+    filename: str = CHAT_REQUEST_EXAMPLE_FILENAME,
+) -> dict[str, Any] | None:
+    """Read one documentation-only request example without sharing cache state."""
+
+    value = _read_request_example(filename)
+    return deepcopy(value) if value is not None else None
+
+
+def load_request_example(
+    filename: str = CHAT_REQUEST_EXAMPLE_FILENAME,
+) -> dict[str, Any] | None:
+    """Compatibility alias for the established documentation loader."""
+
+    return load_chat_request_example(filename)
+
+
+def build_chat_request_openapi_examples(
+    example: Mapping[str, Any] | str | None = None,
+    *,
+    summary: str = "Complete chat request",
+    description: str = "Default values for the chat request.",
+) -> dict[str, dict[str, Any]] | None:
+    if isinstance(example, Mapping):
+        return _build_openapi_examples(
+            example,
+            summary=summary,
+            description=description,
+        )
+    filename = example or CHAT_REQUEST_EXAMPLE_FILENAME
+    return load_chat_openapi_examples(
+        filename,
+        summary=summary,
+        description=description,
+    )
+
+
+def build_chat_stream_request_openapi_examples(
+    example: Mapping[str, Any] | str | None = None,
+    *,
+    summary: str = "Complete streaming chat request",
+    description: str = "Default values for the streaming chat request.",
+) -> dict[str, dict[str, Any]] | None:
+    if isinstance(example, Mapping):
+        return _build_openapi_examples(
+            example,
+            summary=summary,
+            description=description,
+        )
+    filename = example or CHAT_STREAM_REQUEST_EXAMPLE_FILENAME
+    return load_chat_openapi_examples(
+        filename,
+        summary=summary,
+        description=description,
+    )

@@ -15,6 +15,7 @@ from app.llm.errors import OllamaError
 from app.llm.resource_manager import OllamaResourceManager
 from app.logging_config import log_kv
 from app.observability.metrics import metrics
+from app.orchestration.execution_meter import get_current_execution_meter
 from app.settings import Settings
 
 logger = logging.getLogger(__name__)
@@ -128,16 +129,7 @@ def _get_shared_runtime(settings: Settings) -> _SharedOllamaRuntime:
 
 
 class OllamaClient:
-    """Shared, bounded async Ollama HTTP client.
-
-    Instances created with the same connection and concurrency settings share a
-    single runtime. This is important because planner, worker, verifier, reviser,
-    synthesizer, and API inventory calls are separate Python objects but must use
-    one HTTP pool and one global admission controller.
-
-    A custom HTTP transport creates an isolated runtime, which keeps tests and
-    special-purpose clients deterministic.
-    """
+    """Shared, bounded async Ollama HTTP client."""
 
     def __init__(
         self,
@@ -159,8 +151,6 @@ class OllamaClient:
 
     @property
     def runtime_identity(self) -> int:
-        """Diagnostic identity used to verify that role agents share a runtime."""
-
         return id(self._runtime)
 
     async def start(self) -> None:
@@ -184,7 +174,6 @@ class OllamaClient:
             raise OllamaError(_http_error_message(exc)) from exc
         finally:
             metrics.observe("ollama.health_seconds", monotonic() - started)
-
         return {
             "status": "available",
             "root": root.text.strip(),
@@ -278,17 +267,23 @@ class OllamaClient:
         )
         client = await self._runtime.get_client()
         started = monotonic()
+        meter = get_current_execution_meter()
+        if meter is not None:
+            await meter.begin_model_attempt()
+        success = False
+        data: dict[str, Any] = {}
         metrics.inc("ollama.chat_requests")
-
-        async with self.resources.acquire(model):
-            try:
+        try:
+            async with self.resources.acquire(model):
                 log_kv(
                     logger,
                     logging.INFO,
                     "ollama_chat_request",
                     model=model,
                     messages=len(messages),
-                    message_chars=sum(len(str(item.get("content") or "")) for item in messages),
+                    message_chars=sum(
+                        len(str(item.get("content") or "")) for item in messages
+                    ),
                     num_ctx=payload.get("options", {}).get("num_ctx"),
                     num_predict=payload.get("options", {}).get("num_predict"),
                     structured=bool(response_format is not None),
@@ -296,18 +291,29 @@ class OllamaClient:
                 )
                 response = await client.post("/api/chat", json=payload)
                 response.raise_for_status()
-                data = response.json()
-                if not isinstance(data, dict):
+                parsed = response.json()
+                if not isinstance(parsed, dict):
                     raise OllamaError("Ollama /api/chat returned a non-object payload.")
+                data = parsed
                 if data.get("error"):
                     raise OllamaError(str(data["error"]))
-            except (httpx.HTTPError, ValueError, OllamaError) as exc:
-                metrics.inc("ollama.chat_errors")
-                if isinstance(exc, OllamaError):
-                    raise
-                raise OllamaError(_http_error_message(exc)) from exc
-            finally:
-                metrics.observe("ollama.chat_seconds", monotonic() - started)
+                success = True
+        except (httpx.HTTPError, ValueError, OllamaError) as exc:
+            metrics.inc("ollama.chat_errors")
+            if isinstance(exc, OllamaError):
+                raise
+            raise OllamaError(_http_error_message(exc)) from exc
+        finally:
+            metrics.observe("ollama.chat_seconds", monotonic() - started)
+            if meter is not None:
+                await meter.finish_model_attempt(
+                    success=success,
+                    prompt_tokens=_nonnegative_int(data.get("prompt_eval_count")),
+                    generated_tokens=_nonnegative_int(data.get("eval_count")),
+                    model_load_seconds=_nanoseconds_to_seconds(
+                        data.get("load_duration")
+                    ),
+                )
 
         _record_ollama_telemetry(data)
         log_kv(
@@ -353,10 +359,13 @@ class OllamaClient:
         client = await self._runtime.get_client()
         started = monotonic()
         final_payload: dict[str, Any] | None = None
+        meter = get_current_execution_meter()
+        if meter is not None:
+            await meter.begin_model_attempt()
+        success = False
         metrics.inc("ollama.stream_requests")
-
-        async with self.resources.acquire(model):
-            try:
+        try:
+            async with self.resources.acquire(model):
                 async with client.stream("POST", "/api/chat", json=payload) as response:
                     response.raise_for_status()
                     async for line in response.aiter_lines():
@@ -369,7 +378,9 @@ class OllamaClient:
                                 f"Invalid Ollama stream line: {line[:200]}"
                             ) from exc
                         if not isinstance(data, dict):
-                            raise OllamaError("Ollama stream item was not a JSON object.")
+                            raise OllamaError(
+                                "Ollama stream item was not a JSON object."
+                            )
                         if data.get("error"):
                             raise OllamaError(str(data["error"]))
                         content = str((data.get("message") or {}).get("content") or "")
@@ -377,24 +388,38 @@ class OllamaClient:
                             yield content
                         if data.get("done"):
                             final_payload = data
+                            success = True
                             break
-            except (httpx.HTTPError, OllamaError) as exc:
-                metrics.inc("ollama.stream_errors")
-                if isinstance(exc, OllamaError):
-                    raise
-                raise OllamaError(_http_error_message(exc)) from exc
-            finally:
-                metrics.observe("ollama.stream_seconds", monotonic() - started)
-
+        except (httpx.HTTPError, OllamaError) as exc:
+            metrics.inc("ollama.stream_errors")
+            if isinstance(exc, OllamaError):
+                raise
+            raise OllamaError(_http_error_message(exc)) from exc
+        finally:
+            metrics.observe("ollama.stream_seconds", monotonic() - started)
+            if meter is not None:
+                data = final_payload or {}
+                await meter.finish_model_attempt(
+                    success=success,
+                    prompt_tokens=_nonnegative_int(data.get("prompt_eval_count")),
+                    generated_tokens=_nonnegative_int(data.get("eval_count")),
+                    model_load_seconds=_nanoseconds_to_seconds(
+                        data.get("load_duration")
+                    ),
+                )
         if final_payload is not None:
             _record_ollama_telemetry(final_payload)
 
     async def embed(self, *, model: str, text: str) -> list[float]:
         client = await self._runtime.get_client()
         started = monotonic()
+        meter = get_current_execution_meter()
+        if meter is not None:
+            await meter.begin_model_attempt()
+        success = False
         metrics.inc("ollama.embed_requests")
-        async with self.resources.acquire(model):
-            try:
+        try:
+            async with self.resources.acquire(model):
                 response = await client.post(
                     "/api/embed",
                     json={
@@ -406,25 +431,28 @@ class OllamaClient:
                 response.raise_for_status()
                 data = response.json()
                 if not isinstance(data, dict):
-                    raise OllamaError("Ollama /api/embed returned a non-object payload.")
+                    raise OllamaError(
+                        "Ollama /api/embed returned a non-object payload."
+                    )
                 embeddings = data.get("embeddings") or []
                 if not isinstance(embeddings, list) or not embeddings:
                     raise OllamaError("Ollama returned no embeddings.")
                 vector = embeddings[0]
                 if not isinstance(vector, list):
                     raise OllamaError("Ollama returned an invalid embedding vector.")
+                success = True
                 return [float(value) for value in vector]
-            except (httpx.HTTPError, ValueError, TypeError, OllamaError) as exc:
-                metrics.inc("ollama.embed_errors")
-                if isinstance(exc, OllamaError):
-                    raise
-                raise OllamaError(_http_error_message(exc)) from exc
-            finally:
-                metrics.observe("ollama.embed_seconds", monotonic() - started)
+        except (httpx.HTTPError, ValueError, TypeError, OllamaError) as exc:
+            metrics.inc("ollama.embed_errors")
+            if isinstance(exc, OllamaError):
+                raise
+            raise OllamaError(_http_error_message(exc)) from exc
+        finally:
+            metrics.observe("ollama.embed_seconds", monotonic() - started)
+            if meter is not None:
+                await meter.finish_model_attempt(success=success)
 
     async def _get_client(self) -> httpx.AsyncClient:
-        """Backward-compatible private hook retained for existing tests."""
-
         return await self._runtime.get_client()
 
     def _payload(
@@ -441,14 +469,10 @@ class OllamaClient:
     ) -> dict[str, Any]:
         merged_options: dict[str, Any] = {
             "temperature": (
-                self.settings.ollama_temperature
-                if temperature is None
-                else temperature
+                self.settings.ollama_temperature if temperature is None else temperature
             ),
             "num_predict": (
-                self.settings.ollama_num_predict
-                if num_predict is None
-                else num_predict
+                self.settings.ollama_num_predict if num_predict is None else num_predict
             ),
             "num_ctx": int(getattr(self.settings, "ollama_num_ctx", 8192)),
         }
@@ -495,7 +519,6 @@ def _record_ollama_telemetry(data: Mapping[str, Any]) -> None:
         value = data.get(field)
         if isinstance(value, (int, float)) and value >= 0:
             metrics.observe(metric_name, float(value) / 1_000_000_000.0)
-
     for field, metric_name in (
         ("prompt_eval_count", "ollama.prompt_tokens"),
         ("eval_count", "ollama.generated_tokens"),
@@ -503,3 +526,13 @@ def _record_ollama_telemetry(data: Mapping[str, Any]) -> None:
         value = data.get(field)
         if isinstance(value, int) and value >= 0:
             metrics.observe(metric_name, float(value))
+
+
+def _nonnegative_int(value: object) -> int:
+    return int(value) if isinstance(value, int) and value >= 0 else 0
+
+
+def _nanoseconds_to_seconds(value: object) -> float:
+    if isinstance(value, (int, float)) and value >= 0:
+        return float(value) / 1_000_000_000.0
+    return 0.0

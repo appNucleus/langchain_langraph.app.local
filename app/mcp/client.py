@@ -27,6 +27,7 @@ from app.mcp.result_parser import parse_tool_result
 from app.mcp.session import MCPSessionManager
 from app.mcp.transport import MCPHTTPTransport
 from app.observability.metrics import metrics
+from app.orchestration.execution_meter import get_current_execution_meter
 from app.settings import Settings
 
 logger = logging.getLogger(__name__)
@@ -47,6 +48,8 @@ class MCPClientError(MCPError):
 class MCPClient:
     """Session-aware async JSON-RPC client for Streamable HTTP MCP."""
 
+    physical_attempts_metered = True
+
     def __init__(
         self,
         settings: Settings,
@@ -56,8 +59,7 @@ class MCPClient:
     ) -> None:
         self.settings = settings
         self._transport = http_transport or MCPHTTPTransport(
-            settings,
-            transport=transport,
+            settings, transport=transport
         )
         self._request_id = 0
         self._id_lock = asyncio.Lock()
@@ -171,9 +173,6 @@ class MCPClient:
 
         metrics.inc("mcp.tool_calls")
         try:
-            # Never automatically replay tools/call after a session-expiration
-            # response. The server may have executed the side effect before the
-            # transport/session failure became visible to this client.
             result = await self._rpc(
                 "tools/call",
                 {"name": name, "arguments": arguments or {}},
@@ -188,7 +187,7 @@ class MCPClient:
                 data=parsed.data,
                 error=parsed.error,
             )
-        except Exception as exc:  # dependency failure becomes explicit tool data
+        except Exception as exc:
             metrics.inc("mcp.tool_call_errors")
             error = _format_exception(exc)
             log_kv(
@@ -246,6 +245,45 @@ class MCPClient:
                 "automatically replayed because its completion is ambiguous."
             ) from exc
 
+    async def _post(
+        self,
+        payload: dict[str, Any],
+        *,
+        headers: dict[str, str],
+        allow_empty: bool,
+    ) -> tuple[list[dict[str, Any]], dict[str, str]]:
+        meter = get_current_execution_meter()
+        if meter is not None:
+            await meter.begin_tool_attempt()
+        success = False
+        timed_out = False
+        try:
+            messages, response_headers = await self._transport.post(
+                payload,
+                headers=headers,
+                allow_empty=allow_empty,
+            )
+            if messages is None and allow_empty:
+                normalized = []
+            elif isinstance(messages, dict):
+                normalized = [messages]
+            elif isinstance(messages, list) and all(
+                isinstance(item, dict) for item in messages
+            ):
+                normalized = messages
+            else:
+                raise MCPProtocolError(
+                    "MCP transport returned an invalid JSON-RPC message collection."
+                )
+            success = True
+            return normalized, response_headers
+        except (TimeoutError, asyncio.TimeoutError, httpx.TimeoutException):
+            timed_out = True
+            raise
+        finally:
+            if meter is not None:
+                await meter.finish_tool_attempt(success=success, timed_out=timed_out)
+
     async def _send_for_session(
         self,
         method: str,
@@ -266,7 +304,7 @@ class MCPClient:
             method=method,
             session=bool(self.session_id),
         )
-        messages, response_headers = await self._transport.post(
+        messages, response_headers = await self._post(
             payload,
             headers=self._headers(),
             allow_empty=notification,
@@ -289,9 +327,7 @@ class MCPClient:
 
         response = select_response(messages, expected_id=request_id)  # type: ignore[arg-type]
         if response.error is not None:
-            raise MCPClientError(
-                f"MCP JSON-RPC error for {method}: {response.error}"
-            )
+            raise MCPClientError(f"MCP JSON-RPC error for {method}: {response.error}")
         return response.result, normalized_headers
 
     async def _respond_to_server_request(self, message: dict[str, Any]) -> None:
@@ -304,9 +340,6 @@ class MCPClient:
             payload = response_envelope(request_id, {})
             metrics.inc("mcp.server_ping_requests")
         else:
-            # The client declares no sampling, roots, or elicitation capabilities.
-            # Return a JSON-RPC error instead of silently abandoning the server
-            # request and leaving the MCP exchange incomplete.
             payload = error_envelope(
                 request_id,
                 code=-32601,
@@ -314,16 +347,11 @@ class MCPClient:
             )
             metrics.inc("mcp.unsupported_server_requests")
 
-        await self._transport.post(
-            payload,
-            headers=self._headers(),
-            allow_empty=True,
-        )
+        await self._post(payload, headers=self._headers(), allow_empty=True)
 
     def _headers(self) -> dict[str, str]:
         protocol_version = (
-            self._session.state.protocol_version
-            or self.settings.mcp_protocol_version
+            self._session.state.protocol_version or self.settings.mcp_protocol_version
         )
         headers = {
             "Accept": "application/json, text/event-stream",
@@ -343,8 +371,7 @@ class MCPClient:
         return bool(
             not force_refresh
             and self._tools_cache is not None
-            and now - self._tools_cached_at
-            <= self.settings.inventory_cache_ttl_seconds
+            and now - self._tools_cached_at <= self.settings.inventory_cache_ttl_seconds
         )
 
 
