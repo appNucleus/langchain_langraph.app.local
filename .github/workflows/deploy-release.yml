@@ -19,7 +19,7 @@ env:
 
 jobs:
   pre-deployment:
-    name: "Pre-deployment: compile, lint, and test"
+    name: "Pre-deployment: compile, lint, test, and coverage"
     runs-on: ubuntu-latest
     timeout-minutes: 20
     services:
@@ -74,14 +74,27 @@ jobs:
           set -euo pipefail
           python -m pytest -v -ra --tb=long -W default \
             -m "not live_integration" \
-            --junitxml=test-results/pytest.xml
+            --junitxml=test-results/pytest.xml \
+            --cov=app \
+            --cov-branch \
+            --cov-report=
 
-      - name: Upload test report
+      - name: Generate code coverage reports
+        run: |
+          set -euo pipefail
+          python -m coverage report --show-missing
+          python -m coverage xml -o test-results/coverage.xml
+          python -m coverage json -o test-results/coverage.json
+
+      - name: Upload test and coverage reports
         if: always()
         uses: actions/upload-artifact@v6
         with:
           name: pytest-results-${{ github.sha }}
-          path: test-results/pytest.xml
+          path: |
+            test-results/pytest.xml
+            test-results/coverage.xml
+            test-results/coverage.json
           if-no-files-found: ignore
           retention-days: 14
 
