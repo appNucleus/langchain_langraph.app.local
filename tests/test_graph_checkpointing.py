@@ -32,8 +32,8 @@ async def test_echo_graph_preserves_execution_budget_and_completes() -> None:
         await agent.aclose()
 
     assert response.backend == "echo"
-    # Compatibility-only metadata from the base ChatAgent remains stable.
-    assert response.metadata["phase"] == "4"
+    # Canonical runtime metadata remains stable.
+    assert response.metadata["runtime_contract"] == "agent-graph-v1"
     assert "Message received" in response.response
     assert response.metadata["usage"]["model_calls"] == 0
     assert response.metadata["usage"]["tool_calls"] == 0
