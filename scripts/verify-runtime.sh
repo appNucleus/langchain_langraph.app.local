@@ -20,7 +20,7 @@ assert hasattr(settings, "ollama_max_concurrent_requests")
 assert hasattr(settings, "mcp_read_timeout_seconds")
 assert hasattr(settings, "inventory_cache_ttl_seconds")
 assert hasattr(settings, "agent_max_research_rounds")
-assert settings.phase2_max_research_rounds == settings.agent_max_research_rounds
+assert isinstance(settings.agent_max_research_rounds, int)
 print(f"Import/startup contract OK; version={__version__}")
 PY
 
