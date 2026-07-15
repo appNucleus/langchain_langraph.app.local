@@ -67,6 +67,10 @@ def create_app(
             "durable run outcomes, checkpoints, Ollama model routing, and MCP tools."
         ),
         lifespan=build_lifespan(app_settings, agent),
+        swagger_ui_parameters={
+            "defaultModelsExpandDepth": 0,
+            "docExpansion": "none",
+        }
     )
     app.state.settings = app_settings
     app.state.chat_agent = agent
