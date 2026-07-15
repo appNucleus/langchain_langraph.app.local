@@ -82,10 +82,10 @@ def test_chat_request_has_no_documentation_derived_runtime_default() -> None:
     assert ChatRequest.model_fields["metadata"].default_factory is dict
 
 
-def test_factory_loads_documentation_example_only_from_openapi_hook() -> None:
+def test_openapi_module_loads_documentation_example_only_from_openapi_hook() -> None:
     repository_root = Path(__file__).resolve().parents[1]
-    factory = repository_root / "app" / "factory.py"
-    tree = ast.parse(factory.read_text(encoding="utf-8"))
+    openapi_module = repository_root / "app" / "api" / "openapi.py"
+    tree = ast.parse(openapi_module.read_text(encoding="utf-8"))
 
     calls = [
         call

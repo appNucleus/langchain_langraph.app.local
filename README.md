@@ -19,6 +19,31 @@ POST /api/chat/stream
 
 Inventory, metrics, chat, and streaming routes are protected when `API_KEY` is configured. Liveness is process-only. Readiness evaluates required Ollama, MCP, conversation, run-repository, checkpoint, and artifact dependencies.
 
+## API-layer organization
+
+The FastAPI entry point remains `app.main:app`, and `create_app(settings=None, chat_agent=None)` remains the application factory and test seam. HTTP responsibilities are separated by role:
+
+```text
+app/
+├── factory.py                 # application composition only
+├── main.py                    # ASGI entry point
+├── core/
+│   └── lifespan.py            # startup and shutdown lifecycle
+└── api/
+    ├── router.py              # single router composition point
+    ├── dependencies.py        # API-key dependency
+    ├── exception_handlers.py  # exception registration and mappings
+    ├── openapi.py             # lazy Swagger example customization
+    └── routes/
+        ├── root.py
+        ├── health.py
+        ├── inventory.py
+        ├── metrics.py
+        └── chat.py
+```
+
+To follow an HTTP request, start at `app/main.py`, then `app/factory.py`, `app/api/router.py`, and the matching module under `app/api/routes/`. Graph execution, agents, persistence, model/tool clients, and schemas remain outside the API layer.
+
 ## Current graph
 
 ```text
