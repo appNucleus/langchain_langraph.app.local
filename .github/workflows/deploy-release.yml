@@ -79,6 +79,15 @@ jobs:
             --cov-branch \
             --cov-config=pyproject.toml \
             --cov-report=
+      
+      - name: Upload pytest failure details
+        if: ${{ failure() && hashFiles('test-results/failure-details.txt') != '' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: pytest-failure-details-${{ github.run_id }}-${{ github.run_attempt }}
+          path: test-results/failure-details.txt
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Generate and enforce code coverage reports
         run: |
@@ -100,7 +109,7 @@ jobs:
             test-results/coverage.xml
             test-results/coverage.json
           if-no-files-found: ignore
-          retention-days: 14
+          retention-days: 7
 
   deployment:
     name: "Deployment: build and release"
