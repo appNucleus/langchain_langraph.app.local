@@ -87,12 +87,21 @@ def test_openapi_module_loads_documentation_example_only_from_openapi_hook() -> 
     openapi_module = repository_root / "app" / "api" / "openapi.py"
     tree = ast.parse(openapi_module.read_text(encoding="utf-8"))
 
-    calls = [
+    direct_loader_calls = [
         call
         for call in ast.walk(tree)
         if isinstance(call, ast.Call)
         and isinstance(call.func, ast.Name)
         and call.func.id == "load_chat_request_example"
+    ]
+    assert direct_loader_calls == []
+
+    calls = [
+        call
+        for call in ast.walk(tree)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Name)
+        and call.func.id == "_load_request_examples"
     ]
     assert len(calls) == 1
 

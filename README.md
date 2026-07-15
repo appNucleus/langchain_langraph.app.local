@@ -28,13 +28,16 @@ app/
 ├── factory.py                 # application composition only
 ├── main.py                    # ASGI entry point
 ├── core/
+│   ├── __init__.py
 │   └── lifespan.py            # startup and shutdown lifecycle
 └── api/
+    ├── __init__.py
     ├── router.py              # single router composition point
     ├── dependencies.py        # API-key dependency
     ├── exception_handlers.py  # exception registration and mappings
     ├── openapi.py             # lazy Swagger example customization
     └── routes/
+        ├── __init__.py
         ├── root.py
         ├── health.py
         ├── inventory.py
@@ -43,6 +46,8 @@ app/
 ```
 
 To follow an HTTP request, start at `app/main.py`, then `app/factory.py`, `app/api/router.py`, and the matching module under `app/api/routes/`. Graph execution, agents, persistence, model/tool clients, and schemas remain outside the API layer.
+
+`app/factory.py` is intentionally limited to composition: settings and logging, agent construction, FastAPI construction, `app.state`, middleware, exception-handler registration, root-router inclusion, and OpenAPI customization. It does not own route handlers, lifecycle implementation, database clients, or LLM clients.
 
 ## Current graph
 
@@ -91,27 +96,26 @@ The server generates conversation and run IDs when omitted. Each run uses a dist
 
 The process-local conversation gate remains a fast-path optimization only. PostgreSQL is the correctness boundary when the PostgreSQL run repository is enabled.
 
-## Request examples
+## Swagger/OpenAPI request examples
 
-The Swagger/OpenAPI request body is documentation input loaded from:
-
-```text
-docs/example_request/chat.json
-```
-
-This file is loaded lazily only when OpenAPI is generated, such as for
-`/openapi.json`, `/docs`, or `/redoc`. Its contents do not define
-`ChatRequest` model defaults, are not supplied to chat execution, and are not
-used as pytest fixture data. Tests inject code-defined request examples so
-documentation can evolve without changing runtime or test semantics.
-
-An additional documentation example may be maintained at:
+The two POST operations use separate documentation-only request examples:
 
 ```text
-docs/example_request/chat-complete.json
+docs/example_request/chat.json         -> POST /api/chat
+docs/example_request/chat-stream.json  -> POST /api/chat/stream
 ```
 
-Neither documentation file is a runtime request template.
+These files are read lazily only while OpenAPI is generated, such as for `/openapi.json`, `/docs`, or `/redoc`. They are validated against `ChatRequest` before insertion into the schema.
+
+They are not:
+
+- Pydantic field defaults;
+- runtime request defaults or fallback request data;
+- chat, graph, agent, persistence, database, model, or tool input;
+- application startup or configuration input;
+- pytest fixture data.
+
+Missing or invalid documentation JSON does not prevent application startup or ordinary API execution. Tests inject code-defined examples through the preserved `app.factory.load_chat_request_example` test seam, so the test suite does not depend on production files under `docs/example_request/`.
 
 ## Streaming status
 

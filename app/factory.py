@@ -17,6 +17,7 @@ from app.graph import ChatAgent
 from app.logging_config import configure_logging
 from app.orchestration.chat_runtime import ChatRuntimeAgent
 from app.orchestration.execution_meter import execution_meter_scope
+from app.schemas.chat import load_chat_request_example
 from app.schemas.execution import ExecutionBudget
 from app.services.inventory import InventoryService
 from app.settings import Settings, get_settings
@@ -81,11 +82,15 @@ def create_app(
 
     register_exception_handlers(app)
     app.include_router(api_router)
-    install_openapi_customization(app)
+    install_openapi_customization(
+        app,
+        request_example_loader=load_chat_request_example,
+    )
     return app
 
 
 __all__ = [
     "create_app",
+    "load_chat_request_example",
     "openapi_with_chat_request_example",
 ]
