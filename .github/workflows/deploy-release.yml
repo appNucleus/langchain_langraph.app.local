@@ -72,20 +72,24 @@ jobs:
       - name: Run unit and deterministic integration tests
         run: |
           set -euo pipefail
+
+          mkdir -p test-results
+
           python -m pytest -v -ra --tb=long -W default \
             -m "not live_integration" \
             --junitxml=test-results/pytest.xml \
             --cov=app \
             --cov-branch \
             --cov-config=pyproject.toml \
-            --cov-report=
+            --cov-report= \
+            2>&1 | tee test-results/pytest-console.log
       
-      - name: Upload pytest failure details
-        if: ${{ failure() && hashFiles('test-results/failure-details.txt') != '' }}
+      - name: Upload original pytest console log
+        if: ${{ failure() && hashFiles('test-results/pytest-console.log') != '' }}
         uses: actions/upload-artifact@v6
         with:
-          name: pytest-failure-details-${{ github.run_id }}-${{ github.run_attempt }}
-          path: test-results/failure-details.txt
+          name: pytest-console-log-${{ github.run_id }}-${{ github.run_attempt }}
+          path: test-results/pytest-console.log
           if-no-files-found: error
           retention-days: 90
 
