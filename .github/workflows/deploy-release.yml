@@ -87,7 +87,7 @@ jobs:
           name: pytest-failure-details-${{ github.run_id }}-${{ github.run_attempt }}
           path: test-results/failure-details.txt
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 90
 
       - name: Generate and enforce code coverage reports
         run: |
@@ -109,7 +109,7 @@ jobs:
             test-results/coverage.xml
             test-results/coverage.json
           if-no-files-found: ignore
-          retention-days: 7
+          retention-days: 90
 
   deployment:
     name: "Deployment: build and release"
