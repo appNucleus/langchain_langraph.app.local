@@ -151,6 +151,7 @@ class Settings(BaseSettings):
     postgres_auto_setup: bool = True
     redis_url: str = ""
     redis_key_prefix: str = "langgraph"
+    redis_max_connections: int = Field(default=20, ge=1, le=1000)
     minio_endpoint: str = "dbs.home.arpa:9000"
     minio_access_key: str = ""
     minio_secret_key: str = ""
@@ -165,10 +166,15 @@ class Settings(BaseSettings):
     final_max_revision_rounds: int = Field(default=1, ge=0, le=3)
 
     @model_validator(mode="after")
-    def validate_run_lease_settings(self) -> "Settings":
+    def validate_runtime_settings(self) -> "Settings":
         if self.run_lease_heartbeat_seconds >= self.run_lease_ttl_seconds:
             raise ValueError(
                 "RUN_LEASE_HEARTBEAT_SECONDS must be less than RUN_LEASE_TTL_SECONDS"
+            )
+        if self.postgres_pool_min_size > self.postgres_pool_max_size:
+            raise ValueError(
+                "POSTGRES_POOL_MIN_SIZE must be less than or equal to "
+                "POSTGRES_POOL_MAX_SIZE"
             )
         if self.run_repository_backend == "postgres" and not any(
             (

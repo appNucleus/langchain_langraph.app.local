@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from contextlib import AbstractAsyncContextManager
 from typing import Any
 
+import asyncpg
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+from psycopg.rows import dict_row
+from psycopg_pool import AsyncConnectionPool
 
 from app.logging_config import log_kv
 from app.settings import Settings
@@ -41,7 +43,8 @@ class StateRuntime:
         self.runs: RunRepository = MemoryRunRepository()
         self.checkpointer: Any = InMemorySaver(serde=_checkpoint_serializer())
         self.artifacts: MinioArtifactStore | None = None
-        self._checkpoint_context: AbstractAsyncContextManager[Any] | None = None
+        self._checkpoint_pool: AsyncConnectionPool | None = None
+        self._postgres_pool: asyncpg.Pool | None = None
         self._started = False
         self.degraded_reason: str | None = None
 
@@ -49,6 +52,8 @@ class StateRuntime:
         if self._started:
             return
         try:
+            await self._start_postgres_pool()
+
             self.conversations = self._build_conversation_store()
             start = getattr(self.conversations, "start", None)
             if callable(start):
@@ -62,11 +67,26 @@ class StateRuntime:
                     raise RuntimeError("DATABASE_URL is required for PostgreSQL checkpoints")
                 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
-                self._checkpoint_context = AsyncPostgresSaver.from_conn_string(
-                    self.settings.database_url,
+                # LangGraph's checkpointer uses psycopg while the application stores use
+                # asyncpg. The drivers cannot share one physical pool, so each driver has
+                # one bounded application-scoped pool instead of per-request connections.
+                self._checkpoint_pool = AsyncConnectionPool(
+                    conninfo=self.settings.database_url,
+                    min_size=self.settings.postgres_pool_min_size,
+                    max_size=self.settings.postgres_pool_max_size,
+                    kwargs={
+                        "autocommit": True,
+                        "prepare_threshold": 0,
+                        "row_factory": dict_row,
+                    },
+                    open=False,
+                    timeout=self.settings.postgres_command_timeout_seconds,
+                )
+                await self._checkpoint_pool.open(wait=True)
+                self.checkpointer = AsyncPostgresSaver(
+                    self._checkpoint_pool,
                     serde=_checkpoint_serializer(),
                 )
-                self.checkpointer = await self._checkpoint_context.__aenter__()
                 if self.settings.postgres_auto_setup:
                     await self.checkpointer.setup()
 
@@ -98,7 +118,7 @@ class StateRuntime:
         await self.runs.start()
         self.checkpointer = InMemorySaver(serde=_checkpoint_serializer())
         self.artifacts = None
-        self._checkpoint_context = None
+        self._checkpoint_pool = None
         self._started = True
         self.degraded_reason = reason
 
@@ -116,12 +136,27 @@ class StateRuntime:
 
         close = getattr(self.conversations, "aclose", None)
         if callable(close):
-            await close()
+            try:
+                await close()
+            except Exception:  # noqa: BLE001 - shutdown remains best effort
+                logger.exception("conversation_store_close_failed")
 
-        if self._checkpoint_context is not None:
-            await self._checkpoint_context.__aexit__(None, None, None)
+        if self._checkpoint_pool is not None:
+            try:
+                await self._checkpoint_pool.close()
+            except Exception:  # noqa: BLE001 - shutdown remains best effort
+                logger.exception("checkpoint_pool_close_failed")
+            finally:
+                self._checkpoint_pool = None
 
-        self._checkpoint_context = None
+        if self._postgres_pool is not None:
+            try:
+                await self._postgres_pool.close()
+            except Exception:  # noqa: BLE001 - shutdown remains best effort
+                logger.exception("postgres_pool_close_failed")
+            finally:
+                self._postgres_pool = None
+
         self._started = False
 
     async def _checkpoint_health(self) -> dict[str, Any]:
@@ -174,6 +209,7 @@ class StateRuntime:
             "run_repository_backend": self.settings.run_repository_backend,
             "checkpoint_backend": self.settings.checkpoint_backend,
             "artifact_backend": self.settings.artifact_backend,
+            "connection_management": self._connection_management_status(),
         }
         if self.degraded_reason:
             payload["degraded_reason"] = (
@@ -225,6 +261,65 @@ class StateRuntime:
 
         return payload
 
+    async def _start_postgres_pool(self) -> None:
+        uses_asyncpg = any(
+            (
+                self.settings.state_backend == "postgres",
+                self.settings.run_repository_backend == "postgres",
+            )
+        )
+        if not uses_asyncpg or self._postgres_pool is not None:
+            return
+        if not self.settings.database_url:
+            raise RuntimeError(
+                "DATABASE_URL is required for PostgreSQL conversation or run storage"
+            )
+        self._postgres_pool = await asyncpg.create_pool(
+            dsn=self.settings.database_url,
+            min_size=self.settings.postgres_pool_min_size,
+            max_size=self.settings.postgres_pool_max_size,
+            command_timeout=self.settings.postgres_command_timeout_seconds,
+        )
+
+    def _connection_management_status(self) -> dict[str, Any]:
+        pool = self._postgres_pool
+        postgres: dict[str, Any]
+        if pool is None:
+            postgres = {"status": "disabled", "shared_asyncpg_pool": False}
+        else:
+            postgres = {
+                "status": "available",
+                "shared_asyncpg_pool": True,
+                "size": pool.get_size(),
+                "idle": pool.get_idle_size(),
+                "min_size": pool.get_min_size(),
+                "max_size": pool.get_max_size(),
+            }
+        return {
+            "postgres": postgres,
+            "checkpoint": {
+                "driver": "psycopg",
+                "application_scoped": self._checkpoint_pool is not None,
+                "pooled": self._checkpoint_pool is not None,
+                "min_size": (
+                    self.settings.postgres_pool_min_size
+                    if self._checkpoint_pool is not None
+                    else 0
+                ),
+                "max_size": (
+                    self.settings.postgres_pool_max_size
+                    if self._checkpoint_pool is not None
+                    else 0
+                ),
+            },
+            "redis": {
+                "application_scoped": self.settings.state_backend == "redis",
+            },
+            "minio": {
+                "application_scoped": self.settings.artifact_backend == "minio",
+            },
+        }
+
     def _build_conversation_store(self) -> ConversationStore | BoundedInMemoryStore:
         if self.settings.state_backend == "postgres":
             if not self.settings.database_url:
@@ -235,6 +330,7 @@ class StateRuntime:
                 max_pool_size=self.settings.postgres_pool_max_size,
                 max_messages=self.settings.state_max_history_messages,
                 command_timeout=self.settings.postgres_command_timeout_seconds,
+                pool=self._postgres_pool,
             )
         if self.settings.state_backend == "redis":
             if not self.settings.redis_url:
@@ -244,6 +340,7 @@ class StateRuntime:
                 key_prefix=self.settings.redis_key_prefix,
                 ttl_seconds=self.settings.state_ttl_seconds,
                 max_messages=self.settings.state_max_history_messages,
+                max_connections=self.settings.redis_max_connections,
             )
         return self._memory_store()
 
@@ -259,6 +356,7 @@ class StateRuntime:
                 max_pool_size=self.settings.postgres_pool_max_size,
                 command_timeout=self.settings.postgres_command_timeout_seconds,
                 auto_setup=self.settings.postgres_auto_setup,
+                pool=self._postgres_pool,
             )
         return MemoryRunRepository()
 

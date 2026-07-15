@@ -156,6 +156,30 @@ Artifacts: disabled or MinIO
 
 For durable multi-process execution use PostgreSQL for the run repository and checkpoints. Conversation turns are appended idempotently by `run_id`; PostgreSQL and Redis enforce that independently of the bounded visible history window. Optional dependency startup failures enter explicit memory degradation; required dependency failures stop startup.
 
+### Connection lifecycle and dbs.local alignment
+
+The application owns one persistence runtime per FastAPI application process. PostgreSQL conversation history and durable run records reuse one bounded `asyncpg` pool instead of creating independent pools. The LangGraph PostgreSQL checkpointer uses one separate bounded application-scoped `psycopg` pool because its driver is not compatible with the `asyncpg` pool. Redis uses one bounded application client and MinIO uses one application client.
+
+The example endpoints and credentials are aligned with `appNucleus/dbs.local`:
+
+```env
+DATABASE_URL=postgresql://langgraph_user:change_me_postgres_2026@dbs.home.arpa:5432/langgraph_app
+REDIS_URL=redis://default:change_me_redis_2026@dbs.home.arpa:6379/0
+REDIS_MAX_CONNECTIONS=20
+MINIO_ENDPOINT=dbs.home.arpa:9000
+MINIO_ACCESS_KEY=minioadmin
+MINIO_SECRET_KEY=change_me_minio_2026
+MINIO_BUCKET=langgraph-app
+```
+
+`pgAdmin` and `RedisInsight` are administration interfaces, not application persistence backends. The database stack also provides Neo4j, but this application has no active Neo4j runtime path, so no unused Neo4j client or connection is created.
+
+`/health/ready` includes non-secret connection-management metadata such as whether the shared PostgreSQL pool is active and its bounded size.
+
+## Execution usage metadata
+
+Successful and safely terminated chat responses expose the complete serialized execution-meter snapshot under `metadata.usage`. Compatibility fields such as `model_calls`, `tool_calls`, and `elapsed_seconds` remain present alongside physical attempt, failure, fallback, token, queue, deadline, checkpoint, artifact, and cancellation counters.
+
 ## Deployment and rollback
 
 The release workflow compiles, lints, tests, builds, deploys, performs smoke/API checks, creates a known-good backup, and rolls back failures. It still rebuilds the image on the production runner; immutable build-once/deploy-by-digest remains a later-stage objective.
@@ -164,9 +188,13 @@ The release workflow compiles, lints, tests, builds, deploys, performs smoke/API
 
 ```bash
 python -m pip check
-python -m compileall -q app tests
-python -m ruff check app tests
+python -m compileall -q app tests scripts/check_coverage_thresholds.py
+python -m ruff check app tests scripts/check_coverage_thresholds.py
 python -m pytest -v -ra --tb=long -W default -m "not live_integration"
+python -m coverage xml --rcfile=pyproject.toml -o test-results/coverage.xml
+python -m coverage json --rcfile=pyproject.toml -o test-results/coverage.json
+python -m coverage report --rcfile=pyproject.toml
+python scripts/check_coverage_thresholds.py test-results/coverage.json --config pyproject.toml
 docker compose --env-file .env.example config
 ```
 

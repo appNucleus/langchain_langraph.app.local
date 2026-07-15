@@ -35,24 +35,30 @@ class PostgresConversationStore(ConversationStore):
         max_pool_size: int = 10,
         max_messages: int = 30,
         command_timeout: float = 30.0,
+        pool: asyncpg.Pool | None = None,
     ) -> None:
         self.database_url = database_url
         self.min_pool_size = min_pool_size
         self.max_pool_size = max_pool_size
         self.max_messages = max_messages
         self.command_timeout = command_timeout
-        self._pool: asyncpg.Pool | None = None
+        self._pool: asyncpg.Pool | None = pool
+        self._owns_pool = pool is None
+        self._started = False
 
     async def start(self) -> None:
-        if self._pool is not None:
+        if self._started:
             return
-        pool = await asyncpg.create_pool(
-            dsn=self.database_url,
-            min_size=self.min_pool_size,
-            max_size=self.max_pool_size,
-            command_timeout=self.command_timeout,
-        )
-        self._pool = pool
+        pool = self._pool
+        if pool is None:
+            pool = await asyncpg.create_pool(
+                dsn=self.database_url,
+                min_size=self.min_pool_size,
+                max_size=self.max_pool_size,
+                command_timeout=self.command_timeout,
+            )
+            self._pool = pool
+            self._owns_pool = True
         try:
             async with pool.acquire() as connection:
                 lock_name = "langchain-langraph-state-migrations"
@@ -113,20 +119,29 @@ class PostgresConversationStore(ConversationStore):
                         "SELECT pg_advisory_unlock(hashtext($1))", lock_name
                     )
         except BaseException:
-            await pool.close()
-            self._pool = None
+            if self._owns_pool and self._pool is not None:
+                await self._pool.close()
+                self._pool = None
             raise
+        self._started = True
 
     async def aclose(self) -> None:
-        if self._pool is not None:
-            await self._pool.close()
-            self._pool = None
+        pool = self._pool
+        if pool is not None and self._owns_pool:
+            await pool.close()
+        self._pool = None
+        self._started = False
 
     async def health(self) -> dict[str, Any]:
         pool = self._require_pool()
         async with pool.acquire() as connection:
             value = await connection.fetchval("SELECT 1")
-        return {"status": "available", "backend": "postgres", "value": value}
+        return {
+            "status": "available",
+            "backend": "postgres",
+            "value": value,
+            "pool": _pool_snapshot(pool, shared=not self._owns_pool),
+        }
 
     async def get(self, thread_id: str) -> list[dict[str, Any]]:
         pool = self._require_pool()
@@ -292,3 +307,13 @@ class PostgresConversationStore(ConversationStore):
         if self._pool is None:
             raise RuntimeError("PostgreSQL conversation store is not started")
         return self._pool
+
+
+def _pool_snapshot(pool: asyncpg.Pool, *, shared: bool) -> dict[str, Any]:
+    return {
+        "shared": shared,
+        "size": pool.get_size(),
+        "idle": pool.get_idle_size(),
+        "min_size": pool.get_min_size(),
+        "max_size": pool.get_max_size(),
+    }

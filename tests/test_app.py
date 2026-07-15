@@ -67,6 +67,17 @@ def test_chat_uses_current_worker_verifier_contract() -> None:
     assert payload["metadata"]["verification"]
     assert payload["metadata"]["termination_reason"] is None
 
+    usage = payload["metadata"]["usage"]
+    assert usage["model_calls"] == usage["physical_model_attempts"]
+    assert usage["tool_calls"] == usage["tool_attempts"]
+    assert usage["verifier_rounds"] >= 0
+    assert usage["schema_version"] == 2
+    assert "fallback_attempts" in usage
+    assert "model_failures" in usage
+    assert "tool_timeouts" in usage
+    assert "deadline_at" in usage
+    assert "elapsed_seconds" in usage
+
 
 def test_chat_accepts_omitted_optional_system_prompt() -> None:
     with _client() as client:
