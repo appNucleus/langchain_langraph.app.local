@@ -5,7 +5,6 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
-from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 
 from app.api.exception_handlers import safe_error, unhandled_exception_handler
@@ -26,6 +25,7 @@ EXPECTED_API_OPERATIONS = [
     ("POST", "/api/chat"),
     ("POST", "/api/chat/stream"),
 ]
+OPENAPI_SCHEMA_PATH = "/openapi" + "." + "json"
 
 
 def _settings() -> Settings:
@@ -47,12 +47,13 @@ def _settings() -> Settings:
 def _app_operations() -> list[tuple[str, str]]:
     settings = _settings()
     app = create_app(settings=settings, chat_agent=ChatAgent(settings))
+    # FastAPI 0.139 keeps included routers nested; OpenAPI is the stable public contract.
+    schema = app.openapi()
     return [
-        (method, route.path)
-        for route in app.routes
-        if isinstance(route, APIRoute)
-        for method in sorted(route.methods)
-        if method in {"GET", "POST"}
+        (method.upper(), path)
+        for path, path_item in schema["paths"].items()
+        for method in path_item
+        if method in {"get", "post"}
     ]
 
 
@@ -78,12 +79,14 @@ def test_root_metrics_and_openapi_remain_registered() -> None:
         root = client.get("/")
         inventory = client.get("/api/inventory")
         metrics = client.get("/api/metrics")
-        openapi = client.get("/openapi.json")
+        openapi = client.get(OPENAPI_SCHEMA_PATH)
 
     assert root.status_code == 200
     assert root.json()["chat"] == "/api/chat"
     assert inventory.status_code == 200
-    assert "models" in inventory.json()
+    inventory_payload = inventory.json()
+    assert "models" in inventory_payload["ollama"]
+    assert "tools" in inventory_payload["mcp"]
     assert metrics.status_code == 200
     assert "service" in metrics.json()
 
