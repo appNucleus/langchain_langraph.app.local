@@ -9,10 +9,10 @@ from app.api.dependencies import require_api_key
 from app.observability.metrics import metrics
 from app.settings import Settings
 
-router = APIRouter()
+router = APIRouter(tags=["Status"])
 
 
-@router.get("/api/metrics", dependencies=[Depends(require_api_key)])
+@router.get("/api/metrics", summary="Get Application Metrics", dependencies=[Depends(require_api_key)])
 async def application_metrics(request: Request) -> dict[str, Any]:
     current_settings: Settings = request.app.state.settings
     return {

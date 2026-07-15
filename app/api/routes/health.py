@@ -11,10 +11,10 @@ from app.graph import ChatAgent
 from app.services.inventory import InventoryService
 from app.settings import Settings
 
-router = APIRouter()
+router = APIRouter(tags=["General"])
 
 
-@router.get("/health")
+@router.get("/health", summary="Get Health Status")
 async def health(request: Request) -> dict[str, object]:
     current_settings: Settings = request.app.state.settings
     return {
@@ -24,7 +24,7 @@ async def health(request: Request) -> dict[str, object]:
     }
 
 
-@router.get("/health/live")
+@router.get("/health/live", summary="Get Live Health Status")
 async def live_health(request: Request) -> JSONResponse:
     current_settings: Settings = request.app.state.settings
     return JSONResponse(
@@ -37,7 +37,7 @@ async def live_health(request: Request) -> JSONResponse:
     )
 
 
-@router.get("/health/ready")
+@router.get("/health/ready", summary="Get Ready Health Status")
 async def ready_health(request: Request) -> JSONResponse:
     current_agent: ChatAgent = request.app.state.chat_agent
     current_settings: Settings = request.app.state.settings

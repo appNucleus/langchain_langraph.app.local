@@ -15,12 +15,13 @@ from app.orchestration.run_identity import RequestIdentityError
 from app.schemas.chat import ChatRequest, ChatResponse
 
 logger = logging.getLogger("app.factory")
-router = APIRouter()
+router = APIRouter(tags=["Chat"])
 
 
 @router.post(
     "/api/chat",
     response_model=ChatResponse,
+    summary="Send a chat message",
     dependencies=[Depends(require_api_key)],
 )
 async def chat(request: Request, chat_request: ChatRequest) -> ChatResponse:
@@ -36,7 +37,7 @@ async def chat(request: Request, chat_request: ChatRequest) -> ChatResponse:
         raise
 
 
-@router.post("/api/chat/stream", dependencies=[Depends(require_api_key)])
+@router.post("/api/chat/stream", summary="Stream Chat Response", dependencies=[Depends(require_api_key)])
 async def chat_stream(
     request: Request,
     chat_request: ChatRequest,

@@ -5,12 +5,13 @@ from fastapi import APIRouter, Request
 from app import __version__
 from app.settings import Settings
 
-router = APIRouter()
+router = APIRouter(tags=["General"])
 
 
-@router.get("/")
+@router.get("/", summary="Root Endpoint")
 async def root(request: Request) -> dict[str, str]:
     current_settings: Settings = request.app.state.settings
+
     return {
         "service": current_settings.app_name,
         "version": __version__,

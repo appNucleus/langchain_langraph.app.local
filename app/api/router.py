@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
-from app.api.routes import chat, health, inventory, metrics, root
+from app.api.routes import root, health, inventory, metrics, chat
 
 router = APIRouter()
 router.include_router(root.router)

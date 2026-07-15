@@ -7,10 +7,10 @@ from app.graph import ChatAgent
 from app.services.inventory import InventoryService, build_inventory_payload
 from app.settings import Settings
 
-router = APIRouter()
+router = APIRouter(tags=["Status"])
 
 
-@router.get("/api/inventory", dependencies=[Depends(require_api_key)])
+@router.get("/api/inventory", summary="Get Available Models and Tools Status", dependencies=[Depends(require_api_key)])
 async def inventory(request: Request) -> dict[str, object]:
     current_agent: ChatAgent = request.app.state.chat_agent
     current_settings: Settings = request.app.state.settings
