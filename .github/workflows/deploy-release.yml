@@ -72,7 +72,6 @@ jobs:
       - name: Run unit and deterministic integration tests
         run: |
           set -euo pipefail
-
           mkdir -p test-results
 
           python -m pytest -v -ra --tb=long -W default \
@@ -91,6 +90,18 @@ jobs:
           name: pytest-console-log-${{ github.run_id }}-${{ github.run_attempt }}
           path: test-results/pytest-console.log
           if-no-files-found: error
+          retention-days: 90
+
+      - name: Upload pytest diagnostic details
+        if: ${{ failure() && hashFiles('test-results/failure-details.txt') != '' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: pytest-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            test-results/failure-details.txt
+            test-results/failure-details.json
+            test-results/repository-snapshot.json
+          if-no-files-found: ignore
           retention-days: 90
 
       - name: Generate and enforce code coverage reports
