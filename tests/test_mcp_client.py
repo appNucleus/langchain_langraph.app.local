@@ -4,7 +4,7 @@ import asyncio
 import json
 from collections import Counter
 
-import httpx
+import httpx2 as httpx
 import pytest
 
 from app.mcp.client import MCPClient

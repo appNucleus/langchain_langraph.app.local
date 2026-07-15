@@ -469,12 +469,7 @@ class ChatRuntimeAgent(ChatAgent):
                     "errors": runtime_inventory.errors,
                     "cached": runtime_inventory.cached,
                 },
-                "usage": {
-                    "model_calls": effective_budget.model_calls,
-                    "tool_calls": effective_budget.tool_calls,
-                    "verifier_rounds": effective_budget.verifier_rounds,
-                    "elapsed_seconds": round(effective_budget.elapsed_seconds, 3),
-                },
+                "usage": effective_budget.usage_metadata(),
             },
         )
         log_kv(

@@ -33,11 +33,13 @@ class RedisConversationStore(ConversationStore):
         key_prefix: str = "langgraph:conversation",
         ttl_seconds: int = 3600,
         max_messages: int = 30,
+        max_connections: int = 20,
     ) -> None:
         self.redis_url = redis_url
         self.key_prefix = key_prefix.rstrip(":")
         self.ttl_seconds = ttl_seconds
         self.max_messages = max_messages
+        self.max_connections = max_connections
         self._client: Redis | None = None
 
     async def start(self) -> None:
@@ -47,8 +49,14 @@ class RedisConversationStore(ConversationStore):
                 encoding="utf-8",
                 decode_responses=True,
                 health_check_interval=30,
+                max_connections=self.max_connections,
             )
-            await self._client.ping()
+            try:
+                await self._client.ping()
+            except BaseException:
+                await self._client.aclose()
+                self._client = None
+                raise
 
     async def aclose(self) -> None:
         if self._client is not None:
@@ -56,8 +64,17 @@ class RedisConversationStore(ConversationStore):
             self._client = None
 
     async def health(self) -> dict[str, Any]:
-        value = await self._require_client().ping()
-        return {"status": "available", "backend": "redis", "value": bool(value)}
+        client = self._require_client()
+        value = await client.ping()
+        return {
+            "status": "available",
+            "backend": "redis",
+            "value": bool(value),
+            "pool": {
+                "application_scoped": True,
+                "max_connections": self.max_connections,
+            },
+        }
 
     async def get(self, thread_id: str) -> list[dict[str, Any]]:
         values = await self._require_client().lrange(

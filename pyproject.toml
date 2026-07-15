@@ -31,3 +31,51 @@ extend-exclude = [".venv", "build", "dist"]
 # Start with correctness-critical lint rules so the gate protects deployments
 # without requiring an unrelated whole-repository style rewrite.
 select = ["E9", "F63", "F7", "F82"]
+
+[tool.coverage.run]
+branch = true
+source = ["app"]
+# These files are not part of the active testable runtime surface: main.py is
+# only the ASGI composition entry point, while the remaining modules belong to
+# the superseded pre-agent runtime and are not imported by the current graph.
+omit = [
+  "app/main.py",
+  "app/api/errors.py",
+  "app/api/streaming.py",
+  "app/services/decomposition.py",
+  "app/services/formatting.py",
+  "app/services/memory.py",
+  "app/services/termination.py",
+]
+
+[tool.coverage.report]
+fail_under = 70
+precision = 2
+show_missing = true
+skip_empty = true
+
+[tool.coverage.json]
+output = "test-results/coverage.json"
+pretty_print = true
+
+[tool.project_coverage]
+minimum = 70.0
+# These are active production modules, not permanent coverage omissions. They
+# are temporary migration waivers because the current baseline is below 70%.
+# Remove each path as soon as its branch coverage reaches the threshold.
+per_file_waivers = [
+  "app/llm/ollama.py",
+  "app/mcp/protocol.py",
+  "app/mcp/result_parser.py",
+  "app/observability/redaction.py",
+  "app/observability/timing.py",
+  "app/orchestration/chat_runtime.py",
+  "app/orchestration/run_identity.py",
+  "app/services/answer_quality.py",
+  "app/services/query_rewriter.py",
+  "app/state/minio.py",
+  "app/state/postgres.py",
+  "app/state/redis.py",
+  "app/state/runtime.py",
+  "app/tools/executor.py",
+]

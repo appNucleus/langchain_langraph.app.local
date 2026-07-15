@@ -19,7 +19,7 @@ env:
 
 jobs:
   pre-deployment:
-    name: "Pre-deployment: compile, lint, and test"
+    name: "Pre-deployment: compile, lint, test, and coverage"
     runs-on: ubuntu-latest
     timeout-minutes: 20
     services:
@@ -64,26 +64,67 @@ jobs:
           python -m pip check
 
       - name: Compile Python sources
-        run: python -m compileall -q app tests
+        run: python -m compileall -q app tests scripts/check_coverage_thresholds.py
 
       - name: Run correctness lint gate
-        run: python -m ruff check app tests
+        run: python -m ruff check app tests scripts/check_coverage_thresholds.py
 
       - name: Run unit and deterministic integration tests
         run: |
           set -euo pipefail
+          mkdir -p test-results
+
           python -m pytest -v -ra --tb=long -W default \
             -m "not live_integration" \
-            --junitxml=test-results/pytest.xml
+            --junitxml=test-results/pytest.xml \
+            --cov=app \
+            --cov-branch \
+            --cov-config=pyproject.toml \
+            --cov-report= \
+            2>&1 | tee test-results/pytest-console.log
+      
+      - name: Upload original pytest console log
+        if: ${{ failure() && hashFiles('test-results/pytest-console.log') != '' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: pytest-console-log-${{ github.run_id }}-${{ github.run_attempt }}
+          path: test-results/pytest-console.log
+          if-no-files-found: error
+          retention-days: 90
 
-      - name: Upload test report
+      - name: Upload pytest diagnostic details
+        if: ${{ failure() && hashFiles('test-results/failure-details.txt') != '' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: pytest-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            test-results/failure-details.txt
+            test-results/failure-details.json
+            test-results/repository-snapshot.json
+          if-no-files-found: ignore
+          retention-days: 90
+
+      - name: Generate and enforce code coverage reports
+        run: |
+          set -euo pipefail
+          python -m coverage xml --rcfile=pyproject.toml -o test-results/coverage.xml
+          python -m coverage json --rcfile=pyproject.toml -o test-results/coverage.json
+          python -m coverage report --rcfile=pyproject.toml
+          python scripts/check_coverage_thresholds.py \
+            test-results/coverage.json \
+            --config pyproject.toml
+
+      - name: Upload test and coverage reports
         if: always()
         uses: actions/upload-artifact@v6
         with:
           name: pytest-results-${{ github.sha }}
-          path: test-results/pytest.xml
+          path: |
+            test-results/pytest.xml
+            test-results/coverage.xml
+            test-results/coverage.json
           if-no-files-found: ignore
-          retention-days: 14
+          retention-days: 90
 
   deployment:
     name: "Deployment: build and release"

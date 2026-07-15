@@ -5,6 +5,8 @@ from typing import Any
 
 from app.factory import create_app
 from app.schemas.chat import (
+    CHAT_REQUEST_EXAMPLE_FILENAME,
+    CHAT_STREAM_REQUEST_EXAMPLE_FILENAME,
     ChatRequest,
     build_chat_request_openapi_examples,
     load_chat_request_example,
@@ -82,6 +84,36 @@ def test_create_app_loads_documentation_example_only_for_openapi(
 
     app.openapi()
     assert calls == 1
+
+
+def test_openapi_uses_corresponding_post_request_example_files(
+    monkeypatch: Any,
+) -> None:
+    calls: list[str] = []
+
+    def load_documentation_example(filename: str) -> dict[str, Any]:
+        calls.append(filename)
+        return {"message": filename}
+
+    monkeypatch.setattr(
+        "app.factory.load_chat_request_example",
+        load_documentation_example,
+    )
+
+    schema = create_app(settings=_settings()).openapi()
+
+    assert calls == [
+        CHAT_REQUEST_EXAMPLE_FILENAME,
+        CHAT_STREAM_REQUEST_EXAMPLE_FILENAME,
+    ]
+    assert schema["paths"]["/api/chat"]["post"]["requestBody"]["content"][
+        "application/json"
+    ]["examples"]["default"]["value"]["message"] == CHAT_REQUEST_EXAMPLE_FILENAME
+    assert schema["paths"]["/api/chat/stream"]["post"]["requestBody"]["content"][
+        "application/json"
+    ]["examples"]["default"]["value"]["message"] == (
+        CHAT_STREAM_REQUEST_EXAMPLE_FILENAME
+    )
 
 
 def test_openapi_uses_code_injected_documentation_example(
