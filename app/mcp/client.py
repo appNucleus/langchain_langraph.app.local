@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from time import monotonic
 from typing import Any
 
-import httpx
+import httpx2 as httpx
 
 from app import __version__
 from app.logging_config import log_kv

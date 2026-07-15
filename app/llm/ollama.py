@@ -9,7 +9,7 @@ from threading import RLock
 from time import monotonic
 from typing import Any
 
-import httpx
+import httpx2 as httpx
 
 from app.llm.errors import OllamaError
 from app.llm.resource_manager import OllamaResourceManager

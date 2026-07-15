@@ -15,6 +15,7 @@ from app.settings import Settings
 from app.state.base import ConversationStore
 from app.state.in_memory import BoundedInMemoryStore
 from app.state.minio import MinioArtifactStore
+from app.state.neo4j import Neo4jConnectionManager
 from app.state.postgres import PostgresConversationStore
 from app.state.redis import RedisConversationStore
 from app.state.run_repository import (
@@ -43,10 +44,12 @@ class StateRuntime:
         self.runs: RunRepository = MemoryRunRepository()
         self.checkpointer: Any = InMemorySaver(serde=_checkpoint_serializer())
         self.artifacts: MinioArtifactStore | None = None
+        self.neo4j: Neo4jConnectionManager | None = None
         self._checkpoint_pool: AsyncConnectionPool | None = None
         self._postgres_pool: asyncpg.Pool | None = None
         self._started = False
         self.degraded_reason: str | None = None
+        self.neo4j_degraded_reason: str | None = None
 
     async def start(self) -> None:
         if self._started:
@@ -100,6 +103,8 @@ class StateRuntime:
                 )
                 await self.artifacts.start()
 
+            await self._start_neo4j()
+
             self._started = True
             self.degraded_reason = None
         except Exception:
@@ -118,11 +123,21 @@ class StateRuntime:
         await self.runs.start()
         self.checkpointer = InMemorySaver(serde=_checkpoint_serializer())
         self.artifacts = None
+        self.neo4j = None
         self._checkpoint_pool = None
         self._started = True
         self.degraded_reason = reason
+        self.neo4j_degraded_reason = None
 
     async def aclose(self) -> None:
+        if self.neo4j is not None:
+            try:
+                await self.neo4j.aclose()
+            except Exception:  # noqa: BLE001 - shutdown remains best effort
+                logger.exception("neo4j_driver_close_failed")
+            finally:
+                self.neo4j = None
+
         if self.artifacts is not None:
             try:
                 await self.artifacts.aclose()
@@ -203,8 +218,9 @@ class StateRuntime:
         }
 
     async def health(self) -> dict[str, Any]:
+        degraded = bool(self.degraded_reason or self.neo4j_degraded_reason)
         payload: dict[str, Any] = {
-            "status": "degraded" if self.degraded_reason else "available",
+            "status": "degraded" if degraded else "available",
             "conversation_backend": self.settings.state_backend,
             "run_repository_backend": self.settings.run_repository_backend,
             "checkpoint_backend": self.settings.checkpoint_backend,
@@ -259,7 +275,74 @@ class StateRuntime:
         else:
             payload["artifacts"] = {"status": "disabled", "backend": "disabled"}
 
+        if self.neo4j is not None:
+            try:
+                payload["neo4j"] = await asyncio.wait_for(
+                    self.neo4j.health(),
+                    timeout=self.settings.persistence_health_timeout_seconds,
+                )
+            except Exception as exc:
+                payload["neo4j"] = {
+                    "status": "unavailable",
+                    "backend": "neo4j",
+                    "error": (
+                        f"{type(exc).__name__}: {str(exc).strip()}"
+                        if self.settings.expose_internal_health_details
+                        else "Dependency unavailable."
+                    ),
+                }
+        elif self.settings.neo4j_enabled:
+            payload["neo4j"] = {
+                "status": "unavailable",
+                "backend": "neo4j",
+                "error": (
+                    self.neo4j_degraded_reason or "Neo4j driver not started"
+                    if self.settings.expose_internal_health_details
+                    else "Dependency unavailable."
+                ),
+            }
+        else:
+            payload["neo4j"] = {"status": "disabled", "backend": "neo4j"}
+
         return payload
+
+    async def _start_neo4j(self) -> None:
+        if not self.settings.neo4j_enabled or self.neo4j is not None:
+            return
+        manager = Neo4jConnectionManager(
+            self.settings.neo4j_uri,
+            self.settings.neo4j_username,
+            self.settings.neo4j_password,
+            database=self.settings.neo4j_database,
+            max_connection_pool_size=self.settings.neo4j_max_connection_pool_size,
+            connection_acquisition_timeout=(
+                self.settings.neo4j_connection_acquisition_timeout_seconds
+            ),
+            connection_timeout=self.settings.neo4j_connection_timeout_seconds,
+            max_connection_lifetime=(
+                self.settings.neo4j_max_connection_lifetime_seconds
+            ),
+            keep_alive=self.settings.neo4j_keep_alive,
+        )
+        try:
+            await manager.start()
+        except Exception as exc:
+            await manager.aclose()
+            if self.settings.persistence_required:
+                raise
+            self.neo4j_degraded_reason = (
+                f"{type(exc).__name__}: {str(exc).strip() or 'startup failed'}"
+            )
+            log_kv(
+                logger,
+                logging.ERROR,
+                "neo4j_startup_degraded",
+                error_type=type(exc).__name__,
+                error=str(exc).strip() or "startup failed",
+            )
+            return
+        self.neo4j = manager
+        self.neo4j_degraded_reason = None
 
     async def _start_postgres_pool(self) -> None:
         uses_asyncpg = any(
@@ -318,6 +401,19 @@ class StateRuntime:
             "minio": {
                 "application_scoped": self.settings.artifact_backend == "minio",
             },
+            "neo4j": (
+                self.neo4j.connection_status()
+                if self.neo4j is not None
+                else {
+                    "application_scoped": False,
+                    "pooled": False,
+                    "max_connection_pool_size": (
+                        self.settings.neo4j_max_connection_pool_size
+                        if self.settings.neo4j_enabled
+                        else 0
+                    ),
+                }
+            ),
         }
 
     def _build_conversation_store(self) -> ConversationStore | BoundedInMemoryStore:

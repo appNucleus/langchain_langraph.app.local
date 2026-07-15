@@ -229,3 +229,156 @@ async def test_postgres_checkpointer_uses_one_bounded_application_pool(
         await runtime.aclose()
 
     assert pool.close_calls == 1
+
+
+class _FakeNeo4jDriver:
+    def __init__(self, *, error: Exception | None = None) -> None:
+        self.error = error
+        self.verify_calls: list[dict[str, Any]] = []
+        self.close_calls = 0
+
+    async def verify_connectivity(self, **kwargs: Any) -> None:
+        self.verify_calls.append(kwargs)
+        if self.error is not None:
+            raise self.error
+
+    async def close(self) -> None:
+        self.close_calls += 1
+
+
+@pytest.mark.asyncio
+async def test_neo4j_uses_one_bounded_application_driver(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.state.neo4j as neo4j_module
+
+    driver = _FakeNeo4jDriver()
+    create_calls: list[tuple[str, dict[str, Any]]] = []
+
+    def create_driver(uri: str, **kwargs: Any) -> _FakeNeo4jDriver:
+        create_calls.append((uri, kwargs))
+        return driver
+
+    monkeypatch.setattr(
+        neo4j_module.AsyncGraphDatabase,
+        "driver",
+        staticmethod(create_driver),
+    )
+    manager = neo4j_module.Neo4jConnectionManager(
+        "bolt://dbs.home.arpa:7687",
+        "neo4j",
+        "password",
+        database="neo4j",
+        max_connection_pool_size=9,
+        connection_acquisition_timeout=11,
+        connection_timeout=7,
+        max_connection_lifetime=1800,
+        keep_alive=True,
+    )
+
+    await manager.start()
+    await manager.start()
+    health = await manager.health()
+    await manager.aclose()
+
+    assert len(create_calls) == 1
+    assert create_calls[0][0] == "bolt://dbs.home.arpa:7687"
+    options = create_calls[0][1]
+    assert options["auth"] == ("neo4j", "password")
+    assert options["max_connection_pool_size"] == 9
+    assert options["connection_acquisition_timeout"] == 11
+    assert options["connection_timeout"] == 7
+    assert options["max_connection_lifetime"] == 1800
+    assert health["pool"]["application_scoped"] is True
+    assert health["pool"]["max_connection_pool_size"] == 9
+    assert driver.verify_calls == [{"database": "neo4j"}, {"database": "neo4j"}]
+    assert driver.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_state_runtime_reports_neo4j_connection_management(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.state.neo4j as neo4j_module
+
+    driver = _FakeNeo4jDriver()
+    monkeypatch.setattr(
+        neo4j_module.AsyncGraphDatabase,
+        "driver",
+        staticmethod(lambda _uri, **_kwargs: driver),
+    )
+    settings = Settings(
+        _env_file=None,
+        state_backend="memory",
+        run_repository_backend="memory",
+        checkpoint_backend="memory",
+        artifact_backend="disabled",
+        neo4j_enabled=True,
+        neo4j_uri="bolt://dbs.home.arpa:7687",
+        neo4j_username="neo4j",
+        neo4j_password="password",
+        neo4j_database="neo4j",
+        neo4j_max_connection_pool_size=12,
+        ollama_required=False,
+        mcp_required=False,
+    )
+    runtime = StateRuntime(settings)
+
+    await runtime.start()
+    try:
+        health = await runtime.health()
+        assert health["status"] == "available"
+        assert health["neo4j"]["status"] == "available"
+        management = health["connection_management"]["neo4j"]
+        assert management["application_scoped"] is True
+        assert management["pooled"] is True
+        assert management["max_connection_pool_size"] == 12
+    finally:
+        await runtime.aclose()
+
+    assert driver.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_optional_neo4j_failure_degrades_without_discarding_other_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.state.neo4j as neo4j_module
+
+    driver = _FakeNeo4jDriver(error=RuntimeError("neo4j unavailable"))
+    monkeypatch.setattr(
+        neo4j_module.AsyncGraphDatabase,
+        "driver",
+        staticmethod(lambda _uri, **_kwargs: driver),
+    )
+    settings = Settings(
+        _env_file=None,
+        neo4j_enabled=True,
+        neo4j_uri="bolt://dbs.home.arpa:7687",
+        neo4j_username="neo4j",
+        neo4j_password="password",
+        persistence_required=False,
+        ollama_required=False,
+        mcp_required=False,
+    )
+    runtime = StateRuntime(settings)
+
+    await runtime.start()
+    health = await runtime.health()
+    await runtime.aclose()
+
+    assert health["status"] == "degraded"
+    assert health["conversation"]["backend"] == "memory"
+    assert health["neo4j"]["status"] == "unavailable"
+    assert driver.close_calls == 1
+
+
+def test_neo4j_enabled_requires_connection_credentials() -> None:
+    with pytest.raises(ValueError, match="NEO4J_PASSWORD"):
+        Settings(
+            _env_file=None,
+            neo4j_enabled=True,
+            neo4j_uri="bolt://dbs.home.arpa:7687",
+            neo4j_username="neo4j",
+            neo4j_password="",
+        )

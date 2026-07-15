@@ -157,6 +157,20 @@ class Settings(BaseSettings):
     minio_secret_key: str = ""
     minio_bucket: str = "langchain-langraph-app"
     minio_secure: bool = False
+    neo4j_enabled: bool = False
+    neo4j_uri: str = "bolt://dbs.home.arpa:7687"
+    neo4j_username: str = ""
+    neo4j_password: str = ""
+    neo4j_database: str = "neo4j"
+    neo4j_max_connection_pool_size: int = Field(default=20, ge=1, le=1000)
+    neo4j_connection_acquisition_timeout_seconds: float = Field(
+        default=30.0, gt=0, le=300
+    )
+    neo4j_connection_timeout_seconds: float = Field(default=10.0, gt=0, le=300)
+    neo4j_max_connection_lifetime_seconds: float = Field(
+        default=3600.0, gt=0, le=86400
+    )
+    neo4j_keep_alive: bool = True
     persistence_required: bool = False
     artifact_storage_required: bool = False
     persistence_health_timeout_seconds: float = Field(default=5.0, gt=0, le=60)
@@ -176,6 +190,19 @@ class Settings(BaseSettings):
                 "POSTGRES_POOL_MIN_SIZE must be less than or equal to "
                 "POSTGRES_POOL_MAX_SIZE"
             )
+        if self.neo4j_enabled:
+            required = {
+                "NEO4J_URI": self.neo4j_uri,
+                "NEO4J_USERNAME": self.neo4j_username,
+                "NEO4J_PASSWORD": self.neo4j_password,
+                "NEO4J_DATABASE": self.neo4j_database,
+            }
+            missing = [name for name, value in required.items() if not value.strip()]
+            if missing:
+                raise ValueError(
+                    "Neo4j is enabled but required settings are empty: "
+                    + ", ".join(missing)
+                )
         if self.run_repository_backend == "postgres" and not any(
             (
                 self.resume_token_keys_json.strip(),
@@ -236,6 +263,7 @@ class Settings(BaseSettings):
                 self.checkpoint_backend != "memory",
                 self.artifact_backend != "disabled",
                 self.run_repository_backend != "memory",
+                self.neo4j_enabled,
             )
         )
 

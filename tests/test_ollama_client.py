@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 
-import httpx
+import httpx2 as httpx
 import pytest
 from pydantic import BaseModel
 
